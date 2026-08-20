@@ -1,0 +1,10 @@
+name: astrbot_plugin_group_invite_guard
+desc: 加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员
+author: Kimi
+version: 1.0.0
+repo: ""
+display_name: 加群邀请守卫
+short_desc: LLM 判断加群邀请，支持自动同意/拒绝与管理员通知
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.16"

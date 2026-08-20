@@ -1,0 +1,47 @@
+{
+  "enable": {
+    "description": "是否启用加群邀请自动处理",
+    "type": "bool",
+    "default": true
+  },
+  "auto_approve": {
+    "description": "LLM 判断“要加”时是否自动同意进群；关闭则只通知管理员，不自动同意（让人联系管理员）",
+    "type": "bool",
+    "default": false
+  },
+  "auto_reject": {
+    "description": "LLM 判断“不要加”时是否自动拒绝；关闭则只通知管理员",
+    "type": "bool",
+    "default": false
+  },
+  "notify_private": {
+    "description": "是否私聊通知管理员",
+    "type": "bool",
+    "default": true
+  },
+  "notify_private_qq": {
+    "description": "私聊通知的 QQ 号；留空则使用 AstrBot 全局 admins_id 里的第一个",
+    "type": "string",
+    "default": ""
+  },
+  "notify_group": {
+    "description": "是否在指定群发通知",
+    "type": "bool",
+    "default": false
+  },
+  "notify_group_id": {
+    "description": "通知群号；留空则不发送",
+    "type": "string",
+    "default": ""
+  },
+  "llm_provider_id": {
+    "description": "判断用的 LLM provider id；留空则使用默认 provider",
+    "type": "string",
+    "default": ""
+  },
+  "decision_prompt": {
+    "description": "让 LLM 判断是否同意加群邀请的提示词",
+    "type": "string",
+    "default": "你是 QQ 机器人的加群邀请决策助手。根据邀请信息判断是否同意机器人加入该群。只输出 JSON：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\"}。approve 表示同意进群，reject 表示拒绝。"
+  }
+}
