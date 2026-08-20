@@ -43,5 +43,25 @@
     "description": "让 LLM 判断是否同意加群邀请的提示词",
     "type": "string",
     "default": "你是 QQ 机器人的加群邀请决策助手。根据邀请信息判断是否同意机器人加入该群。只输出 JSON：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\"}。approve 表示同意进群，reject 表示拒绝。"
+  },
+  "enable_private_intent": {
+    "description": "是否启用私聊加群意图检测（私聊问能不能加群、直接发群邀请链接等）",
+    "type": "bool",
+    "default": true
+  },
+  "private_intent_reply": {
+    "description": "检测到私聊加群意图时是否自动回复对方（回复内容由 LLM 生成）",
+    "type": "bool",
+    "default": true
+  },
+  "private_intent_notify": {
+    "description": "检测到私聊加群意图时是否通知管理员",
+    "type": "bool",
+    "default": true
+  },
+  "private_intent_prompt": {
+    "description": "私聊加群意图检测与回复的提示词",
+    "type": "string",
+    "default": "你是 QQ 机器人。判断这条私聊消息是否表达了“想邀请/拉机器人进群”的意图（包括询问能不能加群、直接发群邀请链接等）。只输出 JSON：{\"is_invite_intent\": true 或 false, \"reply\": \"若为加群意图，回复对方的话\", \"reason\": \"给管理员的简短说明\"}。若不是加群意图，is_invite_intent 为 false，reply 和 reason 都留空字符串。"
   }
 }

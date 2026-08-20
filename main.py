@@ -4,7 +4,8 @@ import re
 from typing import Any
 
 from astrbot.api import logger
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 
 
@@ -13,6 +14,12 @@ def _get_value(raw: Any, key: str, default: Any = None) -> Any:
         return raw.get(key, default)
     except Exception:
         return default
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes", "是")
 
 
 def _parse_json(text: str) -> dict:
@@ -24,6 +31,24 @@ def _parse_json(text: str) -> dict:
         return json.loads(candidate)
     except Exception:
         return {"action": "unknown", "reason": text[:200]}
+
+
+_INVITE_LINK_MARKS = (
+    "qm.qq.com",
+    "jq.qq.com",
+    "qun.qq.com",
+    "group/invite",
+    "join_group",
+)
+
+_INVITE_KEYWORDS = (
+    "拉你进群", "拉你进", "拉你入群", "拉我进群", "拉我进", "拉我入群",
+    "进群", "入群", "加群", "加个群", "加下群", "加一下群",
+    "邀请你进群", "邀请你进", "邀请你加群", "邀请你加",
+    "邀你进群", "邀你加群", "邀我进群", "邀我加群",
+    "能不能加群", "可以加群吗", "能加群吗", "想拉你进群", "想拉你",
+    "邀请链接", "群邀请", "进我们群", "来我们群", "来群里",
+)
 
 
 class GroupInviteRequestFilter(filter.CustomFilter):
@@ -40,11 +65,24 @@ class GroupInviteRequestFilter(filter.CustomFilter):
         )
 
 
+class PrivateInviteIntentFilter(filter.CustomFilter):
+    """只匹配私聊消息（post_type=message, message_type=private）。"""
+
+    def filter(self, event: AstrMessageEvent, cfg) -> bool:
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is None:
+            return False
+        return (
+            _get_value(raw, "post_type") == "message"
+            and _get_value(raw, "message_type") == "private"
+        )
+
+
 @register(
     "astrbot_plugin_group_invite_guard",
     "Kimi",
-    "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员",
-    "1.0.0",
+    "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
+    "1.1.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -124,6 +162,63 @@ class GroupInviteGuardPlugin(Star):
         note = self._compose_note(inviter_qq, group_id, comment, action, reason)
         await self._notify(bot, note)
 
+    @filter.custom_filter(PrivateInviteIntentFilter)
+    async def on_private_invite_intent(self, event: AstrMessageEvent):
+        if not self.config.get("enable", True):
+            return
+        if not self.config.get("enable_private_intent", True):
+            return
+
+        text = (event.get_message_str() or "").strip()
+        if not text:
+            return
+
+        # 粗筛：明显不是加群意图就交还给正常私聊，不额外调 LLM
+        if not self._looks_like_invite_intent(text):
+            return
+
+        try:
+            decision = await self._ask_private_intent(text)
+        except Exception as exc:
+            logger.error(f"group_invite_guard: private intent LLM failed: {exc}")
+            return
+
+        if not _as_bool(decision.get("is_invite_intent")):
+            return
+
+        # 确认是加群意图，接管这条私聊，阻止默认 LLM 回复
+        try:
+            event.stop_event()
+            event.should_call_llm(False)
+        except Exception:
+            pass
+
+        sender_id = event.get_sender_id() or ""
+        reply = str(decision.get("reply") or "").strip()
+        reason = str(decision.get("reason") or "").strip()
+
+        if self.config.get("private_intent_reply", True) and reply:
+            try:
+                await event.send(MessageChain(chain=[Plain(reply)]))
+            except Exception as exc:
+                logger.error(f"group_invite_guard: reply private failed: {exc}")
+
+        note = self._compose_private_note(sender_id, text, reply, reason)
+        bot = self._find_onebot_client(event)
+        if bot is None:
+            logger.error("group_invite_guard: no OneBot client for private intent notify")
+            return
+        if self.config.get("private_intent_notify", True):
+            await self._notify(bot, note)
+
+    def _looks_like_invite_intent(self, text: str) -> bool:
+        low = text.lower()
+        if any(mark in low for mark in _INVITE_LINK_MARKS):
+            return True
+        if any(kw in text for kw in _INVITE_KEYWORDS):
+            return True
+        return False
+
     async def _ask_llm(self, inviter_qq: str, group_id: str, comment: str) -> dict:
         provider_id = self.config.get("llm_provider_id") or self._default_provider_id()
         if not provider_id:
@@ -148,6 +243,28 @@ class GroupInviteGuardPlugin(Star):
         )
         text = (getattr(resp, "completion_text", "") or "").strip()
         return _parse_json(text)
+
+    async def _ask_private_intent(self, text: str) -> dict:
+        provider_id = self.config.get("llm_provider_id") or self._default_provider_id()
+        if not provider_id:
+            raise RuntimeError("no llm provider id configured")
+
+        system_prompt = self.config.get(
+            "private_intent_prompt",
+            "你是 QQ 机器人。判断这条私聊消息是否表达了“想邀请/拉机器人进群”的意图（包括询问能不能加群、直接发群邀请链接等）。只输出 JSON：{\"is_invite_intent\": true 或 false, \"reply\": \"若为加群意图，回复对方的话\", \"reason\": \"给管理员的简短说明\"}。若不是加群意图，is_invite_intent 为 false，reply 和 reason 都留空字符串。",
+        )
+        prompt = (
+            f"对方私聊发来一条消息：\n{text}\n\n"
+            f"请判断这是否是加群邀请意图，并给出相应回复。"
+        )
+
+        resp = await self.context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=prompt,
+            system_prompt=system_prompt,
+        )
+        result_text = (getattr(resp, "completion_text", "") or "").strip()
+        return _parse_json(result_text)
 
     def _default_provider_id(self) -> str:
         provider_settings = self._nested(self._global_config(), "provider_settings")
@@ -243,6 +360,18 @@ class GroupInviteGuardPlugin(Star):
         ]
         if reason:
             lines.append(f"理由：{reason}")
+        return "\n".join(lines)
+
+    def _compose_private_note(self, sender_id, text, reply, reason) -> str:
+        lines = [
+            "[私聊加群意图通知]",
+            f"对方 QQ：{sender_id or '(未知)'}",
+            f"对方消息：{text}",
+        ]
+        if reply:
+            lines.append(f"已回复：{reply}")
+        if reason:
+            lines.append(f"说明：{reason}")
         return "\n".join(lines)
 
     async def _notify(self, bot: Any, note: str) -> None:
