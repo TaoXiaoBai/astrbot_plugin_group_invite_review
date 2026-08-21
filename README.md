@@ -1,4 +1,4 @@
-# astrbot_plugin_group_invite_guard
+# astrbot_plugin_group_invite_review
 
 AstrBot 加群邀请守卫：当有人邀请机器人进群时，让 **LLM 自主判断**要不要加，而不是靠关键词或等级规则。同时支持识别私聊里"问能不能加群"或"直接发邀请链接"的场景。
 
@@ -46,7 +46,7 @@ AstrBot 加群邀请守卫：当有人邀请机器人进群时，让 **LLM 自�
 
 ## 安装
 
-1. 将本目录放到 AstrBot 的 `data/plugins/` 下，目录名保持 `astrbot_plugin_group_invite_guard`
+1. 将本目录放到 AstrBot 的 `data/plugins/` 下，目录名保持 `astrbot_plugin_group_invite_guard`（插件标识；仓库名已改为 `astrbot_plugin_group_invite_review`）
 2. 重启 AstrBot
 3. 在 WebUI → 插件 → 加群邀请守卫 中配置
 
