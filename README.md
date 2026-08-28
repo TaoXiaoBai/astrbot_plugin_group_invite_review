@@ -30,6 +30,7 @@ AstrBot 加群邀请守卫：当有人邀请机器人进群时，让 **LLM 结�
 | `enable_member_context` | bool | `true` | 是否收集目标群成员列表，供 LLM 判断时参考 |
 | `enable_impression_context` | bool | `true` | 是否从历史会话收集对邀请人和该群的印象，供 LLM 判断时参考 |
 | `truncate_marker` | string | `…` | 上下文内容过长被截断时使用的占位字符 |
+| `decision_persona` | string | `""` | 决策 LLM 使用哪个 AstrBot 人格设定的设定内容来充当性格；留空则用插件自带决策提示词 |
 | `enable_private_intent` | bool | `true` | 是否启用私聊加群意图检测 |
 | `private_intent_reply` | bool | `true` | 检测到私聊加群意图时是否自动回复对方（回复内容由 LLM 生成） |
 | `private_intent_notify` | bool | `true` | 检测到私聊加群意图时是否通知管理员 |

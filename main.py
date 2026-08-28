@@ -229,6 +229,11 @@ class GroupInviteGuardPlugin(Star):
             "decision_prompt",
             "你是 QQ 机器人的加群邀请决策助手。根据邀请信息（可结合目标群成员信息和历史印象）判断是否同意机器人加入该群。只输出 JSON：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\"}。approve 表示同意进群，reject 表示拒绝。",
         )
+        decision_persona = str(self.config.get("decision_persona") or "").strip()
+        if decision_persona:
+            persona_prompt = await self._resolve_persona_prompt(decision_persona)
+            if persona_prompt:
+                system_prompt = f"{persona_prompt}\n\n{system_prompt}"
         context = await self._build_invite_context(inviter_qq, group_id, bot)
         prompt = (
             f"收到一个加群邀请：\n"
@@ -247,6 +252,18 @@ class GroupInviteGuardPlugin(Star):
         )
         text = (getattr(resp, "completion_text", "") or "").strip()
         return _parse_json(text)
+
+    async def _resolve_persona_prompt(self, persona_id: str) -> str:
+        """加载 AstrBot 人格设定的 system_prompt，用于给决策 LLM 充当性格；失败返回空。"""
+        pm = getattr(self.context, "persona_manager", None)
+        if pm is None:
+            return ""
+        try:
+            persona = await pm.get_persona(persona_id)
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load persona '{persona_id}' failed: {exc}")
+            return ""
+        return str(getattr(persona, "system_prompt", "") or "").strip()
 
     async def _build_invite_context(self, inviter_qq: str, group_id: str, bot) -> str:
         """收集目标群成员列表与历史印象，拼成给 LLM 参考的背景信息；两块都拿不到时返回空字符串。"""
@@ -299,9 +316,12 @@ class GroupInviteGuardPlugin(Star):
 
     async def _build_impression_section(self, inviter_qq: str, group_id: str) -> str:
         inviter_lines = await self._search_impression_lines(inviter_qq)
+        speaker_lines = await self._extract_speaker_quotes(inviter_qq)
         group_lines = await self._search_impression_lines(group_id)
 
         parts = []
+        if speaker_lines:
+            parts.append(f"邀请人（QQ {inviter_qq}）在历史里说过的原话：\n" + "\n".join(speaker_lines))
         if inviter_lines:
             parts.append("对邀请人 QQ 的既有印象：\n" + "\n".join(inviter_lines))
         if group_lines:
@@ -329,6 +349,56 @@ class GroupInviteGuardPlugin(Star):
             if len(lines) >= 30:
                 break
         return lines[:30]
+
+    async def _extract_speaker_quotes(self, inviter_qq: str) -> list:
+        """从历史会话（含群聊）里抓取邀请人本人的发言原话，形成对 TA 的印象。"""
+        qq = str(inviter_qq or "").strip()
+        if not qq:
+            return []
+        try:
+            conversations, _ = await self.context.conversation_manager.get_filtered_conversations(
+                page=1, page_size=10, search_query=qq, include_history=True
+            )
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: search speaker history '{qq}' failed: {exc}")
+            return []
+
+        pattern = re.compile(r"ID:\s*" + re.escape(qq))
+        quotes = []
+        for conv in conversations or []:
+            history = getattr(conv, "history", None)
+            if not history:
+                continue
+            try:
+                items = json.loads(history)
+            except Exception:
+                continue
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").strip().lower()
+                if role not in ("user", "assistant"):
+                    continue
+                text = self._content_to_text(item.get("content"))
+                for raw_line in text.splitlines():
+                    if not pattern.search(raw_line):
+                        continue
+                    line = re.sub(r"^\s*\[[^\]]*\]\s*", "", raw_line)
+                    line = re.sub(r"^\s*\S+\s*\(ID:[^)]*\)\s*[:：]\s*", "", line)
+                    line = re.sub(r"^\s*\[At:[^\]]*\]\s*", "", line).strip()
+                    if not line or len(line) < 2:
+                        continue
+                    if len(line) > 300:
+                        line = line[:300] + self.config.get("truncate_marker", "…")
+                    if line not in quotes:
+                        quotes.append(line)
+                if len(quotes) >= 20:
+                    break
+            if len(quotes) >= 20:
+                break
+        return quotes[:20]
 
     def _extract_history_lines(self, history: str) -> list:
         try:

@@ -59,6 +59,11 @@
     "type": "string",
     "default": "…"
   },
+  "decision_persona": {
+    "description": "决策 LLM 使用哪个 AstrBot 人格设定的设定内容来充当性格；留空则用插件自带决策提示词。可填人格名（如 Sydney、LittleSkin支持）",
+    "type": "string",
+    "default": ""
+  },
   "enable_private_intent": {
     "description": "是否启用私聊加群意图检测（私聊问能不能加群、直接发群邀请链接等）",
     "type": "bool",
