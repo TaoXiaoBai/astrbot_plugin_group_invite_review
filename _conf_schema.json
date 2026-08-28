@@ -42,7 +42,22 @@
   "decision_prompt": {
     "description": "让 LLM 判断是否同意加群邀请的提示词",
     "type": "string",
-    "default": "你是 QQ 机器人的加群邀请决策助手。根据邀请信息判断是否同意机器人加入该群。只输出 JSON：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\"}。approve 表示同意进群，reject 表示拒绝。"
+    "default": "你是 QQ 机器人的加群邀请决策助手。根据邀请信息（可结合目标群成员信息和历史印象）判断是否同意机器人加入该群。只输出 JSON：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\"}。approve 表示同意进群，reject 表示拒绝。"
+  },
+  "enable_member_context": {
+    "description": "是否收集目标群成员列表，供 LLM 判断加群邀请时参考",
+    "type": "bool",
+    "default": true
+  },
+  "enable_impression_context": {
+    "description": "是否从历史会话中收集对邀请人和该群的印象，供 LLM 判断加群邀请时参考",
+    "type": "bool",
+    "default": true
+  },
+  "truncate_marker": {
+    "description": "上下文内容过长被截断时使用的占位字符",
+    "type": "string",
+    "default": "…"
   },
   "enable_private_intent": {
     "description": "是否启用私聊加群意图检测（私聊问能不能加群、直接发群邀请链接等）",

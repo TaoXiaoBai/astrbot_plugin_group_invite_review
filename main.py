@@ -114,8 +114,10 @@ class GroupInviteGuardPlugin(Star):
             logger.warning("group_invite_guard: request event missing flag, skip")
             return
 
+        bot = self._find_onebot_client(event)
+
         try:
-            decision = await self._ask_llm(inviter_qq, group_id, comment)
+            decision = await self._ask_llm(inviter_qq, group_id, comment, bot)
         except Exception as exc:
             logger.error(f"group_invite_guard: LLM decision failed: {exc}")
             decision = {"action": "unknown", "reason": f"LLM error: {exc}"}
@@ -123,7 +125,6 @@ class GroupInviteGuardPlugin(Star):
         action = str(decision.get("action") or "unknown").strip().lower()
         reason = str(decision.get("reason") or "").strip()
 
-        bot = self._find_onebot_client(event)
         if bot is None:
             logger.error("group_invite_guard: no OneBot client found")
             return
@@ -219,22 +220,25 @@ class GroupInviteGuardPlugin(Star):
             return True
         return False
 
-    async def _ask_llm(self, inviter_qq: str, group_id: str, comment: str) -> dict:
+    async def _ask_llm(self, inviter_qq: str, group_id: str, comment: str, bot=None) -> dict:
         provider_id = self.config.get("llm_provider_id") or self._default_provider_id()
         if not provider_id:
             raise RuntimeError("no llm provider id configured")
 
         system_prompt = self.config.get(
             "decision_prompt",
-            "你是 QQ 机器人的加群邀请决策助手。根据邀请信息判断是否同意机器人加入该群。只输出 JSON：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\"}。approve 表示同意进群，reject 表示拒绝。",
+            "你是 QQ 机器人的加群邀请决策助手。根据邀请信息（可结合目标群成员信息和历史印象）判断是否同意机器人加入该群。只输出 JSON：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\"}。approve 表示同意进群，reject 表示拒绝。",
         )
+        context = await self._build_invite_context(inviter_qq, group_id, bot)
         prompt = (
             f"收到一个加群邀请：\n"
             f"邀请人 QQ：{inviter_qq}\n"
             f"群号：{group_id}\n"
             f"附言：{comment or '(无)'}\n"
-            f"请判断是否同意机器人加入该群。"
         )
+        if context:
+            prompt += f"\n背景信息：\n{context}\n"
+        prompt += "\n请判断是否同意机器人加入该群。"
 
         resp = await self.context.llm_generate(
             chat_provider_id=provider_id,
@@ -243,6 +247,135 @@ class GroupInviteGuardPlugin(Star):
         )
         text = (getattr(resp, "completion_text", "") or "").strip()
         return _parse_json(text)
+
+    async def _build_invite_context(self, inviter_qq: str, group_id: str, bot) -> str:
+        """收集目标群成员列表与历史印象，拼成给 LLM 参考的背景信息；两块都拿不到时返回空字符串。"""
+        sections = []
+        if self.config.get("enable_member_context", True):
+            member_section = await self._build_member_section(group_id, bot)
+            if member_section:
+                sections.append(member_section)
+        if self.config.get("enable_impression_context", True):
+            impression_section = await self._build_impression_section(inviter_qq, group_id)
+            if impression_section:
+                sections.append(impression_section)
+
+        if not sections:
+            return ""
+
+        context = "\n\n".join(sections)
+        marker = self.config.get("truncate_marker", "…")
+        if len(context) > 4000:
+            context = context[:4000] + marker
+        return context
+
+    async def _build_member_section(self, group_id: str, bot) -> str:
+        header = "目标群成员列表："
+        fallback = f"{header}\n机器人尚未进群，无法获取成员列表"
+        if bot is None:
+            return fallback
+        try:
+            members = await self._call_action(
+                bot, "get_group_member_list", group_id=int(group_id), no_cache=True
+            )
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: get_group_member_list failed: {exc}")
+            return fallback
+
+        lines = []
+        for member in members or []:
+            if not isinstance(member, dict):
+                continue
+            name = _get_value(member, "card") or _get_value(member, "nickname") or ""
+            qq = _get_value(member, "user_id") or ""
+            if not name and not qq:
+                continue
+            identity = self._member_role_label(_get_value(member, "role"))
+            lines.append(f"[{identity}] {name} (QQ: {qq})")
+
+        if not lines:
+            return fallback
+        return header + "\n" + "\n".join(lines)
+
+    async def _build_impression_section(self, inviter_qq: str, group_id: str) -> str:
+        inviter_lines = await self._search_impression_lines(inviter_qq)
+        group_lines = await self._search_impression_lines(group_id)
+
+        parts = []
+        if inviter_lines:
+            parts.append("对邀请人 QQ 的既有印象：\n" + "\n".join(inviter_lines))
+        if group_lines:
+            parts.append("对该群的既有印象：\n" + "\n".join(group_lines))
+        return "\n\n".join(parts)
+
+    async def _search_impression_lines(self, query: str) -> list:
+        query = str(query or "").strip()
+        if not query:
+            return []
+        try:
+            conversations, _ = await self.context.conversation_manager.get_filtered_conversations(
+                page=1, page_size=5, search_query=query, include_history=True
+            )
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: search history for '{query}' failed: {exc}")
+            return []
+
+        lines = []
+        for conv in conversations or []:
+            history = getattr(conv, "history", None)
+            if not history:
+                continue
+            lines.extend(self._extract_history_lines(history))
+            if len(lines) >= 30:
+                break
+        return lines[:30]
+
+    def _extract_history_lines(self, history: str) -> list:
+        try:
+            items = json.loads(history)
+        except Exception:
+            return []
+        if not isinstance(items, list):
+            return []
+
+        lines = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            if role not in ("user", "assistant"):
+                continue
+            text = self._content_to_text(item.get("content"))
+            if not text:
+                continue
+            if len(text) > 300:
+                text = text[:300] + self.config.get("truncate_marker", "…")
+            label = "用户" if role == "user" else "机器人"
+            lines.append(f"{label}：{text}")
+        return lines[-6:]
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return " ".join(parts).strip()
+        return str(content).strip()
+
+    @staticmethod
+    def _member_role_label(role: Any) -> str:
+        mapping = {"owner": "群主", "admin": "管理员", "member": "成员"}
+        return mapping.get(str(role or "").strip().lower(), str(role or "成员"))
 
     async def _ask_private_intent(self, text: str) -> dict:
         provider_id = self.config.get("llm_provider_id") or self._default_provider_id()

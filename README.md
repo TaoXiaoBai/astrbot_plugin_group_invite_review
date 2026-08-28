@@ -1,6 +1,6 @@
 # astrbot_plugin_group_invite_review
 
-AstrBot 加群邀请守卫：当有人邀请机器人进群时，让 **LLM 自主判断**要不要加，而不是靠关键词或等级规则。同时支持识别私聊里"问能不能加群"或"直接发邀请链接"的场景。
+AstrBot 加群邀请守卫：当有人邀请机器人进群时，让 **LLM 结合目标群成员信息与历史印象判断**要不要加，而不是靠关键词或等级规则。同时支持识别私聊里"问能不能加群"或"直接发邀请链接"的场景。
 
 ## 功能
 
@@ -27,6 +27,9 @@ AstrBot 加群邀请守卫：当有人邀请机器人进群时，让 **LLM 自�
 | `notify_group_id` | string | `""` | 通知群号；留空则不发送 |
 | `llm_provider_id` | string | `""` | 判断用的 LLM provider id；留空则使用默认 provider |
 | `decision_prompt` | string | 见 schema | 让 LLM 判断是否同意的提示词 |
+| `enable_member_context` | bool | `true` | 是否收集目标群成员列表，供 LLM 判断时参考 |
+| `enable_impression_context` | bool | `true` | 是否从历史会话收集对邀请人和该群的印象，供 LLM 判断时参考 |
+| `truncate_marker` | string | `…` | 上下文内容过长被截断时使用的占位字符 |
 | `enable_private_intent` | bool | `true` | 是否启用私聊加群意图检测 |
 | `private_intent_reply` | bool | `true` | 检测到私聊加群意图时是否自动回复对方（回复内容由 LLM 生成） |
 | `private_intent_notify` | bool | `true` | 检测到私聊加群意图时是否通知管理员 |
