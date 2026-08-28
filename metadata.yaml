@@ -1,7 +1,7 @@
 name: astrbot_plugin_group_invite_guard
 desc: 加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别
 author: Kimi
-version: 1.1.0
+version: 1.2.0
 repo: "https://github.com/TaoXiaoBai/astrbot_plugin_group_invite_review"
 display_name: 加群邀请守卫
 short_desc: LLM 判断加群邀请与私聊加群意图，支持自动同意/拒绝与管理员通知
