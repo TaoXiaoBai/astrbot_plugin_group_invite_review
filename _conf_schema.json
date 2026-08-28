@@ -60,9 +60,11 @@
     "default": "…"
   },
   "decision_persona": {
-    "description": "决策用人格名（留空用默认）",
+    "description": "决策用人格（留空用默认）",
     "type": "string",
-    "default": ""
+    "default": "",
+    "options": ["", "Sydney", "LittleSkin支持"],
+    "labels": ["不使用（默认）", "Sydney", "LittleSkin支持"]
   },
   "enable_private_intent": {
     "description": "是否检测私聊加群意图",
