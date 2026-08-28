@@ -115,9 +115,14 @@ class GroupInviteGuardPlugin(Star):
             return
 
         bot = self._find_onebot_client(event)
+        platform_id = None
+        try:
+            platform_id = event.get_platform_id()
+        except Exception:
+            pass
 
         try:
-            decision = await self._ask_llm(inviter_qq, group_id, comment, bot)
+            decision = await self._ask_llm(inviter_qq, group_id, comment, bot, platform_id)
         except Exception as exc:
             logger.error(f"group_invite_guard: LLM decision failed: {exc}")
             decision = {"action": "unknown", "reason": f"LLM error: {exc}"}
@@ -178,8 +183,14 @@ class GroupInviteGuardPlugin(Star):
         if not self._looks_like_invite_intent(text):
             return
 
+        platform_id = None
         try:
-            decision = await self._ask_private_intent(text)
+            platform_id = event.get_platform_id()
+        except Exception:
+            pass
+
+        try:
+            decision = await self._ask_private_intent(text, platform_id)
         except Exception as exc:
             logger.error(f"group_invite_guard: private intent LLM failed: {exc}")
             return
@@ -220,20 +231,17 @@ class GroupInviteGuardPlugin(Star):
             return True
         return False
 
-    async def _ask_llm(self, inviter_qq: str, group_id: str, comment: str, bot=None) -> dict:
+    async def _ask_llm(
+        self, inviter_qq: str, group_id: str, comment: str, bot=None, platform_id: str = None
+    ) -> dict:
         provider_id = self.config.get("llm_provider_id") or self._default_provider_id()
         if not provider_id:
             raise RuntimeError("no llm provider id configured")
 
-        system_prompt = self.config.get(
-            "decision_prompt",
-            "你是 QQ 机器人的加群邀请决策助手。根据邀请信息（可结合目标群成员信息和历史印象）判断是否同意机器人加入该群。只输出 JSON：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\"}。approve 表示同意进群，reject 表示拒绝。",
-        )
         decision_persona = str(self.config.get("decision_persona") or "").strip()
-        if decision_persona:
-            persona_prompt = await self._resolve_persona_prompt(decision_persona)
-            if persona_prompt:
-                system_prompt = f"{persona_prompt}\n\n{system_prompt}"
+        persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
+        system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
+
         context = await self._build_invite_context(inviter_qq, group_id, bot)
         prompt = (
             f"收到一个加群邀请：\n"
@@ -243,7 +251,10 @@ class GroupInviteGuardPlugin(Star):
         )
         if context:
             prompt += f"\n背景信息：\n{context}\n"
-        prompt += "\n请判断是否同意机器人加入该群。"
+        prompt += (
+            "\n请以你的身份和性格判断是否同意这个加群邀请。"
+            "只输出一个 JSON 对象：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\"}。"
+        )
 
         resp = await self.context.llm_generate(
             chat_provider_id=provider_id,
@@ -253,10 +264,21 @@ class GroupInviteGuardPlugin(Star):
         text = (getattr(resp, "completion_text", "") or "").strip()
         return _parse_json(text)
 
-    async def _resolve_persona_prompt(self, persona_id: str) -> str:
-        """加载 AstrBot 人格设定的 system_prompt，用于给决策 LLM 充当性格；失败返回空。"""
+    async def _resolve_persona_prompt(self, persona_id: str, platform_id: str = None) -> str:
+        """加载人格设定的完整 system_prompt，用于给决策 LLM 充当性格；失败返回空。"""
         pm = getattr(self.context, "persona_manager", None)
         if pm is None:
+            return ""
+        if not persona_id:
+            # 未显式指定人格时，自动用当前账号的默认人格
+            try:
+                umo = f"{platform_id}:GroupMessage:0" if platform_id else None
+                persona = await pm.get_default_persona_v3(umo=umo)
+                persona_id = persona["name"] if persona else None
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: resolve default persona failed: {exc}")
+                persona_id = None
+        if not persona_id or persona_id == "default":
             return ""
         try:
             persona = await pm.get_persona(persona_id)
@@ -447,18 +469,22 @@ class GroupInviteGuardPlugin(Star):
         mapping = {"owner": "群主", "admin": "管理员", "member": "成员"}
         return mapping.get(str(role or "").strip().lower(), str(role or "成员"))
 
-    async def _ask_private_intent(self, text: str) -> dict:
+    async def _ask_private_intent(self, text: str, platform_id: str = None) -> dict:
         provider_id = self.config.get("llm_provider_id") or self._default_provider_id()
         if not provider_id:
             raise RuntimeError("no llm provider id configured")
 
-        system_prompt = self.config.get(
-            "private_intent_prompt",
-            "你是 QQ 机器人。判断这条私聊消息是否表达了“想邀请/拉机器人进群”的意图（包括询问能不能加群、直接发群邀请链接等）。只输出 JSON：{\"is_invite_intent\": true 或 false, \"reply\": \"若为加群意图，回复对方的话\", \"reason\": \"给管理员的简短说明\"}。若不是加群意图，is_invite_intent 为 false，reply 和 reason 都留空字符串。",
-        )
+        decision_persona = str(self.config.get("decision_persona") or "").strip()
+        persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
+        system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
+
         prompt = (
             f"对方私聊发来一条消息：\n{text}\n\n"
-            f"请判断这是否是加群邀请意图，并给出相应回复。"
+            "请以你的身份和性格判断这是否表达了“想邀请/拉机器人进群”的意图"
+            "（包括询问能不能加群、直接发群邀请链接等）。"
+            "只输出一个 JSON 对象：{\"is_invite_intent\": true 或 false, "
+            "\"reply\": \"若为加群意图，回复对方的话（否则空字符串）\", "
+            "\"reason\": \"给管理员的简短说明（否则空字符串）\"}。"
         )
 
         resp = await self.context.llm_generate(
