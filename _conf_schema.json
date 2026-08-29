@@ -75,5 +75,17 @@
     "description": "检测到意图时是否通知管理员",
     "type": "bool",
     "default": true
+  },
+  "revenge_mode": {
+    "description": "被踢后的报复方式",
+    "type": "string",
+    "default": "off",
+    "options": ["off", "delete_friend", "delete_and_ban"],
+    "labels": ["关闭", "删除并拉黑", "删除并加入AstrBot黑名单"]
+  },
+  "revenge_notify": {
+    "description": "报复后是否通知管理员",
+    "type": "bool",
+    "default": true
   }
 }

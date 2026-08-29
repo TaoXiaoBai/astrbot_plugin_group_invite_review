@@ -1,6 +1,8 @@
+import asyncio
 import inspect
 import json
 import re
+import time
 from typing import Any
 
 from astrbot.api import logger
@@ -78,6 +80,26 @@ class PrivateInviteIntentFilter(filter.CustomFilter):
         )
 
 
+class GroupKickFilter(filter.CustomFilter):
+    """只匹配机器人被踢出群的通知（post_type=notice, notice_type=group_decrease, sub_type=kick/kick_me，且被移出的是机器人自己）。"""
+
+    def filter(self, event: AstrMessageEvent, cfg) -> bool:
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is None:
+            return False
+        if (
+            _get_value(raw, "post_type") != "notice"
+            or _get_value(raw, "notice_type") != "group_decrease"
+        ):
+            return False
+        sub_type = str(_get_value(raw, "sub_type") or "")
+        if sub_type not in ("kick", "kick_me"):
+            return False
+        user_id = str(_get_value(raw, "user_id") or "")
+        self_id = str(_get_value(raw, "self_id") or "")
+        return bool(user_id and self_id and user_id == self_id)
+
+
 @register(
     "astrbot_plugin_group_invite_guard",
     "Kimi",
@@ -147,6 +169,18 @@ class GroupInviteGuardPlugin(Star):
                 logger.info(
                     f"group_invite_guard: approved invite from {inviter_qq} to group {group_id}"
                 )
+                # 自动同意成功后，记录群号 -> 邀请人，供被踢后报复使用
+                try:
+                    records = await self.get_kv_data("invite_records", {})
+                    if not isinstance(records, dict):
+                        records = {}
+                    records[str(group_id)] = str(inviter_qq)
+                    await self.put_kv_data("invite_records", records)
+                    logger.info(
+                        f"group_invite_guard: recorded inviter {inviter_qq} for group {group_id}"
+                    )
+                except Exception as exc:
+                    logger.warning(f"group_invite_guard: record inviter failed: {exc}")
             except Exception as exc:
                 logger.error(f"group_invite_guard: approve failed: {exc}")
         elif action == "reject" and self.config.get("auto_reject", False):
@@ -221,6 +255,46 @@ class GroupInviteGuardPlugin(Star):
             logger.error("group_invite_guard: no OneBot client for private intent notify")
             return
         if self.config.get("private_intent_notify", True):
+            await self._notify(bot, note)
+
+    @filter.custom_filter(GroupKickFilter)
+    async def on_group_kick(self, event: AstrMessageEvent):
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is None:
+            return
+
+        group_id = str(_get_value(raw, "group_id") or "")
+        if not group_id:
+            return
+
+        mode = str(self.config.get("revenge_mode", "off") or "off").strip().lower()
+        if mode not in ("delete_friend", "delete_and_ban"):
+            return
+
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
+            records = {}
+        inviter_qq = records.get(group_id) if isinstance(records, dict) else None
+        if not inviter_qq:
+            logger.info(
+                f"group_invite_guard: no inviter record for group {group_id}, skip revenge"
+            )
+            return
+
+        bot = self._find_onebot_client(event)
+        if bot is None:
+            logger.error("group_invite_guard: no OneBot client for revenge")
+            return
+
+        result = await self._take_revenge(inviter_qq, bot)
+        logger.info(
+            f"group_invite_guard: revenge on {inviter_qq} for group {group_id}: {result}"
+        )
+
+        if self.config.get("revenge_notify", True):
+            note = self._compose_revenge_note(group_id, inviter_qq, result)
             await self._notify(bot, note)
 
     def _looks_like_invite_intent(self, text: str) -> bool:
@@ -573,6 +647,71 @@ class GroupInviteGuardPlugin(Star):
                 result = fn(action, **params)
                 return await result if inspect.isawaitable(result) else result
         raise RuntimeError(f"no usable OneBot action caller for {action}")
+
+    async def _take_revenge(self, inviter_qq: str, bot) -> str:
+        """按 revenge_mode 对邀请人执行报复，返回人类可读结果；单个动作失败不抛出，写入结果字符串。"""
+        mode = str(self.config.get("revenge_mode", "off") or "off").strip().lower()
+        if mode not in ("delete_friend", "delete_and_ban"):
+            return "未启用报复"
+
+        parts = []
+        try:
+            await self._call_action(bot, "delete_friend", user_id=int(inviter_qq))
+            parts.append(f"已删除并拉黑好友 {inviter_qq}")
+        except Exception as exc:
+            parts.append(f"删除好友失败：{exc}")
+
+        if mode == "delete_and_ban":
+            parts.append(await self._ban_inviter(inviter_qq))
+        return "；".join(parts)
+
+    async def _ban_inviter(self, inviter_qq: str) -> str:
+        """把邀请人加入 AstrBot 黑名单（qq_tools 插件），不可用时降级并注明。"""
+        try:
+            md = self.context.get_registered_star("astrbot_plugin_qq_tools")
+        except Exception as exc:
+            return f"获取 qq_tools 实例失败：{exc}"
+
+        instance = getattr(md, "star_cls", None)
+        if instance is None:
+            return "黑名单功能不可用（未安装/未启用 qq_tools）"
+
+        try:
+            config = getattr(instance, "config", None)
+            if config is None:
+                return "黑名单功能不可用（qq_tools 配置不可读）"
+            ban_list = config.get("ban_list")
+            if not isinstance(ban_list, list):
+                ban_list = []
+            # 移除旧的同 QQ 记录，再追加永久拉黑
+            ban_list = [
+                item
+                for item in ban_list
+                if not (isinstance(item, dict) and str(item.get("user_id")) == str(inviter_qq))
+            ]
+            ban_list.append(
+                {"user_id": str(inviter_qq), "ban_time": int(time.time()), "duration": -1}
+            )
+            config["ban_list"] = ban_list
+
+            save = getattr(config, "save_config", None)
+            if callable(save):
+                if inspect.iscoroutinefunction(save):
+                    await save()
+                else:
+                    await asyncio.to_thread(save)
+            return f"已加入 AstrBot 黑名单：{inviter_qq}"
+        except Exception as exc:
+            return f"加入黑名单失败：{exc}"
+
+    def _compose_revenge_note(self, group_id, inviter_qq, result) -> str:
+        lines = [
+            "[被踢报复通知]",
+            f"群号：{group_id}",
+            f"邀请人 QQ：{inviter_qq}",
+            f"报复结果：{result}",
+        ]
+        return "\n".join(lines)
 
     def _compose_note(self, inviter_qq, group_id, comment, action, reason) -> str:
         action_label = {

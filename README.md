@@ -13,6 +13,7 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 - 按配置决定：自动同意进群、自动拒绝、或仅通知管理员
 - 识别私聊加群意图（问"能不能加群"、发邀请链接）
 - 结果通知管理员（私聊 / 群）
+- 被踢后报复邀请人：自动同意进群时记录邀请人，被该群踢出后按配置删除并拉黑 / 加入 AstrBot 黑名单，并通知管理员
 
 ## 配置
 
@@ -33,6 +34,8 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 | `enable_private_intent` | bool | `true` | 是否检测私聊加群意图 |
 | `private_intent_reply` | bool | `true` | 检测到意图时是否回复对方 |
 | `private_intent_notify` | bool | `true` | 检测到意图时是否通知管理员 |
+| `revenge_mode` | string | `"off"` | 被踢后的报复方式：`off` 关闭 / `delete_friend` 删除并拉黑 / `delete_and_ban` 删除并加入AstrBot黑名单 |
+| `revenge_notify` | bool | `true` | 报复后是否通知管理员 |
 
 默认配置即"让人联系管理员"：判断要加时不会自动进群，只私聊通知管理员。
 
