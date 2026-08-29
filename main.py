@@ -120,6 +120,21 @@ class GroupMuteFilter(filter.CustomFilter):
         return bool(user_id and self_id and user_id == self_id)
 
 
+class AdminCommandFilter(filter.CustomFilter):
+    """只匹配管理员发起的命令消息（邀请记录/记录邀请/拉黑列表/解封）。"""
+
+    def filter(self, event: AstrMessageEvent, cfg) -> bool:
+        try:
+            if not event.is_admin():
+                return False
+        except Exception:
+            return False
+        text = (event.get_message_str() or "").strip()
+        cmd = text.lstrip("/").strip()
+        first = cmd.split(" ", 1)[0] if cmd else ""
+        return first in ("邀请记录", "邀请列表", "记录邀请", "拉黑列表", "黑名单", "解封")
+
+
 @register(
     "astrbot_plugin_group_invite_guard",
     "Kimi",
@@ -946,63 +961,42 @@ class GroupInviteGuardPlugin(Star):
             result["group"] = group_id
         return result
 
-    @filter.command("/邀请记录", alias=["邀请记录", "/邀请列表", "邀请列表"])
-    async def cmd_invite_records(self, event: AstrMessageEvent):
-        if not event.is_admin():
-            yield event.plain_result("无权限")
-            return
+    async def _list_invite_records_text(self) -> str:
         try:
             records = await self.get_kv_data("invite_records", {})
         except Exception as exc:
-            yield event.plain_result(f"读取邀请记录失败：{exc}")
-            return
+            return f"读取邀请记录失败：{exc}"
         if not isinstance(records, dict) or not records:
-            yield event.plain_result("暂无邀请记录")
-            return
-        lines = [f"群号 {gid} -> 邀请人 {qq}" for gid, qq in records.items()]
-        yield event.plain_result("\n".join(lines))
+            return "暂无邀请记录"
+        return "\n".join(f"群号 {gid} -> 邀请人 {qq}" for gid, qq in records.items())
 
-    @filter.command("/记录邀请", alias=["记录邀请"])
-    async def cmd_record_invite(self, event: AstrMessageEvent, group_id: str, inviter_qq: str):
-        if not event.is_admin():
-            yield event.plain_result("无权限")
-            return
+    async def _record_invite_text(self, group_id: str, inviter_qq: str) -> str:
         try:
             records = await self.get_kv_data("invite_records", {})
         except Exception as exc:
-            yield event.plain_result(f"读取邀请记录失败：{exc}")
-            return
+            return f"读取邀请记录失败：{exc}"
         if not isinstance(records, dict):
             records = {}
         records[str(group_id)] = str(inviter_qq)
         try:
             await self.put_kv_data("invite_records", records)
         except Exception as exc:
-            yield event.plain_result(f"写入邀请记录失败：{exc}")
-            return
-        yield event.plain_result(f"已记录 群号 {group_id} -> 邀请人 {inviter_qq}")
+            return f"写入邀请记录失败：{exc}"
+        return f"已记录 群号 {group_id} -> 邀请人 {inviter_qq}"
 
-    @filter.command("/拉黑列表", alias=["拉黑列表", "/黑名单", "黑名单"])
-    async def cmd_ban_list(self, event: AstrMessageEvent):
-        if not event.is_admin():
-            yield event.plain_result("无权限")
-            return
+    async def _list_ban_list_text(self) -> str:
         instance = self._get_qq_tools_instance()
         if instance is None:
-            yield event.plain_result("黑名单功能不可用（未安装/未启用 qq_tools）")
-            return
+            return "黑名单功能不可用（未安装/未启用 qq_tools）"
         try:
             config = getattr(instance, "config", None)
             if config is None:
-                yield event.plain_result("黑名单功能不可用（qq_tools 配置不可读）")
-                return
+                return "黑名单功能不可用（qq_tools 配置不可读）"
             ban_list = config.get("ban_list")
         except Exception as exc:
-            yield event.plain_result(f"读取黑名单失败：{exc}")
-            return
+            return f"读取黑名单失败：{exc}"
         if not isinstance(ban_list, list) or not ban_list:
-            yield event.plain_result("黑名单为空")
-            return
+            return "黑名单为空"
         lines = []
         for item in ban_list:
             if not isinstance(item, dict):
@@ -1016,28 +1010,17 @@ class GroupInviteGuardPlugin(Star):
             duration = item.get("duration")
             duration_str = "永久" if duration == -1 else str(duration if duration is not None else "-")
             reason = str(item.get("reason") or "-")
-            lines.append(
-                f"QQ {user_id} | 拉黑时间 {ban_time_str} | 时长 {duration_str} | 原因 {reason}"
-            )
-        if not lines:
-            yield event.plain_result("黑名单为空")
-            return
-        yield event.plain_result("\n".join(lines))
+            lines.append(f"QQ {user_id} | 拉黑时间 {ban_time_str} | 时长 {duration_str} | 原因 {reason}")
+        return "\n".join(lines) if lines else "黑名单为空"
 
-    @filter.command("/解封", alias=["解封"])
-    async def cmd_unban(self, event: AstrMessageEvent, qq: str):
-        if not event.is_admin():
-            yield event.plain_result("无权限")
-            return
+    async def _unban_text(self, qq: str) -> str:
         instance = self._get_qq_tools_instance()
         if instance is None:
-            yield event.plain_result("黑名单功能不可用（未安装/未启用 qq_tools）")
-            return
+            return "黑名单功能不可用（未安装/未启用 qq_tools）"
         try:
             config = getattr(instance, "config", None)
             if config is None:
-                yield event.plain_result("黑名单功能不可用（qq_tools 配置不可读）")
-                return
+                return "黑名单功能不可用（qq_tools 配置不可读）"
             ban_list = config.get("ban_list")
             if not isinstance(ban_list, list):
                 ban_list = []
@@ -1047,8 +1030,7 @@ class GroupInviteGuardPlugin(Star):
                 if not (isinstance(item, dict) and str(item.get("user_id")) == str(qq))
             ]
             if len(new_list) == len(ban_list):
-                yield event.plain_result(f"{qq} 不在黑名单中")
-                return
+                return f"{qq} 不在黑名单中"
             config["ban_list"] = new_list
             save = getattr(config, "save_config", None)
             if callable(save):
@@ -1056,6 +1038,34 @@ class GroupInviteGuardPlugin(Star):
                     await save()
                 else:
                     await asyncio.to_thread(save)
-            yield event.plain_result(f"已解封 {qq}")
+            return f"已解封 {qq}"
         except Exception as exc:
-            yield event.plain_result(f"解封失败：{exc}")
+            return f"解封失败：{exc}"
+
+    async def _dispatch_admin_command(self, event: AstrMessageEvent) -> str:
+        text = (event.get_message_str() or "").strip().lstrip("/").strip()
+        parts = text.split()
+        cmd = parts[0] if parts else ""
+        args = parts[1:]
+
+        if cmd in ("邀请记录", "邀请列表"):
+            return await self._list_invite_records_text()
+        if cmd == "记录邀请":
+            if len(args) < 2:
+                return "用法：/记录邀请 <群号> <邀请人QQ>"
+            return await self._record_invite_text(args[0], args[1])
+        if cmd in ("拉黑列表", "黑名单"):
+            return await self._list_ban_list_text()
+        if cmd == "解封":
+            if not args:
+                return "用法：/解封 <QQ>"
+            return await self._unban_text(args[0])
+        return "未知命令"
+
+    @filter.custom_filter(AdminCommandFilter)
+    async def on_admin_command(self, event: AstrMessageEvent):
+        result = await self._dispatch_admin_command(event)
+        try:
+            await event.send(MessageChain(chain=[Plain(result)]))
+        except Exception as exc:
+            logger.error(f"group_invite_guard: send command result failed: {exc}")
