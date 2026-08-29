@@ -69,7 +69,7 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 
 ## 命令
 
-以下命令仅管理员可用，发消息时需带唤醒前缀（默认 `/`）：
+以下命令仅管理员可用，需先唤醒机器人（@机器人 或唤醒词），命令支持带 `/` 前缀（如 `/邀请记录`）：
 
 | 命令 | 别名 | 参数 | 说明 |
 | --- | --- | --- | --- |

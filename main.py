@@ -946,7 +946,7 @@ class GroupInviteGuardPlugin(Star):
             result["group"] = group_id
         return result
 
-    @filter.command("邀请记录", alias=["邀请列表"])
+    @filter.command("/邀请记录", alias=["邀请记录", "/邀请列表", "邀请列表"])
     async def cmd_invite_records(self, event: AstrMessageEvent):
         if not event.is_admin():
             yield event.plain_result("无权限")
@@ -962,7 +962,7 @@ class GroupInviteGuardPlugin(Star):
         lines = [f"群号 {gid} -> 邀请人 {qq}" for gid, qq in records.items()]
         yield event.plain_result("\n".join(lines))
 
-    @filter.command("记录邀请")
+    @filter.command("/记录邀请", alias=["记录邀请"])
     async def cmd_record_invite(self, event: AstrMessageEvent, group_id: str, inviter_qq: str):
         if not event.is_admin():
             yield event.plain_result("无权限")
@@ -982,7 +982,7 @@ class GroupInviteGuardPlugin(Star):
             return
         yield event.plain_result(f"已记录 群号 {group_id} -> 邀请人 {inviter_qq}")
 
-    @filter.command("拉黑列表", alias=["黑名单"])
+    @filter.command("/拉黑列表", alias=["拉黑列表", "/黑名单", "黑名单"])
     async def cmd_ban_list(self, event: AstrMessageEvent):
         if not event.is_admin():
             yield event.plain_result("无权限")
@@ -1024,7 +1024,7 @@ class GroupInviteGuardPlugin(Star):
             return
         yield event.plain_result("\n".join(lines))
 
-    @filter.command("解封")
+    @filter.command("/解封", alias=["解封"])
     async def cmd_unban(self, event: AstrMessageEvent, qq: str):
         if not event.is_admin():
             yield event.plain_result("无权限")
