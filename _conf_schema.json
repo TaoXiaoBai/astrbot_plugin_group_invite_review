@@ -87,5 +87,34 @@
     "description": "报复后是否通知管理员",
     "type": "bool",
     "default": true
+  },
+  "mute_retaliation_enable": {
+    "description": "被禁言达到次数后自动退群并拉黑",
+    "type": "bool",
+    "default": false
+  },
+  "mute_threshold": {
+    "description": "被禁言达到该次数触发退群拉黑",
+    "type": "int",
+    "default": 3
+  },
+  "mute_target": {
+    "description": "拉黑对象",
+    "type": "string",
+    "default": "operator",
+    "options": ["operator", "inviter", "both"],
+    "labels": ["禁言者", "邀请人", "都拉黑"]
+  },
+  "mute_ban_mode": {
+    "description": "拉黑方式",
+    "type": "string",
+    "default": "astrbot_ban",
+    "options": ["astrbot_ban", "delete_friend"],
+    "labels": ["加入AstrBot黑名单", "删除好友并拉黑"]
+  },
+  "mute_notify": {
+    "description": "被禁言/报复后是否通知管理员",
+    "type": "bool",
+    "default": true
   }
 }

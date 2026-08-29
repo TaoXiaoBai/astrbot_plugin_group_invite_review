@@ -100,6 +100,25 @@ class GroupKickFilter(filter.CustomFilter):
         return bool(user_id and self_id and user_id == self_id)
 
 
+class GroupMuteFilter(filter.CustomFilter):
+    """只匹配机器人被禁言的通知（post_type=notice, notice_type=group_ban, sub_type=ban，且被禁言的是机器人自己）。"""
+
+    def filter(self, event: AstrMessageEvent, cfg) -> bool:
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is None:
+            return False
+        if (
+            _get_value(raw, "post_type") != "notice"
+            or _get_value(raw, "notice_type") != "group_ban"
+        ):
+            return False
+        if str(_get_value(raw, "sub_type") or "") != "ban":
+            return False
+        user_id = str(_get_value(raw, "user_id") or "")
+        self_id = str(_get_value(raw, "self_id") or "")
+        return bool(user_id and self_id and user_id == self_id)
+
+
 @register(
     "astrbot_plugin_group_invite_guard",
     "Kimi",
@@ -295,6 +314,99 @@ class GroupInviteGuardPlugin(Star):
 
         if self.config.get("revenge_notify", True):
             note = self._compose_revenge_note(group_id, inviter_qq, result)
+            await self._notify(bot, note)
+
+    @filter.custom_filter(GroupMuteFilter)
+    async def on_group_mute(self, event: AstrMessageEvent):
+        if not self.config.get("mute_retaliation_enable", False):
+            return
+
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is None:
+            return
+
+        group_id = str(_get_value(raw, "group_id") or "")
+        operator_id = str(_get_value(raw, "operator_id") or "")
+        if not group_id:
+            return
+
+        try:
+            records = await self.get_kv_data("mute_records", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load mute_records failed: {exc}")
+            records = {}
+        if not isinstance(records, dict):
+            records = {}
+
+        count = int(records.get(group_id, 0) or 0) + 1
+        records[group_id] = count
+        try:
+            await self.put_kv_data("mute_records", records)
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: save mute_records failed: {exc}")
+
+        threshold = int(self.config.get("mute_threshold", 3) or 3)
+
+        bot = self._find_onebot_client(event)
+        if bot is None:
+            logger.error("group_invite_guard: no OneBot client for mute retaliation")
+            return
+
+        if count < threshold:
+            if self.config.get("mute_notify", True):
+                note = (
+                    f"[被禁言通知]\n"
+                    f"群号：{group_id}\n"
+                    f"操作者 QQ：{operator_id or '(未知)'}\n"
+                    f"累计被禁言：第 {count} 次（阈值 {threshold}）"
+                )
+                await self._notify(bot, note)
+            return
+
+        # 达到阈值：退群
+        try:
+            await self._call_action(
+                bot, "set_group_leave", group_id=int(group_id), is_dismiss=False
+            )
+            leave_result = f"已退出群 {group_id}"
+        except Exception as exc:
+            leave_result = f"退群失败：{exc}"
+
+        # 收集拉黑目标
+        target = str(self.config.get("mute_target", "operator") or "operator").strip().lower()
+        targets = []
+        if target in ("operator", "both") and operator_id:
+            targets.append(operator_id)
+        if target in ("inviter", "both"):
+            try:
+                invite_records = await self.get_kv_data("invite_records", {})
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
+                invite_records = {}
+            inviter_qq = invite_records.get(group_id) if isinstance(invite_records, dict) else None
+            inviter_qq = str(inviter_qq or "").strip()
+            if inviter_qq:
+                targets.append(inviter_qq)
+
+        # 去重、去空，逐一对目标执行拉黑
+        seen = set()
+        ban_results = []
+        for qq in targets:
+            qq = str(qq or "").strip()
+            if not qq or qq in seen:
+                continue
+            seen.add(qq)
+            ban_results.append(await self._apply_mute_ban(qq, bot))
+
+        # 清空该群的禁言记录
+        try:
+            records.pop(group_id, None)
+            await self.put_kv_data("mute_records", records)
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: clear mute_records failed: {exc}")
+
+        if self.config.get("mute_notify", True):
+            note = self._compose_mute_revenge_note(group_id, count, leave_result, ban_results)
             await self._notify(bot, note)
 
     def _looks_like_invite_intent(self, text: str) -> bool:
@@ -710,6 +822,30 @@ class GroupInviteGuardPlugin(Star):
             f"群号：{group_id}",
             f"邀请人 QQ：{inviter_qq}",
             f"报复结果：{result}",
+        ]
+        return "\n".join(lines)
+
+    async def _apply_mute_ban(self, qq: str, bot) -> str:
+        """按 mute_ban_mode 对目标执行拉黑，返回人类可读结果；单个动作失败不抛出，写入结果字符串。"""
+        mode = str(self.config.get("mute_ban_mode", "astrbot_ban") or "astrbot_ban").strip().lower()
+        if mode == "astrbot_ban":
+            return await self._ban_inviter(qq)
+        if mode == "delete_friend":
+            try:
+                await self._call_action(bot, "delete_friend", user_id=int(qq))
+                return f"已删除并拉黑好友 {qq}"
+            except Exception as exc:
+                return f"删除好友失败：{exc}"
+        return "未启用拉黑"
+
+    def _compose_mute_revenge_note(self, group_id, count, leave_result, ban_results) -> str:
+        ban_text = "；".join(ban_results) if ban_results else "(无拉黑目标)"
+        lines = [
+            "[被禁言报复通知]",
+            f"群号：{group_id}",
+            f"累计被禁言次数：{count}",
+            f"退群结果：{leave_result}",
+            f"拉黑结果：{ban_text}",
         ]
         return "\n".join(lines)
 
