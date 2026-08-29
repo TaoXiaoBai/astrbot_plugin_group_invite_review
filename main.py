@@ -3,6 +3,7 @@ import inspect
 import json
 import re
 import time
+from datetime import datetime
 from typing import Any
 
 from astrbot.api import logger
@@ -793,17 +794,21 @@ class GroupInviteGuardPlugin(Star):
             parts.append(f"删除好友失败：{exc}")
 
         if mode == "delete_and_ban":
-            parts.append(await self._ban_inviter(inviter_qq))
+            parts.append(await self._ban_inviter(inviter_qq, "被踢后报复"))
         return "；".join(parts)
 
-    async def _ban_inviter(self, inviter_qq: str) -> str:
-        """把邀请人加入 AstrBot 黑名单（qq_tools 插件），不可用时降级并注明。"""
+    def _get_qq_tools_instance(self) -> Any:
+        """获取 qq_tools 插件实例，未安装或不可用时返回 None。"""
         try:
             md = self.context.get_registered_star("astrbot_plugin_qq_tools")
         except Exception as exc:
-            return f"获取 qq_tools 实例失败：{exc}"
+            logger.warning(f"group_invite_guard: get qq_tools instance failed: {exc}")
+            return None
+        return getattr(md, "star_cls", None)
 
-        instance = getattr(md, "star_cls", None)
+    async def _ban_inviter(self, inviter_qq: str, reason: str = "拉黑") -> str:
+        """把邀请人加入 AstrBot 黑名单（qq_tools 插件），不可用时降级并注明。"""
+        instance = self._get_qq_tools_instance()
         if instance is None:
             return "黑名单功能不可用（未安装/未启用 qq_tools）"
 
@@ -821,7 +826,12 @@ class GroupInviteGuardPlugin(Star):
                 if not (isinstance(item, dict) and str(item.get("user_id")) == str(inviter_qq))
             ]
             ban_list.append(
-                {"user_id": str(inviter_qq), "ban_time": int(time.time()), "duration": -1}
+                {
+                    "user_id": str(inviter_qq),
+                    "ban_time": int(time.time()),
+                    "duration": -1,
+                    "reason": reason,
+                }
             )
             config["ban_list"] = ban_list
 
@@ -848,7 +858,7 @@ class GroupInviteGuardPlugin(Star):
         """按 mute_ban_mode 对目标执行拉黑，返回人类可读结果；单个动作失败不抛出，写入结果字符串。"""
         mode = str(self.config.get("mute_ban_mode", "astrbot_ban") or "astrbot_ban").strip().lower()
         if mode == "astrbot_ban":
-            return await self._ban_inviter(qq)
+            return await self._ban_inviter(qq, "被禁言后报复")
         if mode == "delete_friend":
             try:
                 await self._call_action(bot, "delete_friend", user_id=int(qq), block=True)
@@ -935,3 +945,117 @@ class GroupInviteGuardPlugin(Star):
         if self.config.get("notify_group", False) and group_id:
             result["group"] = group_id
         return result
+
+    @filter.command("邀请记录", alias=["邀请列表"])
+    async def cmd_invite_records(self, event: AstrMessageEvent):
+        if not event.is_admin():
+            yield event.plain_result("无权限")
+            return
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception as exc:
+            yield event.plain_result(f"读取邀请记录失败：{exc}")
+            return
+        if not isinstance(records, dict) or not records:
+            yield event.plain_result("暂无邀请记录")
+            return
+        lines = [f"群号 {gid} -> 邀请人 {qq}" for gid, qq in records.items()]
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("记录邀请")
+    async def cmd_record_invite(self, event: AstrMessageEvent, group_id: str, inviter_qq: str):
+        if not event.is_admin():
+            yield event.plain_result("无权限")
+            return
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception as exc:
+            yield event.plain_result(f"读取邀请记录失败：{exc}")
+            return
+        if not isinstance(records, dict):
+            records = {}
+        records[str(group_id)] = str(inviter_qq)
+        try:
+            await self.put_kv_data("invite_records", records)
+        except Exception as exc:
+            yield event.plain_result(f"写入邀请记录失败：{exc}")
+            return
+        yield event.plain_result(f"已记录 群号 {group_id} -> 邀请人 {inviter_qq}")
+
+    @filter.command("拉黑列表", alias=["黑名单"])
+    async def cmd_ban_list(self, event: AstrMessageEvent):
+        if not event.is_admin():
+            yield event.plain_result("无权限")
+            return
+        instance = self._get_qq_tools_instance()
+        if instance is None:
+            yield event.plain_result("黑名单功能不可用（未安装/未启用 qq_tools）")
+            return
+        try:
+            config = getattr(instance, "config", None)
+            if config is None:
+                yield event.plain_result("黑名单功能不可用（qq_tools 配置不可读）")
+                return
+            ban_list = config.get("ban_list")
+        except Exception as exc:
+            yield event.plain_result(f"读取黑名单失败：{exc}")
+            return
+        if not isinstance(ban_list, list) or not ban_list:
+            yield event.plain_result("黑名单为空")
+            return
+        lines = []
+        for item in ban_list:
+            if not isinstance(item, dict):
+                continue
+            user_id = str(item.get("user_id") or "")
+            ban_time = item.get("ban_time")
+            try:
+                ban_time_str = datetime.fromtimestamp(int(ban_time)).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ban_time_str = str(ban_time if ban_time is not None else "-")
+            duration = item.get("duration")
+            duration_str = "永久" if duration == -1 else str(duration if duration is not None else "-")
+            reason = str(item.get("reason") or "-")
+            lines.append(
+                f"QQ {user_id} | 拉黑时间 {ban_time_str} | 时长 {duration_str} | 原因 {reason}"
+            )
+        if not lines:
+            yield event.plain_result("黑名单为空")
+            return
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("解封")
+    async def cmd_unban(self, event: AstrMessageEvent, qq: str):
+        if not event.is_admin():
+            yield event.plain_result("无权限")
+            return
+        instance = self._get_qq_tools_instance()
+        if instance is None:
+            yield event.plain_result("黑名单功能不可用（未安装/未启用 qq_tools）")
+            return
+        try:
+            config = getattr(instance, "config", None)
+            if config is None:
+                yield event.plain_result("黑名单功能不可用（qq_tools 配置不可读）")
+                return
+            ban_list = config.get("ban_list")
+            if not isinstance(ban_list, list):
+                ban_list = []
+            new_list = [
+                item
+                for item in ban_list
+                if not (isinstance(item, dict) and str(item.get("user_id")) == str(qq))
+            ]
+            if len(new_list) == len(ban_list):
+                yield event.plain_result(f"{qq} 不在黑名单中")
+                return
+            config["ban_list"] = new_list
+            save = getattr(config, "save_config", None)
+            if callable(save):
+                if inspect.iscoroutinefunction(save):
+                    await save()
+                else:
+                    await asyncio.to_thread(save)
+            yield event.plain_result(f"已解封 {qq}")
+        except Exception as exc:
+            yield event.plain_result(f"解封失败：{exc}")

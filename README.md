@@ -15,6 +15,7 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 - 结果通知管理员（私聊 / 群）
 - 被踢后报复邀请人：自动同意进群时记录邀请人，被该群踢出后按配置删除并拉黑 / 加入 AstrBot 黑名单，并通知管理员
 - 被禁言报复：按群记录被禁言次数，达到阈值自动退群，并按配置拉黑禁言者 / 邀请人，通知管理员
+- 管理员命令：查看/维护邀请记录、查看 AstrBot 黑名单、解封（详见「命令」小节）
 
 ## 配置
 
@@ -65,6 +66,17 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 ## 平台
 
 - OneBot V11（`aiocqhttp`），已在 SnowLuma 验证；NapCat / LLOneBot / Lagrange 等 OneBot 实现理论可用
+
+## 命令
+
+以下命令仅管理员可用，发消息时需带唤醒前缀（默认 `/`）：
+
+| 命令 | 别名 | 参数 | 说明 |
+| --- | --- | --- | --- |
+| `/邀请记录` | `/邀请列表` | 无 | 列出所有「群号 -> 邀请人 QQ」记录，空则提示暂无 |
+| `/记录邀请` | 无 | `群号` `邀请人QQ` | 手动写入一条邀请记录 |
+| `/拉黑列表` | `/黑名单` | 无 | 列出 AstrBot 黑名单（QQ、拉黑时间、时长、原因） |
+| `/解封` | 无 | `QQ` | 从 AstrBot 黑名单移除指定 QQ |
 
 ## License
 
