@@ -80,11 +80,15 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
   h1 { font-size:30px; margin:0 0 6px; }
   .sub { color:#6b7184; font-size:15px; margin:0 0 20px 0; }
   table { width:100%; border-collapse:collapse; background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 6px 18px rgba(0,0,0,.06); }
-  th, td { padding:12px 14px; text-align:left; font-size:16px; border-bottom:1px solid #eceef3; }
+  th, td { padding:10px 14px; text-align:left; font-size:16px; border-bottom:1px solid #eceef3; vertical-align:middle; }
   th { background:#4a6cf7; color:#fff; font-weight:600; }
   tr:nth-child(even) td { background:#f8f9fc; }
-  .comment { color:#555; max-width:280px; word-break:break-all; }
+  .comment { color:#555; max-width:240px; word-break:break-all; }
   .empty { color:#6b7184; padding:24px; text-align:center; background:#fff; border-radius:12px; }
+  .person { display:flex; align-items:center; gap:10px; }
+  .avatar { width:44px; height:44px; border-radius:50%; object-fit:cover; background:#eef0f6; border:1px solid #eceef3; }
+  .nick { font-weight:600; font-size:16px; }
+  .qq { color:#6b7184; font-size:13px; }
 </style>
 </head>
 <body>
@@ -97,7 +101,15 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
       {% for it in items %}
       <tr>
         <td>{{ it.group }}</td>
-        <td>{{ it.inviter }}</td>
+        <td>
+          <div class="person">
+            {% if it.avatar %}<img class="avatar" src="{{ it.avatar }}" onerror="this.style.display='none'">{% endif %}
+            <div>
+              {% if it.nickname %}<div class="nick">{{ it.nickname }}</div>{% endif %}
+              <div class="qq">{{ it.inviter }}</div>
+            </div>
+          </div>
+        </td>
         <td>{{ it.time }}</td>
         <td>{{ it.action }}</td>
         <td class="comment">{{ it.comment }}</td>
@@ -197,7 +209,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.5.0",
+    "1.6.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1105,7 +1117,19 @@ class GroupInviteGuardPlugin(Star):
                 lines.append(f"群 {gid} -> {inviter}")
         return "\n".join(lines)
 
-    async def _render_invite_records_image(self) -> str:
+    async def _fetch_nickname(self, bot, qq: str) -> str:
+        """尽力取某个 QQ 的昵称（get_stranger_info），拿不到返回空字符串。"""
+        if bot is None or not qq:
+            return ""
+        try:
+            info = await self._call_action(bot, "get_stranger_info", user_id=int(qq), no_cache=False)
+        except Exception:
+            return ""
+        if isinstance(info, dict):
+            return str(info.get("nickname") or "").strip()
+        return ""
+
+    async def _render_invite_records_image(self, bot=None) -> str:
         """把邀请记录渲染成图片，返回本地图片路径；无记录或渲染失败返回空字符串。"""
         try:
             records = await self.get_kv_data("invite_records", {})
@@ -1114,6 +1138,8 @@ class GroupInviteGuardPlugin(Star):
             return ""
         if not isinstance(records, dict) or not records:
             return ""
+
+        show_profile = _as_bool(self.config.get("invite_records_show_profile", True))
 
         items = []
         for gid, rec in records.items():
@@ -1135,10 +1161,20 @@ class GroupInviteGuardPlugin(Star):
                     "time": ts,
                     "action": action,
                     "comment": comment,
+                    "avatar": "",
+                    "nickname": "",
                     "_ts": ts_int,
                 }
             )
         items.sort(key=lambda x: x["_ts"], reverse=True)
+
+        if show_profile:
+            for it in items:
+                qq = it["inviter"]
+                if qq and qq != "(未知)":
+                    it["avatar"] = f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=100"
+                    it["nickname"] = await self._fetch_nickname(bot, qq)
+
         for it in items:
             it.pop("_ts", None)
 
@@ -1155,7 +1191,8 @@ class GroupInviteGuardPlugin(Star):
 
     async def _send_invite_records_image(self, event: AstrMessageEvent) -> bool:
         """尝试以图片形式发送邀请记录；成功返回 True，失败返回 False 让调用方回退文本。"""
-        path = await self._render_invite_records_image()
+        bot = self._find_onebot_client(event)
+        path = await self._render_invite_records_image(bot)
         if not path:
             return False
         try:

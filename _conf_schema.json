@@ -136,5 +136,10 @@
     "description": "LLM 拉黑/解封是否需要管理员身份",
     "type": "bool",
     "default": false
+  },
+  "invite_records_show_profile": {
+    "description": "邀请记录图片里显示邀请人头像和昵称",
+    "type": "bool",
+    "default": true
   }
 }
