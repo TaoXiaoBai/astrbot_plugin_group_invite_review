@@ -8,7 +8,7 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Plain, Image
 from astrbot.api.star import Context, Star, register
 
 
@@ -68,6 +68,48 @@ _INVITE_KEYWORDS = (
     "能不能加群", "可以加群吗", "能加群吗", "想拉你进群", "想拉你",
     "邀请链接", "群邀请", "进我们群", "来我们群", "来群里",
 )
+
+
+_INVITE_RECORDS_TEMPLATE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  body { margin:0; background:#f6f7fb; font-family:"Microsoft YaHei",-apple-system,"PingFang SC",sans-serif; color:#1a1a2e; }
+  .wrap { padding:28px; }
+  h1 { font-size:30px; margin:0 0 6px; }
+  .sub { color:#6b7184; font-size:15px; margin:0 0 20px 0; }
+  table { width:100%; border-collapse:collapse; background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 6px 18px rgba(0,0,0,.06); }
+  th, td { padding:12px 14px; text-align:left; font-size:16px; border-bottom:1px solid #eceef3; }
+  th { background:#4a6cf7; color:#fff; font-weight:600; }
+  tr:nth-child(even) td { background:#f8f9fc; }
+  .comment { color:#555; max-width:280px; word-break:break-all; }
+  .empty { color:#6b7184; padding:24px; text-align:center; background:#fff; border-radius:12px; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>加群邀请记录</h1>
+    <div class="sub">共 {{ total }} 条（新→旧）</div>
+    {% if items %}
+    <table>
+      <tr><th>群号</th><th>邀请人</th><th>时间</th><th>处理结果</th><th>附言</th></tr>
+      {% for it in items %}
+      <tr>
+        <td>{{ it.group }}</td>
+        <td>{{ it.inviter }}</td>
+        <td>{{ it.time }}</td>
+        <td>{{ it.action }}</td>
+        <td class="comment">{{ it.comment }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <div class="empty">暂无邀请记录</div>
+    {% endif %}
+  </div>
+</body>
+</html>"""
 
 
 class GroupInviteRequestFilter(filter.CustomFilter):
@@ -155,7 +197,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.4.0",
+    "1.5.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1063,6 +1105,66 @@ class GroupInviteGuardPlugin(Star):
                 lines.append(f"群 {gid} -> {inviter}")
         return "\n".join(lines)
 
+    async def _render_invite_records_image(self) -> str:
+        """把邀请记录渲染成图片，返回本地图片路径；无记录或渲染失败返回空字符串。"""
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
+            return ""
+        if not isinstance(records, dict) or not records:
+            return ""
+
+        items = []
+        for gid, rec in records.items():
+            inviter = self._record_inviter(rec) or "(未知)"
+            if isinstance(rec, dict):
+                try:
+                    ts_int = int(rec.get("time") or 0)
+                    ts = datetime.fromtimestamp(ts_int).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    ts_int, ts = 0, "-"
+                comment = str(rec.get("comment") or "").strip() or "(无附言)"
+                action = str(rec.get("action") or "").strip() or "-"
+            else:
+                ts_int, ts, comment, action = 0, "-", "(无附言)", "-"
+            items.append(
+                {
+                    "group": str(gid),
+                    "inviter": inviter,
+                    "time": ts,
+                    "action": action,
+                    "comment": comment,
+                    "_ts": ts_int,
+                }
+            )
+        items.sort(key=lambda x: x["_ts"], reverse=True)
+        for it in items:
+            it.pop("_ts", None)
+
+        try:
+            return await self.html_render(
+                _INVITE_RECORDS_TEMPLATE,
+                {"items": items, "total": len(items)},
+                return_url=False,
+                options={"full_page": True, "type": "png"},
+            )
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: render invite image failed: {exc}")
+            return ""
+
+    async def _send_invite_records_image(self, event: AstrMessageEvent) -> bool:
+        """尝试以图片形式发送邀请记录；成功返回 True，失败返回 False 让调用方回退文本。"""
+        path = await self._render_invite_records_image()
+        if not path:
+            return False
+        try:
+            await event.send(MessageChain(chain=[Image(file=path)]))
+            return True
+        except Exception as exc:
+            logger.error(f"group_invite_guard: send invite image failed: {exc}")
+            return False
+
     async def _record_invite_text(self, group_id: str, inviter_qq: str) -> str:
         await self._record_invite(group_id, inviter_qq, action="手动记录")
         return f"已记录 群号 {group_id} -> 邀请人 {inviter_qq}"
@@ -1179,6 +1281,12 @@ class GroupInviteGuardPlugin(Star):
 
     @filter.custom_filter(AdminCommandFilter)
     async def on_admin_command(self, event: AstrMessageEvent):
+        text = (event.get_message_str() or "").strip().lstrip("/").strip()
+        cmd = text.split(" ", 1)[0] if text else ""
+        # 邀请记录优先发图片表格，渲染/发送失败则回退纯文本
+        if cmd in ("邀请记录", "邀请列表"):
+            if await self._send_invite_records_image(event):
+                return
         result = await self._dispatch_admin_command(event)
         try:
             await event.send(MessageChain(chain=[Plain(result)]))
