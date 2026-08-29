@@ -12,6 +12,22 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 
 
+try:
+    from astrbot.core.agent.run_context import ContextWrapper
+except Exception:  # 兼容旧版 / 内部 API 缺失
+    ContextWrapper = None
+
+
+def _unwrap_event(event):
+    """@filter.llm_tool 在 v4.26+ 传入 ContextWrapper，这里取出内部 AstrMessageEvent。"""
+    if ContextWrapper is not None and isinstance(event, ContextWrapper):
+        try:
+            return event.context.event
+        except Exception:
+            return event
+    return event
+
+
 def _get_value(raw: Any, key: str, default: Any = None) -> Any:
     try:
         return raw.get(key, default)
@@ -139,7 +155,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.1.0",
+    "1.3.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1069,3 +1085,127 @@ class GroupInviteGuardPlugin(Star):
             await event.send(MessageChain(chain=[Plain(result)]))
         except Exception as exc:
             logger.error(f"group_invite_guard: send command result failed: {exc}")
+
+    def _read_ban_entries(self) -> list:
+        """读取 qq_tools 黑名单，返回 [(user_id, reason), ...]。"""
+        instance = self._get_qq_tools_instance()
+        if instance is None:
+            return []
+        try:
+            config = getattr(instance, "config", None)
+            if config is None:
+                return []
+            ban_list = config.get("ban_list")
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: read ban_list failed: {exc}")
+            return []
+        if not isinstance(ban_list, list):
+            return []
+        entries = []
+        for item in ban_list:
+            if not isinstance(item, dict):
+                continue
+            user_id = str(item.get("user_id") or "").strip()
+            if not user_id:
+                continue
+            reason = str(item.get("reason") or "未注明").strip()
+            entries.append((user_id, reason))
+        return entries
+
+    async def _build_ban_context_text(self) -> str:
+        """把黑名单/邀请记录/禁言记录拼成一段给 LLM 的上下文；全空返回空字符串。"""
+        lines = []
+        entries = self._read_ban_entries()
+        if entries:
+            lines.append("当前拉黑名单：")
+            for user_id, reason in entries[:20]:
+                lines.append(f"- QQ {user_id}（{reason}）")
+
+        try:
+            invite = await self.get_kv_data("invite_records", {})
+        except Exception:
+            invite = {}
+        if isinstance(invite, dict) and invite:
+            lines.append("被邀请进群记录（群号 -> 邀请人）：")
+            for gid, qq in list(invite.items())[:20]:
+                lines.append(f"- 群 {gid} 由 {qq} 邀请")
+
+        try:
+            mute = await self.get_kv_data("mute_records", {})
+        except Exception:
+            mute = {}
+        if isinstance(mute, dict) and mute:
+            lines.append("被禁言记录（群号：次数）：")
+            for gid, cnt in list(mute.items())[:20]:
+                lines.append(f"- 群 {gid}：{cnt} 次")
+
+        if not lines:
+            return ""
+        return "[加群邀请守卫·封禁记录]\n" + "\n".join(lines)
+
+    def _tool_allowed(self, event):
+        """判断 LLM 主动拉黑/解封是否放行；返回 (是否放行, 拒绝原因)。"""
+        if not self.config.get("enable", True):
+            return False, "插件未启用。"
+        if not self.config.get("llm_tool_ban", True):
+            return False, "LLM 主动拉黑功能未启用。"
+        if self.config.get("llm_tool_require_admin", False):
+            try:
+                if not event.is_admin():
+                    return False, "没有权限：当前工具仅管理员可触发。"
+            except Exception:
+                return False, "没有权限：当前工具仅管理员可触发。"
+        return True, ""
+
+    @filter.on_llm_request(priority=-1)
+    async def on_llm_request(self, event, req):
+        if not self.config.get("enable", True):
+            return
+        if not self.config.get("llm_context_inject", True):
+            return
+        try:
+            block = await self._build_ban_context_text()
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: build ban context failed: {exc}")
+            return
+        if not block:
+            return
+        existing = getattr(req, "system_prompt", None) or ""
+        req.system_prompt = f"{existing}\n\n{block}" if existing else block
+
+    @filter.llm_tool(name="group_invite_ban_user")
+    async def llm_ban_user(self, event, user_id: str, reason: str = ""):
+        """把某个 QQ 用户加入机器人黑名单（拉黑）。当用户有骚扰、辱骂、恶意邀请后踢机器人等行为，或历史已多次违规时，主动调用此工具拉黑。"""
+        event = _unwrap_event(event)
+        allowed, msg = self._tool_allowed(event)
+        if not allowed:
+            return msg
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return "拉黑失败：缺少 user_id（QQ 号）。"
+        reason = str(reason or "").strip() or "LLM 主动拉黑"
+        return await self._ban_inviter(user_id, reason)
+
+    @filter.llm_tool(name="group_invite_unban_user")
+    async def llm_unban_user(self, event, user_id: str):
+        """把某个 QQ 用户从机器人黑名单移除（解封）。当确认是误伤、用户已道歉或不再需要拉黑时主动调用。"""
+        event = _unwrap_event(event)
+        allowed, msg = self._tool_allowed(event)
+        if not allowed:
+            return msg
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return "解封失败：缺少 user_id（QQ 号）。"
+        return await self._unban_text(user_id)
+
+    @filter.llm_tool(name="group_invite_query_ban")
+    async def llm_query_ban(self, event):
+        """查询机器人当前的黑名单、被邀请进群记录、被禁言记录。需要了解当前封禁/邀请状态时调用。"""
+        event = _unwrap_event(event)
+        if not self.config.get("enable", True):
+            return "插件未启用。"
+        try:
+            block = await self._build_ban_context_text()
+        except Exception as exc:
+            return f"查询失败：{exc}"
+        return block or "当前没有封禁记录。"

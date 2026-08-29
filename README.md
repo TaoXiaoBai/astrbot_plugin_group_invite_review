@@ -16,6 +16,7 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 - 被踢后报复邀请人：自动同意进群时记录邀请人，被该群踢出后按配置删除并拉黑 / 加入 AstrBot 黑名单，并通知管理员
 - 被禁言报复：按群记录被禁言次数，达到阈值自动退群，并按配置拉黑禁言者 / 邀请人，通知管理员
 - 管理员命令：查看/维护邀请记录、查看 AstrBot 黑名单、解封（详见「命令」小节）
+- LLM 主动拉黑/解封/查询（通过工具调用），并把封禁/邀请/禁言记录注入 LLM 上下文
 
 ## 配置
 
@@ -44,6 +45,9 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 | `mute_ban_mode` | string | `"astrbot_ban"` | 拉黑方式：`astrbot_ban` 加入AstrBot黑名单 / `delete_friend` 删除好友并拉黑 |
 | `mute_notify` | bool | `true` | 被禁言/报复后是否通知管理员 |
 | `ban_notice_message` | string | `""` | 拉黑前私聊发给邀请人的话（留空不发） |
+| `llm_context_inject` | bool | `true` | 是否把封禁记录注入 LLM 上下文 |
+| `llm_tool_ban` | bool | `true` | 是否允许 LLM 主动拉黑/解封/查询 |
+| `llm_tool_require_admin` | bool | `false` | LLM 拉黑/解封是否需管理员 |
 
 默认配置即"让人联系管理员"：判断要加时不会自动进群，只私聊通知管理员。
 
@@ -77,6 +81,10 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 | `/记录邀请` | 无 | `群号` `邀请人QQ` | 手动写入一条邀请记录 |
 | `/拉黑列表` | `/黑名单` | 无 | 列出 AstrBot 黑名单（QQ、拉黑时间、时长、原因） |
 | `/解封` | 无 | `QQ` | 从 AstrBot 黑名单移除指定 QQ |
+
+## LLM 主动拉黑
+
+机器人聊天时可自主调用三个工具：`group_invite_ban_user`（拉黑）、`group_invite_unban_user`（解封）、`group_invite_query_ban`（查询），并把当前封禁/邀请/禁言记录注入上下文。默认无需管理员，可在配置里开启管理员限制。
 
 ## License
 

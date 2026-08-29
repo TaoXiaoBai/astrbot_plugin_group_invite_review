@@ -121,5 +121,20 @@
     "description": "拉黑前私聊发给邀请人的话（留空不发）",
     "type": "string",
     "default": ""
+  },
+  "llm_context_inject": {
+    "description": "把封禁/邀请/禁言记录注入 LLM 上下文",
+    "type": "bool",
+    "default": true
+  },
+  "llm_tool_ban": {
+    "description": "允许 LLM 主动拉黑/解封/查询",
+    "type": "bool",
+    "default": true
+  },
+  "llm_tool_require_admin": {
+    "description": "LLM 拉黑/解封是否需要管理员身份",
+    "type": "bool",
+    "default": false
   }
 }
