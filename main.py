@@ -155,7 +155,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.3.1",
+    "1.3.2",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1059,7 +1059,7 @@ class GroupInviteGuardPlugin(Star):
             return f"解封失败：{exc}"
 
     async def _manual_revenge(self, inviter_qq: str, bot) -> str:
-        """手动拉黑邀请人：发自定义通知 + 删除并拉黑好友；revenge_mode 为 delete_and_ban 时再加 AstrBot 黑名单。"""
+        """手动拉黑邀请人：发自定义通知 + 删除并拉黑好友 + 加入 AstrBot 黑名单。"""
         parts = []
         notice = await self._send_ban_notice(bot, inviter_qq)
         if notice:
@@ -1069,8 +1069,7 @@ class GroupInviteGuardPlugin(Star):
             parts.append(f"已删除并拉黑好友 {inviter_qq}")
         except Exception as exc:
             parts.append(f"删除好友失败：{exc}")
-        if str(self.config.get("revenge_mode", "off") or "off").strip().lower() == "delete_and_ban":
-            parts.append(await self._ban_inviter(inviter_qq, "手动拉黑"))
+        parts.append(await self._ban_inviter(inviter_qq, "手动拉黑"))
         return "；".join(parts)
 
     async def _manual_ban_text(self, event: AstrMessageEvent, args) -> str:
