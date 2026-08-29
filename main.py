@@ -155,7 +155,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.3.3",
+    "1.3.4",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -370,14 +370,21 @@ class GroupInviteGuardPlugin(Star):
         if not isinstance(records, dict):
             records = {}
 
-        count = int(records.get(group_id, 0) or 0) + 1
+        try:
+            count = int(records.get(group_id, 0) or 0) + 1
+        except (TypeError, ValueError):
+            logger.warning(f"group_invite_guard: mute_records[{group_id}] 非数字，按 1 计")
+            count = 1
         records[group_id] = count
         try:
             await self.put_kv_data("mute_records", records)
         except Exception as exc:
             logger.warning(f"group_invite_guard: save mute_records failed: {exc}")
 
-        threshold = int(self.config.get("mute_threshold", 3) or 3)
+        try:
+            threshold = int(self.config.get("mute_threshold", 3) or 3)
+        except (TypeError, ValueError):
+            threshold = 3
 
         bot = self._find_onebot_client(event)
         if bot is None:
@@ -837,25 +844,46 @@ class GroupInviteGuardPlugin(Star):
             return None
         return getattr(md, "star_cls", None)
 
-    async def _ban_inviter(self, inviter_qq: str, reason: str = "拉黑") -> str:
-        """把邀请人加入 AstrBot 黑名单（qq_tools 插件），不可用时降级并注明。"""
+    def _get_ban_config(self):
+        """读取 qq_tools 配置；返回 (config, err)。err 为空表示成功。"""
         instance = self._get_qq_tools_instance()
         if instance is None:
-            return "黑名单功能不可用（未安装/未启用 qq_tools）"
+            return None, "黑名单功能不可用（未安装/未启用 qq_tools）"
+        config = getattr(instance, "config", None)
+        if config is None:
+            return None, "黑名单功能不可用（qq_tools 配置不可读）"
+        return config, ""
 
+    @staticmethod
+    def _filter_ban_list(ban_list, qq):
+        """从 ban_list 移除指定 QQ 的旧记录并返回新列表；非 list 输入按空列表处理。"""
+        if not isinstance(ban_list, list):
+            ban_list = []
+        return [
+            item
+            for item in ban_list
+            if not (isinstance(item, dict) and str(item.get("user_id")) == str(qq))
+        ]
+
+    async def _save_ban_config(self, config):
+        """持久化 qq_tools 配置；save_config 缺失时告警并返回 False。"""
+        save = getattr(config, "save_config", None)
+        if callable(save):
+            if inspect.iscoroutinefunction(save):
+                await save()
+            else:
+                await asyncio.to_thread(save)
+            return True
+        logger.warning("group_invite_guard: qq_tools 配置缺少 save_config，未能持久化")
+        return False
+
+    async def _ban_inviter(self, inviter_qq: str, reason: str = "拉黑") -> str:
+        """把邀请人加入 AstrBot 黑名单（qq_tools 插件），不可用时降级并注明。"""
+        config, err = self._get_ban_config()
+        if config is None:
+            return err
         try:
-            config = getattr(instance, "config", None)
-            if config is None:
-                return "黑名单功能不可用（qq_tools 配置不可读）"
-            ban_list = config.get("ban_list")
-            if not isinstance(ban_list, list):
-                ban_list = []
-            # 移除旧的同 QQ 记录，再追加永久拉黑
-            ban_list = [
-                item
-                for item in ban_list
-                if not (isinstance(item, dict) and str(item.get("user_id")) == str(inviter_qq))
-            ]
+            ban_list = self._filter_ban_list(config.get("ban_list"), inviter_qq)
             ban_list.append(
                 {
                     "user_id": str(inviter_qq),
@@ -865,14 +893,11 @@ class GroupInviteGuardPlugin(Star):
                 }
             )
             config["ban_list"] = ban_list
-
-            save = getattr(config, "save_config", None)
-            if callable(save):
-                if inspect.iscoroutinefunction(save):
-                    await save()
-                else:
-                    await asyncio.to_thread(save)
-            return f"已加入 AstrBot 黑名单：{inviter_qq}"
+            persisted = await self._save_ban_config(config)
+            msg = f"已加入 AstrBot 黑名单：{inviter_qq}"
+            if not persisted:
+                msg += "（未能持久化）"
+            return msg
         except Exception as exc:
             return f"加入黑名单失败：{exc}"
 
@@ -1001,13 +1026,10 @@ class GroupInviteGuardPlugin(Star):
         return f"已记录 群号 {group_id} -> 邀请人 {inviter_qq}"
 
     async def _list_ban_list_text(self) -> str:
-        instance = self._get_qq_tools_instance()
-        if instance is None:
-            return "黑名单功能不可用（未安装/未启用 qq_tools）"
+        config, err = self._get_ban_config()
+        if config is None:
+            return err
         try:
-            config = getattr(instance, "config", None)
-            if config is None:
-                return "黑名单功能不可用（qq_tools 配置不可读）"
             ban_list = config.get("ban_list")
         except Exception as exc:
             return f"读取黑名单失败：{exc}"
@@ -1030,31 +1052,21 @@ class GroupInviteGuardPlugin(Star):
         return "\n".join(lines) if lines else "黑名单为空"
 
     async def _unban_text(self, qq: str) -> str:
-        instance = self._get_qq_tools_instance()
-        if instance is None:
-            return "黑名单功能不可用（未安装/未启用 qq_tools）"
+        config, err = self._get_ban_config()
+        if config is None:
+            return err
         try:
-            config = getattr(instance, "config", None)
-            if config is None:
-                return "黑名单功能不可用（qq_tools 配置不可读）"
             ban_list = config.get("ban_list")
-            if not isinstance(ban_list, list):
-                ban_list = []
-            new_list = [
-                item
-                for item in ban_list
-                if not (isinstance(item, dict) and str(item.get("user_id")) == str(qq))
-            ]
-            if len(new_list) == len(ban_list):
+            normalized = ban_list if isinstance(ban_list, list) else []
+            new_list = self._filter_ban_list(normalized, qq)
+            if len(new_list) == len(normalized):
                 return f"{qq} 不在黑名单中"
             config["ban_list"] = new_list
-            save = getattr(config, "save_config", None)
-            if callable(save):
-                if inspect.iscoroutinefunction(save):
-                    await save()
-                else:
-                    await asyncio.to_thread(save)
-            return f"已解封 {qq}"
+            persisted = await self._save_ban_config(config)
+            msg = f"已解封 {qq}"
+            if not persisted:
+                msg += "（未能持久化）"
+            return msg
         except Exception as exc:
             return f"解封失败：{exc}"
 
@@ -1133,13 +1145,10 @@ class GroupInviteGuardPlugin(Star):
 
     def _read_ban_entries(self) -> list:
         """读取 qq_tools 黑名单，返回 [(user_id, reason), ...]。"""
-        instance = self._get_qq_tools_instance()
-        if instance is None:
+        config, err = self._get_ban_config()
+        if config is None:
             return []
         try:
-            config = getattr(instance, "config", None)
-            if config is None:
-                return []
             ban_list = config.get("ban_list")
         except Exception as exc:
             logger.warning(f"group_invite_guard: read ban_list failed: {exc}")
@@ -1247,8 +1256,9 @@ class GroupInviteGuardPlugin(Star):
     async def llm_query_ban(self, event):
         """查询机器人当前的黑名单、被邀请进群记录、被禁言记录。需要了解当前封禁/邀请状态时调用。"""
         event = _unwrap_event(event)
-        if not self.config.get("enable", True):
-            return "插件未启用。"
+        allowed, msg = self._tool_allowed(event)
+        if not allowed:
+            return msg
         try:
             block = await self._build_ban_context_text()
         except Exception as exc:
