@@ -80,15 +80,18 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
   h1 { font-size:30px; margin:0 0 6px; }
   .sub { color:#6b7184; font-size:15px; margin:0 0 20px 0; }
   table { width:100%; border-collapse:collapse; background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 6px 18px rgba(0,0,0,.06); }
-  th, td { padding:10px 14px; text-align:left; font-size:16px; border-bottom:1px solid #eceef3; vertical-align:middle; }
-  th { background:#4a6cf7; color:#fff; font-weight:600; }
+  th, td { padding:10px 12px; text-align:left; font-size:16px; border-bottom:1px solid #eceef3; vertical-align:middle; }
+  th { background:#4a6cf7; color:#fff; font-weight:600; white-space:nowrap; }
   tr:nth-child(even) td { background:#f8f9fc; }
-  .comment { color:#555; max-width:240px; word-break:break-all; }
+  .idx { color:#6b7184; font-family:ui-monospace,Menlo,Consolas,monospace; font-weight:700; }
+  .comment { color:#555; max-width:200px; word-break:break-all; }
   .empty { color:#6b7184; padding:24px; text-align:center; background:#fff; border-radius:12px; }
   .person { display:flex; align-items:center; gap:10px; }
   .avatar { width:44px; height:44px; border-radius:50%; object-fit:cover; background:#eef0f6; border:1px solid #eceef3; }
-  .nick { font-weight:600; font-size:16px; }
+  .gavatar { border-radius:12px; }
+  .nick { font-weight:600; font-size:16px; max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .qq { color:#6b7184; font-size:13px; }
+  .hint { margin-top:16px; font-size:12px; color:#9aa0b0; line-height:1.7; }
 </style>
 </head>
 <body>
@@ -97,10 +100,19 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
     <div class="sub">共 {{ total }} 条（新→旧）</div>
     {% if items %}
     <table>
-      <tr><th>群号</th><th>邀请人</th><th>时间</th><th>处理结果</th><th>附言</th></tr>
+      <tr><th>#</th><th>群</th><th>邀请人</th><th>时间</th><th>处理结果</th><th>附言</th></tr>
       {% for it in items %}
       <tr>
-        <td>{{ it.group }}</td>
+        <td class="idx">{{ it.index }}</td>
+        <td>
+          <div class="person">
+            {% if it.gavatar %}<img class="avatar gavatar" src="{{ it.gavatar }}" onerror="this.style.display='none'">{% endif %}
+            <div>
+              {% if it.gname %}<div class="nick">{{ it.gname }}</div>{% endif %}
+              <div class="qq">{{ it.group }}</div>
+            </div>
+          </div>
+        </td>
         <td>
           <div class="person">
             {% if it.avatar %}<img class="avatar" src="{{ it.avatar }}" onerror="this.style.display='none'">{% endif %}
@@ -119,6 +131,9 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
     {% else %}
     <div class="empty">暂无邀请记录</div>
     {% endif %}
+    <div class="hint">
+      操作提示：/手动拉黑 &lt;QQ&gt; [群号] —— 拉黑该人（给了群号会先退群） ｜ /解封 &lt;QQ&gt; —— 移出黑名单 ｜ /拉黑列表 —— 查看黑名单 ｜ /记录邀请 &lt;群号&gt; &lt;邀请人QQ&gt; —— 补录一条
+    </div>
   </div>
 </body>
 </html>"""
@@ -209,7 +224,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.6.0",
+    "1.7.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1129,6 +1144,18 @@ class GroupInviteGuardPlugin(Star):
             return str(info.get("nickname") or "").strip()
         return ""
 
+    async def _fetch_group_name(self, bot, group_id: str) -> str:
+        """尽力取群名（get_group_info）；拿不到（比如已退群）返回空字符串。"""
+        if bot is None or not group_id:
+            return ""
+        try:
+            info = await self._call_action(bot, "get_group_info", group_id=int(group_id), no_cache=False)
+        except Exception:
+            return ""
+        if isinstance(info, dict):
+            return str(info.get("group_name") or "").strip()
+        return ""
+
     async def _render_invite_records_image(self, bot=None) -> str:
         """把邀请记录渲染成图片，返回本地图片路径；无记录或渲染失败返回空字符串。"""
         try:
@@ -1140,6 +1167,7 @@ class GroupInviteGuardPlugin(Star):
             return ""
 
         show_profile = _as_bool(self.config.get("invite_records_show_profile", True))
+        show_group_profile = _as_bool(self.config.get("invite_records_show_group_profile", True))
 
         items = []
         for gid, rec in records.items():
@@ -1163,10 +1191,14 @@ class GroupInviteGuardPlugin(Star):
                     "comment": comment,
                     "avatar": "",
                     "nickname": "",
+                    "gavatar": "",
+                    "gname": "",
                     "_ts": ts_int,
                 }
             )
         items.sort(key=lambda x: x["_ts"], reverse=True)
+        for i, it in enumerate(items, 1):
+            it["index"] = i
 
         if show_profile:
             for it in items:
@@ -1174,6 +1206,13 @@ class GroupInviteGuardPlugin(Star):
                 if qq and qq != "(未知)":
                     it["avatar"] = f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=100"
                     it["nickname"] = await self._fetch_nickname(bot, qq)
+
+        if show_group_profile:
+            for it in items:
+                gid = it["group"]
+                if gid:
+                    it["gavatar"] = f"https://p.qlogo.cn/gh/{gid}/{gid}/100"
+                    it["gname"] = await self._fetch_group_name(bot, gid)
 
         for it in items:
             it.pop("_ts", None)

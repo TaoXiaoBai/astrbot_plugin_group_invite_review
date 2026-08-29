@@ -141,5 +141,10 @@
     "description": "邀请记录图片里显示邀请人头像和昵称",
     "type": "bool",
     "default": true
+  },
+  "invite_records_show_group_profile": {
+    "description": "邀请记录图片里显示群头像和群名",
+    "type": "bool",
+    "default": true
   }
 }

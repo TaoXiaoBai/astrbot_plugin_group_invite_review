@@ -49,6 +49,7 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 | `llm_tool_ban` | bool | `true` | 是否允许 LLM 主动拉黑/解封/查询 |
 | `llm_tool_require_admin` | bool | `false` | LLM 拉黑/解封是否需管理员 |
 | `invite_records_show_profile` | bool | `true` | 邀请记录图片里显示邀请人头像和昵称 |
+| `invite_records_show_group_profile` | bool | `true` | 邀请记录图片里显示群头像和群名 |
 
 默认配置即"让人联系管理员"：判断要加时不会自动进群，只私聊通知管理员。
 
@@ -78,7 +79,7 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 
 | 命令 | 别名 | 参数 | 说明 |
 | --- | --- | --- | --- |
-| `/邀请记录` | `/邀请列表` | 无 | 以图片表格列出邀请记录（含头像昵称，可在配置关闭），渲染失败时回退纯文本 |
+| `/邀请记录` | `/邀请列表` | 无 | 以图片表格列出邀请记录（序号/群头像群名/邀请人头像昵称/时间/处理结果/附言+底部操作提示），渲染失败时回退纯文本 |
 | `/记录邀请` | 无 | `群号` `邀请人QQ` | 手动写入一条邀请记录 |
 | `/拉黑列表` | `/黑名单` | 无 | 列出 AstrBot 黑名单（QQ、拉黑时间、时长、原因） |
 | `/解封` | 无 | `QQ` | 从 AstrBot 黑名单移除指定 QQ |
