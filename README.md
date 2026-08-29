@@ -42,6 +42,7 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 | `mute_target` | string | `"operator"` | 拉黑对象：`operator` 禁言者 / `inviter` 邀请人 / `both` 都拉黑 |
 | `mute_ban_mode` | string | `"astrbot_ban"` | 拉黑方式：`astrbot_ban` 加入AstrBot黑名单 / `delete_friend` 删除好友并拉黑 |
 | `mute_notify` | bool | `true` | 被禁言/报复后是否通知管理员 |
+| `ban_notice_message` | string | `""` | 拉黑前私聊发给邀请人的话（留空不发） |
 
 默认配置即"让人联系管理员"：判断要加时不会自动进群，只私聊通知管理员。
 

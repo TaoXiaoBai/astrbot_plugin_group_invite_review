@@ -374,6 +374,7 @@ class GroupInviteGuardPlugin(Star):
 
         # 收集拉黑目标
         target = str(self.config.get("mute_target", "operator") or "operator").strip().lower()
+        inviter_qq = ""
         targets = []
         if target in ("operator", "both") and operator_id:
             targets.append(operator_id)
@@ -388,7 +389,7 @@ class GroupInviteGuardPlugin(Star):
             if inviter_qq:
                 targets.append(inviter_qq)
 
-        # 去重、去空，逐一对目标执行拉黑
+        # 去重、去空，逐一对目标执行拉黑（拉黑邀请人前先私聊通知）
         seen = set()
         ban_results = []
         for qq in targets:
@@ -396,6 +397,10 @@ class GroupInviteGuardPlugin(Star):
             if not qq or qq in seen:
                 continue
             seen.add(qq)
+            if qq == inviter_qq:
+                notice = await self._send_ban_notice(bot, qq)
+                if notice:
+                    ban_results.append(notice)
             ban_results.append(await self._apply_mute_ban(qq, bot))
 
         # 清空该群的禁言记录
@@ -760,6 +765,17 @@ class GroupInviteGuardPlugin(Star):
                 return await result if inspect.isawaitable(result) else result
         raise RuntimeError(f"no usable OneBot action caller for {action}")
 
+    async def _send_ban_notice(self, bot, qq: str) -> str:
+        """拉黑前给邀请人发一条自定义私聊消息；未配置则跳过。"""
+        msg = str(self.config.get("ban_notice_message") or "").strip()
+        if not msg:
+            return ""
+        try:
+            await self._call_action(bot, "send_private_msg", user_id=int(qq), message=msg)
+            return f"已私聊通知 {qq}"
+        except Exception as exc:
+            return f"通知 {qq} 失败：{exc}"
+
     async def _take_revenge(self, inviter_qq: str, bot) -> str:
         """按 revenge_mode 对邀请人执行报复，返回人类可读结果；单个动作失败不抛出，写入结果字符串。"""
         mode = str(self.config.get("revenge_mode", "off") or "off").strip().lower()
@@ -767,6 +783,9 @@ class GroupInviteGuardPlugin(Star):
             return "未启用报复"
 
         parts = []
+        notice = await self._send_ban_notice(bot, inviter_qq)
+        if notice:
+            parts.append(notice)
         try:
             await self._call_action(bot, "delete_friend", user_id=int(inviter_qq), block=True)
             parts.append(f"已删除并拉黑好友 {inviter_qq}")
