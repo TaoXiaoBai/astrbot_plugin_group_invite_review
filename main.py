@@ -768,7 +768,7 @@ class GroupInviteGuardPlugin(Star):
 
         parts = []
         try:
-            await self._call_action(bot, "delete_friend", user_id=int(inviter_qq))
+            await self._call_action(bot, "delete_friend", user_id=int(inviter_qq), block=True)
             parts.append(f"已删除并拉黑好友 {inviter_qq}")
         except Exception as exc:
             parts.append(f"删除好友失败：{exc}")
@@ -832,7 +832,7 @@ class GroupInviteGuardPlugin(Star):
             return await self._ban_inviter(qq)
         if mode == "delete_friend":
             try:
-                await self._call_action(bot, "delete_friend", user_id=int(qq))
+                await self._call_action(bot, "delete_friend", user_id=int(qq), block=True)
                 return f"已删除并拉黑好友 {qq}"
             except Exception as exc:
                 return f"删除好友失败：{exc}"
