@@ -155,7 +155,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.3.4",
+    "1.4.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -164,15 +164,6 @@ class GroupInviteGuardPlugin(Star):
 
     @filter.custom_filter(GroupInviteRequestFilter)
     async def on_group_invite(self, event: AstrMessageEvent):
-        # 先阻止这条空的 request 消息继续进入 LLM 回复阶段
-        try:
-            event.stop_event()
-        except Exception:
-            pass
-
-        if not self.config.get("enable", True):
-            return
-
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
         if raw is None:
             return
@@ -182,6 +173,17 @@ class GroupInviteGuardPlugin(Star):
         comment = str(_get_value(raw, "comment") or "")
         flag = str(_get_value(raw, "flag") or "")
         sub_type = str(_get_value(raw, "sub_type") or "invite")
+
+        # 禁用：不接管（不 stop_event），只记录一条邀请后返回
+        if not self.config.get("enable", True):
+            await self._record_invite(group_id, inviter_qq, comment, "仅记录（插件已禁用）")
+            return
+
+        # 启用：接管这条 request，阻止这条空的 request 消息继续进入 LLM 回复阶段
+        try:
+            event.stop_event()
+        except Exception:
+            pass
 
         if not flag:
             logger.warning("group_invite_guard: request event missing flag, skip")
@@ -203,11 +205,11 @@ class GroupInviteGuardPlugin(Star):
         action = str(decision.get("action") or "unknown").strip().lower()
         reason = str(decision.get("reason") or "").strip()
 
+        result_label = "通知管理员（未自动处理）"
         if bot is None:
             logger.error("group_invite_guard: no OneBot client found")
-            return
-
-        if action == "approve" and self.config.get("auto_approve", False):
+            result_label = "判断失败（无 OneBot 客户端）"
+        elif action == "approve" and self.config.get("auto_approve", False):
             try:
                 await self._call_action(
                     bot,
@@ -220,20 +222,10 @@ class GroupInviteGuardPlugin(Star):
                 logger.info(
                     f"group_invite_guard: approved invite from {inviter_qq} to group {group_id}"
                 )
-                # 自动同意成功后，记录群号 -> 邀请人，供被踢后报复使用
-                try:
-                    records = await self.get_kv_data("invite_records", {})
-                    if not isinstance(records, dict):
-                        records = {}
-                    records[str(group_id)] = str(inviter_qq)
-                    await self.put_kv_data("invite_records", records)
-                    logger.info(
-                        f"group_invite_guard: recorded inviter {inviter_qq} for group {group_id}"
-                    )
-                except Exception as exc:
-                    logger.warning(f"group_invite_guard: record inviter failed: {exc}")
+                result_label = "自动同意进群"
             except Exception as exc:
                 logger.error(f"group_invite_guard: approve failed: {exc}")
+                result_label = "自动同意失败"
         elif action == "reject" and self.config.get("auto_reject", False):
             try:
                 await self._call_action(
@@ -247,11 +239,17 @@ class GroupInviteGuardPlugin(Star):
                 logger.info(
                     f"group_invite_guard: rejected invite from {inviter_qq} to group {group_id}"
                 )
+                result_label = "自动拒绝"
             except Exception as exc:
                 logger.error(f"group_invite_guard: reject failed: {exc}")
+                result_label = "自动拒绝失败"
 
-        note = self._compose_note(inviter_qq, group_id, comment, action, reason)
-        await self._notify(bot, note)
+        # 每条邀请都记录（无论是否自动处理），供被踢报复与查询
+        await self._record_invite(group_id, inviter_qq, comment, result_label)
+
+        if bot is not None:
+            note = self._compose_note(inviter_qq, group_id, comment, action, reason)
+            await self._notify(bot, note)
 
     @filter.custom_filter(PrivateInviteIntentFilter)
     async def on_private_invite_intent(self, event: AstrMessageEvent):
@@ -327,7 +325,7 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
             records = {}
-        inviter_qq = records.get(group_id) if isinstance(records, dict) else None
+        inviter_qq = self._record_inviter(records.get(group_id)) if isinstance(records, dict) else ""
         if not inviter_qq:
             logger.info(
                 f"group_invite_guard: no inviter record for group {group_id}, skip revenge"
@@ -423,7 +421,7 @@ class GroupInviteGuardPlugin(Star):
             except Exception as exc:
                 logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
                 invite_records = {}
-            inviter_qq = invite_records.get(group_id) if isinstance(invite_records, dict) else None
+            inviter_qq = self._record_inviter(invite_records.get(group_id)) if isinstance(invite_records, dict) else ""
             inviter_qq = str(inviter_qq or "").strip()
             if inviter_qq:
                 targets.append(inviter_qq)
@@ -844,6 +842,37 @@ class GroupInviteGuardPlugin(Star):
             return None
         return getattr(md, "star_cls", None)
 
+    @staticmethod
+    def _record_inviter(record) -> str:
+        """从邀请记录取邀请人 QQ；兼容旧的纯字符串格式。"""
+        if isinstance(record, dict):
+            return str(record.get("inviter") or "").strip()
+        return str(record or "").strip()
+
+    async def _record_invite(self, group_id: str, inviter_qq: str, comment: str = "", action: str = "") -> None:
+        """记录/覆盖一条邀请（按群号取最新），供被踢报复与查询。"""
+        group_id = str(group_id or "").strip()
+        inviter_qq = str(inviter_qq or "").strip()
+        if not group_id or not inviter_qq:
+            return
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
+            records = {}
+        if not isinstance(records, dict):
+            records = {}
+        records[group_id] = {
+            "inviter": inviter_qq,
+            "comment": str(comment or "").strip(),
+            "time": int(time.time()),
+            "action": str(action or "").strip(),
+        }
+        try:
+            await self.put_kv_data("invite_records", records)
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: save invite_records failed: {exc}")
+
     def _get_ban_config(self):
         """读取 qq_tools 配置；返回 (config, err)。err 为空表示成功。"""
         instance = self._get_qq_tools_instance()
@@ -1009,20 +1038,33 @@ class GroupInviteGuardPlugin(Star):
             return f"读取邀请记录失败：{exc}"
         if not isinstance(records, dict) or not records:
             return "暂无邀请记录"
-        return "\n".join(f"群号 {gid} -> 邀请人 {qq}" for gid, qq in records.items())
+
+        def _sort_key(item):
+            rec = item[1]
+            if isinstance(rec, dict):
+                try:
+                    return int(rec.get("time") or 0)
+                except Exception:
+                    return 0
+            return 0
+
+        lines = []
+        for gid, rec in sorted(records.items(), key=_sort_key, reverse=True):
+            inviter = self._record_inviter(rec) or "(未知)"
+            if isinstance(rec, dict):
+                try:
+                    ts = datetime.fromtimestamp(int(rec.get("time") or 0)).strftime("%m-%d %H:%M")
+                except Exception:
+                    ts = "-"
+                comment = str(rec.get("comment") or "").strip() or "(无附言)"
+                action = str(rec.get("action") or "").strip() or "-"
+                lines.append(f"群 {gid} -> {inviter} | {ts} | {action} | {comment}")
+            else:
+                lines.append(f"群 {gid} -> {inviter}")
+        return "\n".join(lines)
 
     async def _record_invite_text(self, group_id: str, inviter_qq: str) -> str:
-        try:
-            records = await self.get_kv_data("invite_records", {})
-        except Exception as exc:
-            return f"读取邀请记录失败：{exc}"
-        if not isinstance(records, dict):
-            records = {}
-        records[str(group_id)] = str(inviter_qq)
-        try:
-            await self.put_kv_data("invite_records", records)
-        except Exception as exc:
-            return f"写入邀请记录失败：{exc}"
+        await self._record_invite(group_id, inviter_qq, action="手动记录")
         return f"已记录 群号 {group_id} -> 邀请人 {inviter_qq}"
 
     async def _list_ban_list_text(self) -> str:
@@ -1181,8 +1223,9 @@ class GroupInviteGuardPlugin(Star):
             invite = {}
         if isinstance(invite, dict) and invite:
             lines.append("被邀请进群记录（群号 -> 邀请人）：")
-            for gid, qq in list(invite.items())[:20]:
-                lines.append(f"- 群 {gid} 由 {qq} 邀请")
+            for gid, rec in list(invite.items())[:20]:
+                inviter = self._record_inviter(rec)
+                lines.append(f"- 群 {gid} 由 {inviter or '(未知)'} 邀请")
 
         try:
             mute = await self.get_kv_data("mute_records", {})
