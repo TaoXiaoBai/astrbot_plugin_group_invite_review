@@ -81,7 +81,7 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 | `/记录邀请` | 无 | `群号` `邀请人QQ` | 手动写入一条邀请记录 |
 | `/拉黑列表` | `/黑名单` | 无 | 列出 AstrBot 黑名单（QQ、拉黑时间、时长、原因） |
 | `/解封` | 无 | `QQ` | 从 AstrBot 黑名单移除指定 QQ |
-| `/手动拉黑` | 无 | `群号` `[邀请人QQ]` | 退群并拉黑邀请人（发通知+删好友+加入AstrBot黑名单）；邀请人留空则查邀请记录 |
+| `/手动拉黑` | 无 | `QQ` `[群号]` | 拉黑该QQ（发通知+删好友+加入AstrBot黑名单）；给了群号就先退群 |
 
 ## LLM 主动拉黑
 

@@ -155,7 +155,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.3.2",
+    "1.3.3",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1058,56 +1058,46 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             return f"解封失败：{exc}"
 
-    async def _manual_revenge(self, inviter_qq: str, bot) -> str:
-        """手动拉黑邀请人：发自定义通知 + 删除并拉黑好友 + 加入 AstrBot 黑名单。"""
+    async def _manual_blacklist(self, target_qq: str, bot) -> str:
+        """手动拉黑某人：发自定义通知 + 删除并拉黑好友 + 加入 AstrBot 黑名单。"""
         parts = []
-        notice = await self._send_ban_notice(bot, inviter_qq)
+        notice = await self._send_ban_notice(bot, target_qq)
         if notice:
             parts.append(notice)
         try:
-            await self._call_action(bot, "delete_friend", user_id=int(inviter_qq), block=True)
-            parts.append(f"已删除并拉黑好友 {inviter_qq}")
+            await self._call_action(bot, "delete_friend", user_id=int(target_qq), block=True)
+            parts.append(f"已删除并拉黑好友 {target_qq}")
         except Exception as exc:
             parts.append(f"删除好友失败：{exc}")
-        parts.append(await self._ban_inviter(inviter_qq, "手动拉黑"))
+        parts.append(await self._ban_inviter(target_qq, "手动拉黑"))
         return "；".join(parts)
 
     async def _manual_ban_text(self, event: AstrMessageEvent, args) -> str:
-        """手动拉黑：退群 + 拉黑邀请人（找不到邀请人则只退群）。"""
+        """手动拉黑：/手动拉黑 <QQ> [群号]；有群号就退群，没有就直接发通知并拉黑该 QQ。"""
         if not args:
-            return "用法：/手动拉黑 <群号> [邀请人QQ]"
-        group_id = str(args[0] or "").strip()
-        if not group_id:
-            return "用法：/手动拉黑 <群号> [邀请人QQ]"
-        inviter_qq = str(args[1] or "").strip() if len(args) > 1 else ""
+            return "用法：/手动拉黑 <QQ> [群号]"
+        target_qq = str(args[0] or "").strip()
+        if not target_qq:
+            return "用法：/手动拉黑 <QQ> [群号]"
+        group_id = str(args[1] or "").strip() if len(args) > 1 else ""
 
         bot = self._find_onebot_client(event)
         if bot is None:
             return "手动拉黑失败：未找到 OneBot 客户端"
 
-        if not inviter_qq:
-            try:
-                records = await self.get_kv_data("invite_records", {})
-            except Exception as exc:
-                return f"读取邀请记录失败：{exc}"
-            if isinstance(records, dict):
-                inviter_qq = str(records.get(group_id) or "").strip()
-
         parts = []
-        try:
-            await self._call_action(bot, "set_group_leave", group_id=int(group_id), is_dismiss=False)
-            parts.append(f"已退出群 {group_id}")
-        except Exception as exc:
-            parts.append(f"退群失败：{exc}")
-
-        if inviter_qq:
+        if group_id:
             try:
-                result = await self._manual_revenge(inviter_qq, bot)
+                await self._call_action(bot, "set_group_leave", group_id=int(group_id), is_dismiss=False)
+                parts.append(f"已退出群 {group_id}")
             except Exception as exc:
-                result = f"报复失败：{exc}"
-            parts.append(f"邀请人 {inviter_qq}：{result}")
-        else:
-            parts.append("未找到该群的邀请人记录，仅退群、未拉黑")
+                parts.append(f"退群失败：{exc}")
+
+        try:
+            result = await self._manual_blacklist(target_qq, bot)
+        except Exception as exc:
+            result = f"拉黑失败：{exc}"
+        parts.append(f"拉黑 {target_qq}：{result}")
 
         return "；".join(parts)
 
