@@ -1,7 +1,7 @@
 <div align="center">
   <img src="logo.png" width="128" alt="logo">
   <h1>加群邀请守卫</h1>
-  <p>让机器人用<b>自己的人格</b>决定要不要接受加群邀请</p>
+  <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
     <img src="https://img.shields.io/badge/version-1.9.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
@@ -12,7 +12,7 @@
 
 ## 这是什么
 
-一个 AstrBot 插件。有人拉你的 bot 进群时，不靠死板的关键词/等级规则，而是让 bot **用自己的人格设定**，结合目标群的成员和历史聊天印象，自己判断「进还是不进」。进了被踢、被禁言，还能记仇报复。
+一个 AstrBot 插件。有人拉你的 bot 进群时，不靠死板的关键词/等级规则，而是交给 LLM 根据你设定的**人格**，结合目标群的成员和历史聊天印象，自己判断「进还是不进」。进了被踢、被禁言，还能记仇报复。
 
 ## 功能一览
 
