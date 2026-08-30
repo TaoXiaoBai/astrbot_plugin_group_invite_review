@@ -9,7 +9,7 @@
     "description": "自动同意进群",
     "type": "bool",
     "default": false,
-    "hint": "LLM 判断要加时直接同意；关闭则只通知你"
+    "hint": "LLM 判断要加时直接进群；关闭则只通知你"
   },
   "auto_reject": {
     "description": "自动拒绝邀请",
@@ -17,16 +17,22 @@
     "default": false,
     "hint": "LLM 判断不要加时直接拒绝；关闭则只通知你"
   },
+  "reply_inviter_on_decision": {
+    "description": "先回复邀请人",
+    "type": "bool",
+    "default": true,
+    "hint": "同意/拒绝之前，先私聊邀请人一句（同意=打招呼，拒绝=委婉原因）"
+  },
   "notify_private": {
     "description": "私聊通知管理员",
     "type": "bool",
     "default": true
   },
   "notify_private_qq": {
-    "description": "通知的 QQ 号",
+    "description": "管理员 QQ 号",
     "type": "string",
     "default": "",
-    "hint": "留空则用全局管理员"
+    "hint": "通知发给谁；留空则用 AstrBot 全局管理员"
   },
   "notify_group": {
     "description": "在群里通知",
@@ -36,20 +42,21 @@
   "notify_group_id": {
     "description": "通知群号",
     "type": "string",
-    "default": ""
+    "default": "",
+    "hint": "开启「在群里通知」后必填"
   },
   "llm_provider_id": {
-    "description": "决策用的模型",
+    "description": "决策模型",
     "type": "string",
     "default": "",
-    "hint": "留空则用默认模型"
+    "hint": "判断邀请用哪个模型；留空用默认"
   },
   "decision_persona": {
-    "description": "决策用人格",
+    "description": "决策人格",
     "type": "string",
     "default": "",
     "options": ["", "Sydney", "LittleSkin支持"],
-    "labels": ["自动（默认）", "Sydney", "LittleSkin支持"],
+    "labels": ["自动（当前默认人格）", "Sydney", "LittleSkin支持"],
     "hint": "LLM 按这个人格的性格做判断"
   },
   "enable_member_context": {
@@ -67,60 +74,58 @@
   "truncate_marker": {
     "description": "截断占位符",
     "type": "string",
-    "default": "…"
+    "default": "…",
+    "hint": "内容过长被截断时的结尾符号，一般不用改"
   },
   "enable_private_intent": {
-    "description": "检测私聊加群意图",
+    "description": "检测私聊意图",
     "type": "bool",
     "default": true,
     "hint": "私聊问能否加群、发邀请链接也会被识别"
   },
   "private_intent_reply": {
-    "description": "回复私聊邀请",
-    "type": "bool",
-    "default": true
-  },
-  "private_intent_notify": {
-    "description": "通知私聊邀请",
-    "type": "bool",
-    "default": true
-  },
-  "reply_inviter_on_decision": {
-    "description": "回复邀请人",
+    "description": "回复私聊意图",
     "type": "bool",
     "default": true,
-    "hint": "同意/拒绝前先私聊邀请人一句再处理"
+    "hint": "识别到私聊加群意图时回复对方"
+  },
+  "private_intent_notify": {
+    "description": "通知私聊意图",
+    "type": "bool",
+    "default": true,
+    "hint": "识别到私聊加群意图时通知管理员"
   },
   "revenge_mode": {
     "description": "被踢报复方式",
     "type": "string",
     "default": "off",
     "options": ["off", "delete_friend", "delete_and_ban"],
-    "labels": ["关闭", "删除并拉黑", "删除并加黑名单"]
+    "labels": ["关闭", "删除并拉黑", "删除并加黑名单"],
+    "hint": "被该群踢出后对邀请人的处理"
   },
   "revenge_notify": {
     "description": "被踢通知管理员",
     "type": "bool",
     "default": true,
-    "hint": "查不到邀请人时也会通知"
+    "hint": "含查不到邀请人（管理员直拉）的情况"
   },
   "kick_ban_operator": {
     "description": "拉黑踢人者",
     "type": "bool",
     "default": false,
-    "hint": "被踢时把执行踢人的人也拉黑"
+    "hint": "被踢时把执行踢人操作的人也拉黑"
   },
   "record_group_join": {
-    "description": "记录进群",
+    "description": "记录进群事件",
     "type": "bool",
     "default": true,
-    "hint": "记录每次进群的时间和操作人"
+    "hint": "记录每次进群的时间和操作人，供被踢时反查"
   },
   "cross_group_retaliation": {
     "description": "跨群连坐",
     "type": "bool",
     "default": false,
-    "hint": "被踢/禁言达阈值时，退出该邀请人邀请的所有群"
+    "hint": "触发报复时，连带退出该邀请人邀请的所有群"
   },
   "mute_retaliation_enable": {
     "description": "禁言自动报复",
@@ -132,7 +137,7 @@
     "description": "禁言次数阈值",
     "type": "int",
     "default": 3,
-    "hint": "被禁言几次后触发退群拉黑"
+    "hint": "同一个群里被禁言几次后触发"
   },
   "mute_target": {
     "description": "禁言拉黑对象",
@@ -157,33 +162,36 @@
     "description": "拉黑前留言",
     "type": "string",
     "default": "",
-    "hint": "拉黑前私聊发给对方的话，留空不发"
+    "hint": "拉黑前私聊发给对方的话；留空则不发"
   },
   "llm_context_inject": {
     "description": "注入封禁记录",
     "type": "bool",
     "default": true,
-    "hint": "让 LLM 聊天时知道谁有前科"
+    "hint": "把封禁/邀请/禁言记录写进 LLM 上下文，聊天时知道谁有前科"
   },
   "llm_tool_ban": {
     "description": "LLM 主动拉黑",
     "type": "bool",
     "default": true,
-    "hint": "允许 LLM 自主拉黑/解封/查询"
+    "hint": "允许 LLM 聊天时自主拉黑/解封/查询"
   },
   "llm_tool_require_admin": {
     "description": "LLM 拉黑需管理员",
     "type": "bool",
-    "default": false
+    "default": false,
+    "hint": "开启后仅管理员对话中 LLM 才能拉黑/解封"
   },
   "invite_records_show_profile": {
     "description": "显示邀请人头像昵称",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "用于 /邀请记录 图片"
   },
   "invite_records_show_group_profile": {
     "description": "显示群头像群名",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "用于 /邀请记录 图片"
   }
 }
