@@ -244,7 +244,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.8.0",
+    "1.9.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -420,43 +420,83 @@ class GroupInviteGuardPlugin(Star):
         if not group_id:
             return
 
+        operator_id = str(_get_value(raw, "operator_id") or "").strip()
+        self_id = str(_get_value(raw, "self_id") or "").strip()
+        if operator_id and self_id and operator_id == self_id:
+            operator_id = ""  # 机器人自己退群，不算被踢操作者
+
         try:
             records = await self.get_kv_data("invite_records", {})
         except Exception as exc:
             logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
             records = {}
         inviter_qq = self._record_inviter(records.get(group_id)) if isinstance(records, dict) else ""
+
+        mode = str(self.config.get("revenge_mode", "off") or "off").strip().lower()
+        revenge_on = mode in ("delete_friend", "delete_and_ban")
+        ban_operator_on = _as_bool(self.config.get("kick_ban_operator", False))
+        notify_on = self.config.get("revenge_notify", True)
+
+        need_bot = (inviter_qq and revenge_on) or ban_operator_on or (not inviter_qq and notify_on)
+        bot = None
+        if need_bot:
+            bot = self._find_onebot_client(event)
+            if bot is None:
+                logger.error("group_invite_guard: no OneBot client for kick handling")
+                return
+
+        # 报复邀请人（仅 revenge_mode 开启且查到邀请人时）
+        banned = set()
+        result = ""
+        if inviter_qq and revenge_on:
+            result = await self._take_revenge(inviter_qq, bot)
+            banned.add(inviter_qq)
+            logger.info(
+                f"group_invite_guard: revenge on {inviter_qq} for group {group_id}: {result}"
+            )
+
+        # 拉黑踢人者（独立开关，不依赖 revenge_mode 与邀请人记录）
+        ban_line = await self._ban_kick_operator(operator_id, bot, banned)
+
         if not inviter_qq:
             logger.info(
                 f"group_invite_guard: no inviter record for group {group_id}, skip revenge"
             )
             # 查不到邀请人时不依赖 revenge_mode，只要 revenge_notify 开着就通知管理员
-            if self.config.get("revenge_notify", True):
-                bot = self._find_onebot_client(event)
-                if bot is None:
-                    logger.error("group_invite_guard: no OneBot client for kick notify")
-                    return
+            if notify_on:
                 note = await self._compose_kick_no_inviter_note(group_id)
+                if ban_line:
+                    note += "\n" + ban_line
                 await self._notify(bot, note)
             return
 
-        mode = str(self.config.get("revenge_mode", "off") or "off").strip().lower()
-        if mode not in ("delete_friend", "delete_and_ban"):
+        if not revenge_on:
+            # 报复关闭但拉黑了踢人者时，通知里告知管理员
+            if ban_line and notify_on:
+                note = f"[被踢通知]\n群号：{group_id}\n{ban_line}"
+                await self._notify(bot, note)
             return
 
-        bot = self._find_onebot_client(event)
-        if bot is None:
-            logger.error("group_invite_guard: no OneBot client for revenge")
-            return
-
-        result = await self._take_revenge(inviter_qq, bot)
-        logger.info(
-            f"group_invite_guard: revenge on {inviter_qq} for group {group_id}: {result}"
-        )
-
-        if self.config.get("revenge_notify", True):
+        if notify_on:
             note = self._compose_revenge_note(group_id, inviter_qq, result)
+            if ban_line:
+                note += "\n" + ban_line
             await self._notify(bot, note)
+
+    async def _ban_kick_operator(self, operator_id: str, bot, already_banned: set) -> str:
+        """被踢时按 kick_ban_operator 拉黑踢人者，走与手动拉黑相同的完整流程；返回通知用结果行，未执行返回空。"""
+        if not _as_bool(self.config.get("kick_ban_operator", False)):
+            return ""
+        operator_id = str(operator_id or "").strip()
+        if not operator_id:
+            return ""
+        if operator_id in already_banned:
+            return f"踢人者 {operator_id} 与邀请人为同一人，已在报复中拉黑"
+        if bot is None:
+            return ""
+        result = await self._manual_blacklist(operator_id, bot)
+        logger.info(f"group_invite_guard: banned kick operator {operator_id}: {result}")
+        return f"已按设置拉黑踢人者 {operator_id}：{result}"
 
     async def _record_join(self, group_id: str, operator_id: str) -> None:
         """记录/覆盖一条机器人进群记录（按群号取最新），最多保留最近 100 条。"""

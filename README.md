@@ -41,6 +41,7 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 | `revenge_mode` | string | `"off"` | 被踢后的报复方式：`off` 关闭 / `delete_friend` 删除并拉黑 / `delete_and_ban` 删除并加入AstrBot黑名单 |
 | `revenge_notify` | bool | `true` | 报复后是否通知管理员（被踢且查不到邀请人时也靠它通知） |
 | `record_group_join` | bool | `true` | 记录机器人每次进群的时间/操作人 |
+| `kick_ban_operator` | bool | `false` | 被踢出群时，把执行踢人操作的人加入黑名单 |
 | `mute_retaliation_enable` | bool | `false` | 被禁言达到次数后自动退群并拉黑 |
 | `mute_threshold` | int | `3` | 被禁言达到该次数触发退群拉黑 |
 | `mute_target` | string | `"operator"` | 拉黑对象：`operator` 禁言者 / `inviter` 邀请人 / `both` 都拉黑 |

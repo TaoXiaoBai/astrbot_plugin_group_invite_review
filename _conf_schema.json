@@ -93,6 +93,11 @@
     "type": "bool",
     "default": true
   },
+  "kick_ban_operator": {
+    "description": "被踢出群时，把执行踢人操作的人加入黑名单",
+    "type": "bool",
+    "default": false
+  },
   "mute_retaliation_enable": {
     "description": "被禁言达到次数后自动退群并拉黑",
     "type": "bool",
