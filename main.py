@@ -186,6 +186,26 @@ class GroupKickFilter(filter.CustomFilter):
         return bool(user_id and self_id and user_id == self_id)
 
 
+class GroupJoinFilter(filter.CustomFilter):
+    """只匹配机器人进群成功的通知（post_type=notice, notice_type=group_increase, sub_type=invite/approve，且进群的是机器人自己）。"""
+
+    def filter(self, event: AstrMessageEvent, cfg) -> bool:
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is None:
+            return False
+        if (
+            _get_value(raw, "post_type") != "notice"
+            or _get_value(raw, "notice_type") != "group_increase"
+        ):
+            return False
+        sub_type = str(_get_value(raw, "sub_type") or "")
+        if sub_type not in ("invite", "approve"):
+            return False
+        user_id = str(_get_value(raw, "user_id") or "")
+        self_id = str(_get_value(raw, "self_id") or "")
+        return bool(user_id and self_id and user_id == self_id)
+
+
 class GroupMuteFilter(filter.CustomFilter):
     """只匹配机器人被禁言的通知（post_type=notice, notice_type=group_ban, sub_type=ban，且被禁言的是机器人自己）。"""
 
@@ -224,7 +244,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.7.0",
+    "1.8.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -375,6 +395,21 @@ class GroupInviteGuardPlugin(Star):
         if self.config.get("private_intent_notify", True):
             await self._notify(bot, note)
 
+    @filter.custom_filter(GroupJoinFilter)
+    async def on_group_join(self, event: AstrMessageEvent):
+        if not self.config.get("record_group_join", True):
+            return
+
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is None:
+            return
+
+        group_id = str(_get_value(raw, "group_id") or "")
+        if not group_id:
+            return
+        operator_id = str(_get_value(raw, "operator_id") or "")
+        await self._record_join(group_id, operator_id)
+
     @filter.custom_filter(GroupKickFilter)
     async def on_group_kick(self, event: AstrMessageEvent):
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
@@ -383,10 +418,6 @@ class GroupInviteGuardPlugin(Star):
 
         group_id = str(_get_value(raw, "group_id") or "")
         if not group_id:
-            return
-
-        mode = str(self.config.get("revenge_mode", "off") or "off").strip().lower()
-        if mode not in ("delete_friend", "delete_and_ban"):
             return
 
         try:
@@ -399,6 +430,18 @@ class GroupInviteGuardPlugin(Star):
             logger.info(
                 f"group_invite_guard: no inviter record for group {group_id}, skip revenge"
             )
+            # 查不到邀请人时不依赖 revenge_mode，只要 revenge_notify 开着就通知管理员
+            if self.config.get("revenge_notify", True):
+                bot = self._find_onebot_client(event)
+                if bot is None:
+                    logger.error("group_invite_guard: no OneBot client for kick notify")
+                    return
+                note = await self._compose_kick_no_inviter_note(group_id)
+                await self._notify(bot, note)
+            return
+
+        mode = str(self.config.get("revenge_mode", "off") or "off").strip().lower()
+        if mode not in ("delete_friend", "delete_and_ban"):
             return
 
         bot = self._find_onebot_client(event)
@@ -414,6 +457,64 @@ class GroupInviteGuardPlugin(Star):
         if self.config.get("revenge_notify", True):
             note = self._compose_revenge_note(group_id, inviter_qq, result)
             await self._notify(bot, note)
+
+    async def _record_join(self, group_id: str, operator_id: str) -> None:
+        """记录/覆盖一条机器人进群记录（按群号取最新），最多保留最近 100 条。"""
+        group_id = str(group_id or "").strip()
+        if not group_id:
+            return
+        try:
+            records = await self.get_kv_data("join_records", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load join_records failed: {exc}")
+            records = {}
+        if not isinstance(records, dict):
+            records = {}
+        records[group_id] = {
+            "time": int(time.time()),
+            "operator": str(operator_id or "").strip(),
+        }
+        if len(records) > 100:
+            def _join_ts(item):
+                rec = item[1]
+                if isinstance(rec, dict):
+                    try:
+                        return int(rec.get("time") or 0)
+                    except Exception:
+                        return 0
+                return 0
+
+            keep = sorted(records.items(), key=_join_ts, reverse=True)[:100]
+            records = dict(keep)
+        try:
+            await self.put_kv_data("join_records", records)
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: save join_records failed: {exc}")
+
+    async def _compose_kick_no_inviter_note(self, group_id: str) -> str:
+        """被踢但查不到邀请人记录时的管理员通知；附带已知进群记录。"""
+        kick_time = datetime.fromtimestamp(int(time.time())).strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            "[被踢通知（无邀请人记录）]",
+            f"群号：{group_id}",
+            f"被踢时间：{kick_time}",
+            "未记录到邀请人（可能是管理员直接拉群，无邀请事件）",
+        ]
+        try:
+            join_records = await self.get_kv_data("join_records", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load join_records failed: {exc}")
+            join_records = {}
+        rec = join_records.get(group_id) if isinstance(join_records, dict) else None
+        if isinstance(rec, dict):
+            try:
+                join_ts = datetime.fromtimestamp(int(rec.get("time") or 0)).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                join_ts = "-"
+            lines.append(f"进群时间：{join_ts}")
+            operator = str(rec.get("operator") or "").strip()
+            lines.append(f"进群操作人 QQ：{operator or '(未知)'}")
+        return "\n".join(lines)
 
     @filter.custom_filter(GroupMuteFilter)
     async def on_group_mute(self, event: AstrMessageEvent):

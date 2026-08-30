@@ -84,7 +84,12 @@
     "labels": ["关闭", "删除并拉黑", "删除并加入AstrBot黑名单"]
   },
   "revenge_notify": {
-    "description": "报复后是否通知管理员",
+    "description": "报复后是否通知管理员（被踢且查不到邀请人时也靠它通知）",
+    "type": "bool",
+    "default": true
+  },
+  "record_group_join": {
+    "description": "记录机器人每次进群的时间/操作人",
     "type": "bool",
     "default": true
   },

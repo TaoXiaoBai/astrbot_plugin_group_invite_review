@@ -13,7 +13,8 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 - 按配置决定：自动同意进群、自动拒绝、或仅通知管理员
 - 识别私聊加群意图（问"能不能加群"、发邀请链接）
 - 结果通知管理员（私聊 / 群）
-- 被踢后报复邀请人：自动同意进群时记录邀请人，被该群踢出后按配置删除并拉黑 / 加入 AstrBot 黑名单，并通知管理员
+- 被踢后报复邀请人：自动同意进群时记录邀请人，被该群踢出后按配置删除并拉黑 / 加入 AstrBot 黑名单，并通知管理员；查不到邀请人时也会通知管理员（附进群记录）
+- 进群记录：机器人每次进群成功（被拉/被同意）都记录进群时间和操作人（最近 100 条）
 - 被禁言报复：按群记录被禁言次数，达到阈值自动退群，并按配置拉黑禁言者 / 邀请人，通知管理员
 - 管理员命令：查看/维护邀请记录、查看 AstrBot 黑名单、解封、手动拉黑（退群+拉黑邀请人）（详见「命令」小节）；插件禁用时也会记录邀请但不接管事件
 - LLM 主动拉黑/解封/查询（通过工具调用），并把封禁/邀请/禁言记录注入 LLM 上下文
@@ -38,7 +39,8 @@ A group-invite guard that decides whether to accept an invite **using the bot's 
 | `private_intent_reply` | bool | `true` | 检测到意图时是否回复对方 |
 | `private_intent_notify` | bool | `true` | 检测到意图时是否通知管理员 |
 | `revenge_mode` | string | `"off"` | 被踢后的报复方式：`off` 关闭 / `delete_friend` 删除并拉黑 / `delete_and_ban` 删除并加入AstrBot黑名单 |
-| `revenge_notify` | bool | `true` | 报复后是否通知管理员 |
+| `revenge_notify` | bool | `true` | 报复后是否通知管理员（被踢且查不到邀请人时也靠它通知） |
+| `record_group_join` | bool | `true` | 记录机器人每次进群的时间/操作人 |
 | `mute_retaliation_enable` | bool | `false` | 被禁言达到次数后自动退群并拉黑 |
 | `mute_threshold` | int | `3` | 被禁言达到该次数触发退群拉黑 |
 | `mute_target` | string | `"operator"` | 拉黑对象：`operator` 禁言者 / `inviter` 邀请人 / `both` 都拉黑 |
