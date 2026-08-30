@@ -243,7 +243,7 @@ class AdminCommandFilter(filter.CustomFilter):
 @register(
     "astrbot_plugin_group_invite_guard",
     "Kimi",
-    "加群邀请自动处理：LLM 判断是否同意，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
+    "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
     "1.9.0",
 )
 class GroupInviteGuardPlugin(Star):
