@@ -71,6 +71,66 @@ _INVITE_KEYWORDS = (
 )
 
 
+# 配置分组：group -> {key: 默认值}。嵌套读取与旧平铺配置迁移都以它为准，
+# 新增配置项时同步修改这里和 _conf_schema.json。
+_CONFIG_GROUPS = {
+    "basic": {
+        "enable": True,
+        "notify_private": True,
+        "notify_private_qq": "",
+        "notify_group": False,
+        "notify_group_id": "",
+    },
+    "decision": {
+        "auto_approve": False,
+        "auto_reject": False,
+        "reply_inviter_on_decision": True,
+        "llm_provider_id": "",
+        "decision_persona": "",
+        "enable_member_context": True,
+        "enable_impression_context": True,
+        "enable_user_profile": True,
+        "truncate_marker": "…",
+    },
+    "alt_detect": {
+        "alt_account_detect": True,
+        "alt_similarity_threshold": 70,
+    },
+    "private_intent": {
+        "enable_private_intent": True,
+        "private_intent_reply": True,
+        "private_intent_notify": True,
+    },
+    "kick_revenge": {
+        "revenge_mode": "off",
+        "revenge_notify": True,
+        "kick_ban_operator": False,
+        "record_group_join": True,
+        "cross_group_retaliation": False,
+        "ban_notice_message": "",
+    },
+    "mute_revenge": {
+        "mute_retaliation_enable": False,
+        "mute_threshold": 3,
+        "mute_target": "operator",
+        "mute_ban_mode": "astrbot_ban",
+        "mute_notify": True,
+    },
+    "llm_integration": {
+        "llm_context_inject": True,
+        "llm_tool_ban": True,
+        "llm_tool_require_admin": False,
+    },
+    "display": {
+        "invite_records_show_profile": True,
+        "invite_records_show_group_profile": True,
+    },
+}
+
+# 旧平铺配置已迁入分组的标记键（在 schema 中以 invisible 保留，防止被完整性检查剔除）
+_CONFIG_MIGRATED_KEY = "_flat_config_migrated"
+
+
 _INVITE_RECORDS_TEMPLATE = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -133,7 +193,7 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
     <div class="empty">暂无邀请记录</div>
     {% endif %}
     <div class="hint">
-      操作提示：/手动拉黑 &lt;QQ或群号&gt; —— 按邀请记录反查并拉黑该人（匹配到邀请人时自动退其邀请的所有群；旧用法 /手动拉黑 &lt;QQ&gt; &lt;群号&gt; 仍可用） ｜ /解封 &lt;QQ&gt; —— 移出黑名单 ｜ /拉黑列表 —— 查看黑名单 ｜ /记录邀请 &lt;群号&gt; &lt;邀请人QQ&gt; —— 补录一条
+      操作提示：/手动拉黑 &lt;QQ或群号&gt; —— 按邀请记录反查并拉黑该人（匹配到邀请人时自动退其邀请的所有群；旧用法 /手动拉黑 &lt;QQ&gt; &lt;群号&gt; 仍可用） ｜ /解封 &lt;QQ&gt; —— 移出黑名单 ｜ /拉黑列表 —— 查看黑名单 ｜ /画像 &lt;QQ&gt; —— 查看完整画像 ｜ /记录邀请 &lt;群号&gt; &lt;邀请人QQ&gt; —— 补录一条
     </div>
   </div>
 </body>
@@ -227,7 +287,7 @@ class GroupMuteFilter(filter.CustomFilter):
 
 
 class AdminCommandFilter(filter.CustomFilter):
-    """只匹配管理员发起的命令消息（邀请记录/记录邀请/拉黑列表/解封/手动拉黑）。"""
+    """只匹配管理员发起的命令消息（邀请记录/记录邀请/拉黑列表/解封/手动拉黑/画像）。"""
 
     def filter(self, event: AstrMessageEvent, cfg) -> bool:
         try:
@@ -238,19 +298,85 @@ class AdminCommandFilter(filter.CustomFilter):
         text = (event.get_message_str() or "").strip()
         cmd = text.lstrip("/").strip()
         first = cmd.split(" ", 1)[0] if cmd else ""
-        return first in ("邀请记录", "邀请列表", "记录邀请", "拉黑列表", "黑名单", "解封", "手动拉黑")
+        return first in ("邀请记录", "邀请列表", "记录邀请", "拉黑列表", "黑名单", "解封", "手动拉黑", "画像")
 
 
 @register(
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.13.0",
+    "1.14.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config or {}
+        self._migrate_flat_config()
+
+    def _cfg(self, group: str, key: str, default: Any = None) -> Any:
+        """读取嵌套分组配置 self.config[group][key]；分组/键缺失时回退旧平铺顶层 key，最后回退 default。"""
+        try:
+            section = self.config.get(group)
+        except Exception:
+            section = None
+        if isinstance(section, dict):
+            value = section.get(key)
+            if value is not None:
+                return value
+        try:
+            if key in self.config:
+                value = self.config.get(key)
+                if value is not None:
+                    return value
+        except Exception:
+            pass
+        return default
+
+    def _migrate_flat_config(self) -> None:
+        """旧版平铺配置 → 嵌套分组的一次性迁移。
+
+        AstrBotConfig 加载时会剔除 schema 之外的键并立刻落盘，因此旧键以 invisible
+        形式保留在 _conf_schema.json 中，插件初始化时才能读到旧值。
+        只搬「与默认值不同」的旧值：缺失的旧键会被 AstrBotConfig 自动补成默认值，
+        与默认值相同的值搬与不搬等价，且不会覆盖用户在嵌套组里已设置的新值。
+        """
+        cfg = self.config
+        if not isinstance(cfg, dict) or not cfg:
+            return
+        try:
+            if cfg.get(_CONFIG_MIGRATED_KEY):
+                return
+            moved = []
+            for group, keys in _CONFIG_GROUPS.items():
+                section = cfg.get(group)
+                if not isinstance(section, dict):
+                    section = {}
+                    cfg[group] = section
+                for key, default in keys.items():
+                    if key not in cfg:
+                        continue
+                    flat_value = cfg.get(key)
+                    if flat_value is None or flat_value == default:
+                        continue
+                    if section.get(key, default) != default:
+                        continue  # 嵌套组里已有非默认值，以嵌套为准
+                    section[key] = flat_value
+                    moved.append(key)
+            cfg[_CONFIG_MIGRATED_KEY] = True
+            save = getattr(cfg, "save_config", None)
+            if callable(save):
+                try:
+                    save()
+                except Exception as exc:
+                    logger.warning(
+                        f"group_invite_guard: 迁移配置保存失败（运行期仍生效）: {exc}"
+                    )
+            if moved:
+                logger.info(
+                    f"group_invite_guard: 已迁移 {len(moved)} 项旧平铺配置到分组：{'、'.join(moved)}"
+                )
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: 配置迁移失败（不影响运行）: {exc}")
 
     @filter.custom_filter(GroupInviteRequestFilter)
     async def on_group_invite(self, event: AstrMessageEvent):
@@ -265,7 +391,7 @@ class GroupInviteGuardPlugin(Star):
         sub_type = str(_get_value(raw, "sub_type") or "invite")
 
         # 禁用：不接管（不 stop_event），只记录一条邀请后返回
-        if not self.config.get("enable", True):
+        if not self._cfg("basic", "enable", True):
             await self._record_invite(group_id, inviter_qq, comment, "仅记录（插件已禁用）")
             return
 
@@ -298,7 +424,7 @@ class GroupInviteGuardPlugin(Star):
 
         # 执行 approve/reject 之前，先私聊回复邀请人（失败不阻塞后续处理）
         reply_status = ""
-        if reply and bot is not None and self.config.get("reply_inviter_on_decision", True):
+        if reply and bot is not None and self._cfg("decision", "reply_inviter_on_decision", True):
             try:
                 await self._call_action(
                     bot, "send_private_msg", user_id=int(inviter_qq), message=reply
@@ -315,7 +441,7 @@ class GroupInviteGuardPlugin(Star):
         if bot is None:
             logger.error("group_invite_guard: no OneBot client found")
             result_label = "判断失败（无 OneBot 客户端）"
-        elif action == "approve" and self.config.get("auto_approve", False):
+        elif action == "approve" and self._cfg("decision", "auto_approve", False):
             try:
                 await self._call_action(
                     bot,
@@ -332,7 +458,7 @@ class GroupInviteGuardPlugin(Star):
             except Exception as exc:
                 logger.error(f"group_invite_guard: approve failed: {exc}")
                 result_label = "自动同意失败"
-        elif action == "reject" and self.config.get("auto_reject", False):
+        elif action == "reject" and self._cfg("decision", "auto_reject", False):
             try:
                 await self._call_action(
                     bot,
@@ -360,9 +486,9 @@ class GroupInviteGuardPlugin(Star):
 
     @filter.custom_filter(PrivateInviteIntentFilter)
     async def on_private_invite_intent(self, event: AstrMessageEvent):
-        if not self.config.get("enable", True):
+        if not self._cfg("basic", "enable", True):
             return
-        if not self.config.get("enable_private_intent", True):
+        if not self._cfg("private_intent", "enable_private_intent", True):
             return
 
         text = (event.get_message_str() or "").strip()
@@ -399,7 +525,7 @@ class GroupInviteGuardPlugin(Star):
         reply = str(decision.get("reply") or "").strip()
         reason = str(decision.get("reason") or "").strip()
 
-        if self.config.get("private_intent_reply", True) and reply:
+        if self._cfg("private_intent", "private_intent_reply", True) and reply:
             try:
                 await event.send(MessageChain(chain=[Plain(reply)]))
             except Exception as exc:
@@ -410,12 +536,12 @@ class GroupInviteGuardPlugin(Star):
         if bot is None:
             logger.error("group_invite_guard: no OneBot client for private intent notify")
             return
-        if self.config.get("private_intent_notify", True):
+        if self._cfg("private_intent", "private_intent_notify", True):
             await self._notify(bot, note)
 
     @filter.custom_filter(GroupJoinFilter)
     async def on_group_join(self, event: AstrMessageEvent):
-        if not self.config.get("record_group_join", True):
+        if not self._cfg("kick_revenge", "record_group_join", True):
             return
 
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
@@ -450,10 +576,10 @@ class GroupInviteGuardPlugin(Star):
             records = {}
         inviter_qq = self._record_inviter(records.get(group_id)) if isinstance(records, dict) else ""
 
-        mode = str(self.config.get("revenge_mode", "off") or "off").strip().lower()
+        mode = str(self._cfg("kick_revenge", "revenge_mode", "off") or "off").strip().lower()
         revenge_on = mode in ("delete_friend", "delete_and_ban")
-        ban_operator_on = _as_bool(self.config.get("kick_ban_operator", False))
-        notify_on = self.config.get("revenge_notify", True)
+        ban_operator_on = _as_bool(self._cfg("kick_revenge", "kick_ban_operator", False))
+        notify_on = self._cfg("kick_revenge", "revenge_notify", True)
 
         need_bot = (inviter_qq and revenge_on) or ban_operator_on or (not inviter_qq and notify_on)
         bot = None
@@ -508,7 +634,7 @@ class GroupInviteGuardPlugin(Star):
 
     async def _cross_group_leave(self, inviter_qq: str, exclude_group: str, records, bot) -> str:
         """跨群连坐：退出该邀请人邀请过的所有其它群（invite_records 记录保留不删）；返回通知用结果行，未执行返回空。"""
-        if not _as_bool(self.config.get("cross_group_retaliation", False)):
+        if not _as_bool(self._cfg("kick_revenge", "cross_group_retaliation", False)):
             return ""
         inviter_qq = str(inviter_qq or "").strip()
         if not inviter_qq or bot is None or not isinstance(records, dict):
@@ -534,7 +660,7 @@ class GroupInviteGuardPlugin(Star):
 
     async def _ban_kick_operator(self, operator_id: str, bot, already_banned: set) -> str:
         """被踢时按 kick_ban_operator 拉黑踢人者，走与手动拉黑相同的完整流程；返回通知用结果行，未执行返回空。"""
-        if not _as_bool(self.config.get("kick_ban_operator", False)):
+        if not _as_bool(self._cfg("kick_revenge", "kick_ban_operator", False)):
             return ""
         operator_id = str(operator_id or "").strip()
         if not operator_id:
@@ -607,7 +733,7 @@ class GroupInviteGuardPlugin(Star):
 
     @filter.custom_filter(GroupMuteFilter)
     async def on_group_mute(self, event: AstrMessageEvent):
-        if not self.config.get("mute_retaliation_enable", False):
+        if not self._cfg("mute_revenge", "mute_retaliation_enable", False):
             return
 
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
@@ -639,7 +765,7 @@ class GroupInviteGuardPlugin(Star):
             logger.warning(f"group_invite_guard: save mute_records failed: {exc}")
 
         try:
-            threshold = int(self.config.get("mute_threshold", 3) or 3)
+            threshold = int(self._cfg("mute_revenge", "mute_threshold", 3) or 3)
         except (TypeError, ValueError):
             threshold = 3
 
@@ -649,7 +775,7 @@ class GroupInviteGuardPlugin(Star):
             return
 
         if count < threshold:
-            if self.config.get("mute_notify", True):
+            if self._cfg("mute_revenge", "mute_notify", True):
                 note = (
                     f"[被禁言通知]\n"
                     f"群号：{group_id}\n"
@@ -669,7 +795,7 @@ class GroupInviteGuardPlugin(Star):
             leave_result = f"退群失败：{exc}"
 
         # 收集拉黑目标
-        target = str(self.config.get("mute_target", "operator") or "operator").strip().lower()
+        target = str(self._cfg("mute_revenge", "mute_target", "operator") or "operator").strip().lower()
         inviter_qq = ""
         invite_records = {}
         targets = []
@@ -712,7 +838,7 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             logger.warning(f"group_invite_guard: clear mute_records failed: {exc}")
 
-        if self.config.get("mute_notify", True):
+        if self._cfg("mute_revenge", "mute_notify", True):
             note = self._compose_mute_revenge_note(group_id, count, leave_result, ban_results)
             if cross_line:
                 note += "\n" + cross_line
@@ -729,11 +855,11 @@ class GroupInviteGuardPlugin(Star):
     async def _ask_llm(
         self, inviter_qq: str, group_id: str, comment: str, bot=None, platform_id: str = None
     ) -> dict:
-        provider_id = self.config.get("llm_provider_id") or self._default_provider_id()
+        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
         if not provider_id:
             raise RuntimeError("no llm provider id configured")
 
-        decision_persona = str(self.config.get("decision_persona") or "").strip()
+        decision_persona = str(self._cfg("decision", "decision_persona") or "").strip()
         persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
         system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
 
@@ -792,12 +918,12 @@ class GroupInviteGuardPlugin(Star):
         """收集画像/成员列表/历史印象/小号提示，拼成给 LLM 参考的背景信息；返回 (context, alt_warning)。"""
         # 成员列表与历史印象互不依赖，并发拉取；单个失败按空处理
         async def _member():
-            if self.config.get("enable_member_context", True):
+            if self._cfg("decision", "enable_member_context", True):
                 return await self._build_member_section(group_id, bot)
             return ""
 
         async def _impression():
-            if self.config.get("enable_impression_context", True):
+            if self._cfg("decision", "enable_impression_context", True):
                 return await self._build_impression_section(inviter_qq, group_id)
             return ("", 0)
 
@@ -813,7 +939,7 @@ class GroupInviteGuardPlugin(Star):
         sections = [s for s in (profile_section, member_section, impression_section) if s]
 
         context = "\n\n".join(sections)
-        marker = self.config.get("truncate_marker", "…")
+        marker = self._cfg("decision", "truncate_marker", "…")
         if len(context) > 4000:
             context = context[:4000] + marker
         if alt_warning:
@@ -821,13 +947,19 @@ class GroupInviteGuardPlugin(Star):
             context = f"{alt_warning}\n\n{context}" if context else alt_warning
         return context, alt_warning
 
-    async def _build_profile_section(self, inviter_qq: str, speaker_count: int) -> str:
-        """邀请人画像：完全用本地 kv / 黑名单配置拼装，不调 LLM、不发网络请求；全空返回空。"""
-        if not self.config.get("enable_user_profile", True):
-            return ""
-        qq = str(inviter_qq or "").strip()
+    async def _collect_profile_data(self, qq: str) -> dict:
+        """汇总某 QQ 的画像原始数据：纯本地 kv / 黑名单读取，不调 LLM、不发网络请求。决策版与完整版画像共用。"""
+        qq = str(qq or "").strip()
+        data = {
+            "qq": qq,
+            "invited": [],      # [(群号, 记录)]：该 QQ 邀请 bot 进过的群
+            "operated": [],     # [群号]：该 QQ 作为操作人拉 bot 进过的群
+            "rejected": 0,      # 历史邀请被拒绝次数
+            "mute_total": 0,    # TA 邀请的群累计禁言 bot 次数
+            "ban_entry": None,  # 黑名单记录 dict（含原因/拉黑时间），不在黑名单为 None
+        }
         if not qq:
-            return ""
+            return data
 
         async def _load(key):
             try:
@@ -842,40 +974,74 @@ class GroupInviteGuardPlugin(Star):
         join_records = join_records if isinstance(join_records, dict) else {}
         mute_records = mute_records if isinstance(mute_records, dict) else {}
 
-        invited = [str(gid) for gid, rec in invite_records.items() if self._record_inviter(rec) == qq]
-
-        lines = []
-        if invited:
-            lines.append(f"历史互动：邀请过 bot {len(invited)} 次（群：{'、'.join(invited[:10])}）")
-        operated = [
+        invited = [
+            (str(gid), rec)
+            for gid, rec in invite_records.items()
+            if self._record_inviter(rec) == qq
+        ]
+        data["invited"] = invited
+        data["operated"] = [
             str(gid)
             for gid, rec in join_records.items()
             if isinstance(rec, dict) and str(rec.get("operator") or "").strip() == qq
         ]
-        if operated:
-            lines.append(f"曾操作拉 bot 进群：{'、'.join(operated[:10])}")
-
-        for uid, reason in self._read_ban_entries():
-            if uid == qq:
-                lines.append(f"⚠️ 在黑名单中（原因：{reason}）")
-                break
-        rejected = sum(
+        data["ban_entry"] = self._find_ban_entry(qq)
+        data["rejected"] = sum(
             1
-            for rec in invite_records.values()
-            if self._record_inviter(rec) == qq
-            and isinstance(rec, dict)
-            and "拒绝" in str(rec.get("action") or "")
+            for _, rec in invited
+            if isinstance(rec, dict) and "拒绝" in str(rec.get("action") or "")
         )
-        if rejected:
-            lines.append(f"历史邀请被拒绝 {rejected} 次")
         mute_total = 0
-        for gid in invited:
+        for gid, _ in invited:
             try:
                 mute_total += int(mute_records.get(gid, 0) or 0)
             except (TypeError, ValueError):
                 continue
-        if mute_total:
-            lines.append(f"TA 邀请的群累计禁言 bot {mute_total} 次")
+        data["mute_total"] = mute_total
+        return data
+
+    def _find_ban_entry(self, qq: str) -> dict | None:
+        """在 qq_tools 黑名单里找某 QQ 的完整记录（含原因/拉黑时间），找不到或黑名单不可用返回 None。"""
+        config, _ = self._get_ban_config()
+        if config is None:
+            return None
+        try:
+            ban_list = config.get("ban_list")
+        except Exception:
+            return None
+        if not isinstance(ban_list, list):
+            return None
+        qq = str(qq or "").strip()
+        for item in ban_list:
+            if isinstance(item, dict) and str(item.get("user_id") or "").strip() == qq:
+                return item
+        return None
+
+    async def _build_profile_section(self, inviter_qq: str, speaker_count: int) -> str:
+        """邀请人画像（决策用精简版）：完全用本地 kv / 黑名单配置拼装，不调 LLM、不发网络请求；全空返回空。"""
+        if not self._cfg("decision", "enable_user_profile", True):
+            return ""
+        qq = str(inviter_qq or "").strip()
+        if not qq:
+            return ""
+
+        data = await self._collect_profile_data(qq)
+        invited = [gid for gid, _ in data["invited"]]
+
+        lines = []
+        if invited:
+            lines.append(f"历史互动：邀请过 bot {len(invited)} 次（群：{'、'.join(invited[:10])}）")
+        operated = data["operated"]
+        if operated:
+            lines.append(f"曾操作拉 bot 进群：{'、'.join(operated[:10])}")
+        ban_entry = data["ban_entry"]
+        if ban_entry is not None:
+            reason = str(ban_entry.get("reason") or "未注明").strip()
+            lines.append(f"⚠️ 在黑名单中（原因：{reason}）")
+        if data["rejected"]:
+            lines.append(f"历史邀请被拒绝 {data['rejected']} 次")
+        if data["mute_total"]:
+            lines.append(f"TA 邀请的群累计禁言 bot {data['mute_total']} 次")
 
         if speaker_count:
             lines.append(f"活跃度：历史会话中本人发言 {speaker_count} 条")
@@ -884,25 +1050,112 @@ class GroupInviteGuardPlugin(Star):
             return ""
         return "邀请人画像：\n" + "\n".join(lines)
 
-    async def _detect_alt_account(self, inviter_qq: str, comment: str, bot) -> str:
-        """小号识别：新邀请人与黑名单用户做附言/昵称相似度比较；命中阈值返回醒目提示行，否则空。黑名单为空直接跳过，零开销。"""
-        if not _as_bool(self.config.get("alt_account_detect", True)):
-            return ""
+    async def _build_full_profile(self, qq: str, bot=None) -> str:
+        """完整画像（/画像 命令与 LLM 工具用）：比决策版更全，附黑名单详情与所有 ≥30% 的小号相似度候选。"""
+        qq = str(qq or "").strip()
+        if not qq:
+            return "用法：/画像 <QQ>"
+
+        data = await self._collect_profile_data(qq)
+        lines = [f"QQ {qq} 的画像："]
+
+        invited = data["invited"]
+        if invited:
+            lines.append(f"邀请记录：共邀请 bot {len(invited)} 次")
+            for gid, rec in invited[:20]:
+                if isinstance(rec, dict):
+                    try:
+                        ts = datetime.fromtimestamp(int(rec.get("time") or 0)).strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        ts = "-"
+                    action = str(rec.get("action") or "").strip() or "-"
+                    comment = str(rec.get("comment") or "").strip() or "(无附言)"
+                    lines.append(f"· 群 {gid} | {ts} | {action} | {comment}")
+                else:
+                    lines.append(f"· 群 {gid}")
+            if len(invited) > 20:
+                lines.append(f"· …另有 {len(invited) - 20} 条从略")
+        else:
+            lines.append("邀请记录：无")
+
+        operated = data["operated"]
+        lines.append(f"曾操作拉 bot 进群：{'、'.join(operated[:10]) if operated else '无'}")
+
+        ban_entry = data["ban_entry"]
+        if ban_entry is not None:
+            reason = str(ban_entry.get("reason") or "未注明").strip()
+            try:
+                ban_time = datetime.fromtimestamp(
+                    int(ban_entry.get("ban_time") or 0)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ban_time = "-"
+            lines.append(f"黑名单：⚠️ 已拉黑（原因：{reason}，拉黑时间：{ban_time}）")
+        else:
+            lines.append("黑名单：未拉黑")
+
+        priors = []
+        if data["rejected"]:
+            priors.append(f"历史邀请被拒绝 {data['rejected']} 次")
+        if data["mute_total"]:
+            priors.append(f"TA 邀请的群累计禁言 bot {data['mute_total']} 次")
+        lines.append("前科：" + ("；".join(priors) if priors else "无"))
+
+        speaker_lines = await self._extract_speaker_quotes(qq)
+        lines.append(f"活跃度：历史会话中本人发言 {len(speaker_lines)} 条")
+
+        # 小号相似度：用 TA 最近一次邀请附言 + 当前昵称与黑名单逐一比较，列出所有 ≥30% 的候选
+        latest_comment = ""
+        latest_ts = -1
+        for _, rec in invited:
+            if not isinstance(rec, dict):
+                continue
+            c = str(rec.get("comment") or "").strip()
+            if not c:
+                continue
+            try:
+                ts = int(rec.get("time") or 0)
+            except (TypeError, ValueError):
+                ts = 0
+            if ts >= latest_ts:
+                latest_ts, latest_comment = ts, c
+
+        threshold = self._alt_threshold()
+        try:
+            candidates = await self._alt_similarity_candidates(qq, latest_comment, bot)
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: alt candidates for {qq} failed: {exc}")
+            candidates = []
+        candidates = [c for c in candidates if c[1] >= 30]
+        if candidates:
+            lines.append(f"与黑名单用户的小号相似度（阈值 {threshold}%）：")
+            for uid, sim, dim in candidates[:10]:
+                mark = " ⚠️ 达到阈值，疑似小号" if sim >= threshold else ""
+                lines.append(f"· 与 {uid} 相似度 {sim:.0f}%（{dim}）{mark}")
+        else:
+            lines.append(f"与黑名单用户的小号相似度：无 ≥30% 的候选（阈值 {threshold}%）")
+
+        return "\n".join(lines)
+
+    def _alt_threshold(self) -> int:
+        """小号相似度阈值（0-100）。"""
+        try:
+            threshold = int(self._cfg("alt_detect", "alt_similarity_threshold", 70) or 70)
+        except (TypeError, ValueError):
+            threshold = 70
+        return max(0, min(100, threshold))
+
+    async def _alt_similarity_candidates(self, inviter_qq: str, comment: str, bot) -> list:
+        """计算邀请人与每个黑名单用户的附言/昵称相似度，返回 [(黑名单QQ, 相似度, 维度)] 按相似度降序；黑名单为空直接返回 []，零开销。"""
         config, _ = self._get_ban_config()
         if config is None:
-            return ""
+            return []
         try:
             ban_list = config.get("ban_list")
         except Exception:
-            return ""
+            return []
         if not isinstance(ban_list, list) or not ban_list:
-            return ""
-
-        try:
-            threshold = int(self.config.get("alt_similarity_threshold", 70) or 70)
-        except (TypeError, ValueError):
-            threshold = 70
-        threshold = max(0, min(100, threshold))
+            return []
 
         inviter_qq = str(inviter_qq or "").strip()
         comment = str(comment or "").strip()
@@ -942,20 +1195,33 @@ class GroupInviteGuardPlugin(Star):
         if banned_nicks:
             inviter_nick = await self._fetch_nickname(bot, inviter_qq)
 
-        best_sim, best_uid, best_dim = 0.0, "", ""
+        candidates = []
         for uid in banned_qqs:
+            best_sim, best_dim = 0.0, ""
             past = past_comments.get(uid, "")
             if comment and past:
                 sim = difflib.SequenceMatcher(None, comment, past).ratio() * 100
                 if sim > best_sim:
-                    best_sim, best_uid, best_dim = sim, uid, "附言相似"
+                    best_sim, best_dim = sim, "附言相似"
             nick = banned_nicks.get(uid, "")
             if inviter_nick and nick:
                 sim = difflib.SequenceMatcher(None, inviter_nick, nick).ratio() * 100
                 if sim > best_sim:
-                    best_sim, best_uid, best_dim = sim, uid, "昵称相似"
+                    best_sim, best_dim = sim, "昵称相似"
+            if best_dim:
+                candidates.append((uid, best_sim, best_dim))
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        return candidates
 
-        if best_sim < threshold:
+    async def _detect_alt_account(self, inviter_qq: str, comment: str, bot) -> str:
+        """小号识别：新邀请人与黑名单用户做附言/昵称相似度比较；命中阈值返回醒目提示行，否则空。"""
+        if not _as_bool(self._cfg("alt_detect", "alt_account_detect", True)):
+            return ""
+        candidates = await self._alt_similarity_candidates(inviter_qq, comment, bot)
+        if not candidates:
+            return ""
+        best_uid, best_sim, best_dim = candidates[0]
+        if best_sim < self._alt_threshold():
             return ""
         return f"⚠️ 该邀请人与黑名单用户 {best_uid} 相似度 {best_sim:.0f}%（{best_dim}），疑似小号，请谨慎"
 
@@ -1072,7 +1338,7 @@ class GroupInviteGuardPlugin(Star):
                     if not line or len(line) < 2:
                         continue
                     if len(line) > 300:
-                        line = line[:300] + self.config.get("truncate_marker", "…")
+                        line = line[:300] + self._cfg("decision", "truncate_marker", "…")
                     if line not in quotes:
                         quotes.append(line)
                 if len(quotes) >= 20:
@@ -1100,7 +1366,7 @@ class GroupInviteGuardPlugin(Star):
             if not text:
                 continue
             if len(text) > 300:
-                text = text[:300] + self.config.get("truncate_marker", "…")
+                text = text[:300] + self._cfg("decision", "truncate_marker", "…")
             label = "用户" if role == "user" else "机器人"
             lines.append(f"{label}：{text}")
         return lines[-6:]
@@ -1129,11 +1395,11 @@ class GroupInviteGuardPlugin(Star):
         return mapping.get(str(role or "").strip().lower(), str(role or "成员"))
 
     async def _ask_private_intent(self, text: str, platform_id: str = None) -> dict:
-        provider_id = self.config.get("llm_provider_id") or self._default_provider_id()
+        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
         if not provider_id:
             raise RuntimeError("no llm provider id configured")
 
-        decision_persona = str(self.config.get("decision_persona") or "").strip()
+        decision_persona = str(self._cfg("decision", "decision_persona") or "").strip()
         persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
         system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
 
@@ -1235,7 +1501,7 @@ class GroupInviteGuardPlugin(Star):
 
     async def _send_ban_notice(self, bot, qq: str) -> str:
         """拉黑前给邀请人发一条自定义私聊消息；未配置则跳过。"""
-        msg = str(self.config.get("ban_notice_message") or "").strip()
+        msg = str(self._cfg("kick_revenge", "ban_notice_message") or "").strip()
         if not msg:
             return ""
         try:
@@ -1246,7 +1512,7 @@ class GroupInviteGuardPlugin(Star):
 
     async def _take_revenge(self, inviter_qq: str, bot) -> str:
         """按 revenge_mode 对邀请人执行报复，返回人类可读结果；单个动作失败不抛出，写入结果字符串。"""
-        mode = str(self.config.get("revenge_mode", "off") or "off").strip().lower()
+        mode = str(self._cfg("kick_revenge", "revenge_mode", "off") or "off").strip().lower()
         if mode not in ("delete_friend", "delete_and_ban"):
             return "未启用报复"
 
@@ -1372,7 +1638,7 @@ class GroupInviteGuardPlugin(Star):
 
     async def _apply_mute_ban(self, qq: str, bot) -> str:
         """按 mute_ban_mode 对目标执行拉黑，返回人类可读结果；单个动作失败不抛出，写入结果字符串。"""
-        mode = str(self.config.get("mute_ban_mode", "astrbot_ban") or "astrbot_ban").strip().lower()
+        mode = str(self._cfg("mute_revenge", "mute_ban_mode", "astrbot_ban") or "astrbot_ban").strip().lower()
         if mode == "astrbot_ban":
             return await self._ban_inviter(qq, "被禁言后报复")
         if mode == "delete_friend":
@@ -1453,18 +1719,18 @@ class GroupInviteGuardPlugin(Star):
                 logger.error(f"group_invite_guard: notify group failed: {exc}")
 
     def _notify_targets(self) -> dict:
-        private_qq = str(self.config.get("notify_private_qq") or "").strip()
-        group_id = str(self.config.get("notify_group_id") or "").strip()
+        private_qq = str(self._cfg("basic", "notify_private_qq") or "").strip()
+        group_id = str(self._cfg("basic", "notify_group_id") or "").strip()
 
-        if not private_qq and self.config.get("notify_private", True):
+        if not private_qq and self._cfg("basic", "notify_private", True):
             admins = self._nested(self._global_config(), "admins_id") or []
             if admins:
                 private_qq = str(admins[0])
 
         result = {"private": None, "group": None}
-        if self.config.get("notify_private", True) and private_qq:
+        if self._cfg("basic", "notify_private", True) and private_qq:
             result["private"] = private_qq
-        if self.config.get("notify_group", False) and group_id:
+        if self._cfg("basic", "notify_group", False) and group_id:
             result["group"] = group_id
         return result
 
@@ -1534,8 +1800,8 @@ class GroupInviteGuardPlugin(Star):
         if not isinstance(records, dict) or not records:
             return ""
 
-        show_profile = _as_bool(self.config.get("invite_records_show_profile", True))
-        show_group_profile = _as_bool(self.config.get("invite_records_show_group_profile", True))
+        show_profile = _as_bool(self._cfg("display", "invite_records_show_profile", True))
+        show_group_profile = _as_bool(self._cfg("display", "invite_records_show_group_profile", True))
 
         items = []
         for gid, rec in records.items():
@@ -1755,6 +2021,20 @@ class GroupInviteGuardPlugin(Star):
 
         return "；".join(parts)
 
+    async def _profile_text(self, event: AstrMessageEvent, args) -> str:
+        """/画像 <QQ>：输出该 QQ 的完整画像（邀请记录/黑名单/前科/活跃度/小号相似度候选）。"""
+        if not args:
+            return "用法：/画像 <QQ>"
+        qq = str(args[0] or "").strip()
+        if not qq:
+            return "用法：/画像 <QQ>"
+        bot = self._find_onebot_client(event)
+        try:
+            return await self._build_full_profile(qq, bot)
+        except Exception as exc:
+            logger.error(f"group_invite_guard: build profile for {qq} failed: {exc}")
+            return f"查询画像失败：{exc}"
+
     async def _dispatch_admin_command(self, event: AstrMessageEvent) -> str:
         text = (event.get_message_str() or "").strip().lstrip("/").strip()
         parts = text.split()
@@ -1775,6 +2055,8 @@ class GroupInviteGuardPlugin(Star):
             return await self._unban_text(args[0])
         if cmd == "手动拉黑":
             return await self._manual_ban_text(event, args)
+        if cmd == "画像":
+            return await self._profile_text(event, args)
         return "未知命令"
 
     @filter.custom_filter(AdminCommandFilter)
@@ -1850,11 +2132,11 @@ class GroupInviteGuardPlugin(Star):
 
     def _tool_allowed(self, event):
         """判断 LLM 主动拉黑/解封是否放行；返回 (是否放行, 拒绝原因)。"""
-        if not self.config.get("enable", True):
+        if not self._cfg("basic", "enable", True):
             return False, "插件未启用。"
-        if not self.config.get("llm_tool_ban", True):
+        if not self._cfg("llm_integration", "llm_tool_ban", True):
             return False, "LLM 主动拉黑功能未启用。"
-        if self.config.get("llm_tool_require_admin", False):
+        if self._cfg("llm_integration", "llm_tool_require_admin", False):
             try:
                 if not event.is_admin():
                     return False, "没有权限：当前工具仅管理员可触发。"
@@ -1864,9 +2146,9 @@ class GroupInviteGuardPlugin(Star):
 
     @filter.on_llm_request(priority=-1)
     async def on_llm_request(self, event, req):
-        if not self.config.get("enable", True):
+        if not self._cfg("basic", "enable", True):
             return
-        if not self.config.get("llm_context_inject", True):
+        if not self._cfg("llm_integration", "llm_context_inject", True):
             return
         try:
             block = await self._build_ban_context_text()
@@ -1915,3 +2197,19 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             return f"查询失败：{exc}"
         return block or "当前没有封禁记录。"
+
+    @filter.llm_tool(name="group_invite_query_profile")
+    async def llm_query_profile(self, event, qq: str):
+        """查询某个 QQ 用户的完整画像：历史邀请记录、黑名单状态（原因/时间）、被拒与禁言前科、发言活跃度，以及与黑名单用户的小号相似度候选。需要评估某个邀请人/用户是否可信、是否疑似黑名单用户的小号时调用。"""
+        event = _unwrap_event(event)
+        allowed, msg = self._tool_allowed(event)
+        if not allowed:
+            return msg
+        qq = str(qq or "").strip()
+        if not qq:
+            return "查询失败：缺少 qq 参数（QQ 号）。"
+        bot = self._find_onebot_client(event)
+        try:
+            return await self._build_full_profile(qq, bot)
+        except Exception as exc:
+            return f"查询失败：{exc}"

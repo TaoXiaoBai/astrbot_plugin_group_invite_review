@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.13.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.14.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -34,7 +34,7 @@
 
 **LLM 联动**
 - 封禁/邀请/禁言记录自动注入 LLM 上下文，bot 聊天时知道谁有前科
-- bot 可自主调用拉黑 / 解封 / 查询工具（可选需管理员）
+- bot 可自主调用 4 个工具（可选需管理员）：`group_invite_ban_user` 拉黑、`group_invite_unban_user` 解封、`group_invite_query_ban` 查封禁状态、`group_invite_query_profile` 查某个 QQ 的完整画像
 
 **管理命令**（仅管理员，需唤醒 bot）
 
@@ -42,6 +42,7 @@
 | --- | --- |
 | `/邀请记录` | 图片表格展示邀请记录（头像昵称/群名/处理结果，底部附操作提示） |
 | `/记录邀请 <群号> <QQ>` | 手动补录一条邀请记录 |
+| `/画像 <QQ>` | 输出该 QQ 的完整画像：邀请次数与明细/群列表、黑名单状态（原因/时间）、被拒与禁言前科、发言条数，以及与黑名单各用户的相似度候选（≥30% 全列出，达到阈值的标注"疑似小号"） |
 | `/手动拉黑 <QQ或群号>` | 记录驱动：先查邀请记录——是群号则拉黑该群邀请人，是邀请人QQ则收集TA邀请过的所有群；先退群（有几组退几群）再统一拉黑（通知只发一次）；查无记录则按QQ直接拉黑并注明。旧用法 `/手动拉黑 <QQ> <群号>` 不变 |
 | `/拉黑列表` | 查看黑名单（含拉黑原因） |
 | `/解封 <QQ>` | 移出黑名单 |
@@ -63,43 +64,82 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 ## 配置说明
 
 <details>
-<summary>点我展开完整配置表（所有配置都在 WebUI 插件页改）</summary>
+<summary>点我展开完整配置表（所有配置都在 WebUI 插件页改，按分组展示）</summary>
+
+> 1.14.0 起配置改为分组结构；旧版平铺配置会在启动时自动迁移到对应分组，值不变，无需手动处理。
+
+**基础 `basic`**
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
 | `enable` | `true` | 是否启用 |
-| `auto_approve` | `false` | 判断要加时自动同意进群 |
-| `auto_reject` | `false` | 判断不要加时自动拒绝 |
 | `notify_private` | `true` | 私聊通知管理员 |
 | `notify_private_qq` | `""` | 通知 QQ（留空用全局管理员） |
 | `notify_group` | `false` | 在指定群通知 |
 | `notify_group_id` | `""` | 通知群号 |
+
+**邀请决策 `decision`**
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
+| `auto_approve` | `false` | 判断要加时自动同意进群 |
+| `auto_reject` | `false` | 判断不要加时自动拒绝 |
+| `reply_inviter_on_decision` | `true` | 同意/拒绝邀请时，先私聊回复邀请人一句再处理 |
 | `llm_provider_id` | `""` | 判断用的模型（留空用默认） |
 | `decision_persona` | `""` | 决策用人格（留空用默认人格） |
 | `enable_member_context` | `true` | 参考目标群成员 |
 | `enable_impression_context` | `true` | 参考历史印象 |
+| `enable_user_profile` | `true` | 决策时附邀请人画像（本地记录，不额外调 LLM） |
 | `truncate_marker` | `…` | 截断占位符 |
+
+**小号识别 `alt_detect`**
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
+| `alt_account_detect` | `true` | 识别黑名单用户的小号 |
+| `alt_similarity_threshold` | `70` | 相似度（0-100）达到该值视为同一人 |
+
+**私聊意图 `private_intent`**
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
 | `enable_private_intent` | `true` | 检测私聊加群意图 |
 | `private_intent_reply` | `true` | 检测到意图时回复对方 |
 | `private_intent_notify` | `true` | 检测到意图时通知管理员 |
+
+**被踢报复 `kick_revenge`**
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
 | `revenge_mode` | `off` | 被踢报复：`off` / `delete_friend` / `delete_and_ban` |
 | `revenge_notify` | `true` | 报复后通知管理员（查不到邀请人也靠它通知） |
-| `record_group_join` | `true` | 记录每次进群的时间/操作人 |
 | `kick_ban_operator` | `false` | 被踢时把执行踢人的人也拉黑 |
+| `record_group_join` | `true` | 记录每次进群的时间/操作人 |
 | `cross_group_retaliation` | `false` | 被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群并拉黑 TA |
-| `reply_inviter_on_decision` | `true` | 同意/拒绝邀请时，先私聊回复邀请人一句再处理 |
-| `enable_user_profile` | `true` | 决策时附邀请人画像（本地记录，不额外调 LLM） |
-| `alt_account_detect` | `true` | 识别黑名单用户的小号 |
-| `alt_similarity_threshold` | `70` | 相似度（0-100）达到该值视为同一人 |
+| `ban_notice_message` | `""` | 拉黑前私聊发给对方的话，手动拉黑也会发送（留空不发） |
+
+**禁言报复 `mute_revenge`**
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
 | `mute_retaliation_enable` | `false` | 被禁言达阈值自动退群并拉黑 |
 | `mute_threshold` | `3` | 禁言次数阈值 |
 | `mute_target` | `operator` | 拉黑对象：`operator` / `inviter` / `both` |
 | `mute_ban_mode` | `astrbot_ban` | 拉黑方式：`astrbot_ban` / `delete_friend` |
 | `mute_notify` | `true` | 被禁言/报复后通知管理员 |
-| `ban_notice_message` | `""` | 拉黑前私聊发给对方的话（留空不发） |
+
+**LLM 联动 `llm_integration`**
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
 | `llm_context_inject` | `true` | 把封禁记录注入 LLM 上下文 |
-| `llm_tool_ban` | `true` | 允许 LLM 主动拉黑/解封/查询 |
-| `llm_tool_require_admin` | `false` | LLM 拉黑/解封需管理员 |
+| `llm_tool_ban` | `true` | 允许 LLM 主动拉黑/解封/查询/查画像 |
+| `llm_tool_require_admin` | `false` | LLM 拉黑/解封/查画像需管理员 |
+
+**显示 `display`**
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
 | `invite_records_show_profile` | `true` | 邀请记录图显示邀请人头像昵称 |
 | `invite_records_show_group_profile` | `true` | 邀请记录图显示群头像群名 |
 
