@@ -12,7 +12,8 @@
       "notify_private": {
         "description": "私聊通知管理员",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "邀请决策、被踢、被禁言等事件都通过私聊告诉你"
       },
       "notify_private_qq": {
         "description": "管理员 QQ 号",
@@ -23,7 +24,8 @@
       "notify_group": {
         "description": "在群里通知",
         "type": "bool",
-        "default": false
+        "default": false,
+        "hint": "同上的通知改发到指定群，需配合下方群号"
       },
       "notify_group_id": {
         "description": "通知群号",
@@ -53,7 +55,7 @@
         "description": "先回复邀请人",
         "type": "bool",
         "default": true,
-        "hint": "同意/拒绝之前，先私聊邀请人一句（同意=打招呼，拒绝=委婉原因）"
+        "hint": "处理邀请前先私聊邀请人一句：同意=打招呼，拒绝=委婉告知"
       },
       "llm_provider_id": {
         "description": "决策模型",
@@ -109,7 +111,7 @@
         "description": "小号相似度阈值",
         "type": "int",
         "default": 70,
-        "hint": "相似度（0-100）达到该值视为同一人"
+        "hint": "附言/昵称相似度（0-100）达到该值时提示疑似小号；只提示，不会自动拒绝"
       }
     }
   },
@@ -127,7 +129,7 @@
         "description": "回复私聊意图",
         "type": "bool",
         "default": true,
-        "hint": "识别到私聊加群意图时回复对方"
+        "hint": "识别到私聊加群意图时，由 bot 按人格回复对方"
       },
       "private_intent_notify": {
         "description": "通知私聊意图",
@@ -146,8 +148,8 @@
         "type": "string",
         "default": "off",
         "options": ["off", "delete_friend", "delete_and_ban"],
-        "labels": ["关闭", "删除并拉黑", "删除并加黑名单"],
-        "hint": "被该群踢出后对邀请人的处理"
+        "labels": ["关闭", "删好友并拉黑", "删好友拉黑+加黑名单"],
+        "hint": "被该群踢出后怎么处置邀请人；黑名单=AstrBot 黑名单"
       },
       "revenge_notify": {
         "description": "被踢通知管理员",
@@ -202,19 +204,22 @@
         "type": "string",
         "default": "operator",
         "options": ["operator", "inviter", "both"],
-        "labels": ["禁言者", "邀请人", "都拉黑"]
+        "labels": ["禁言者", "邀请人", "都拉黑"],
+        "hint": "触发退群时拉黑谁"
       },
       "mute_ban_mode": {
         "description": "禁言拉黑方式",
         "type": "string",
         "default": "astrbot_ban",
         "options": ["astrbot_ban", "delete_friend"],
-        "labels": ["加黑名单", "删好友并拉黑"]
+        "labels": ["加黑名单", "删好友并拉黑"],
+        "hint": "黑名单=AstrBot 黑名单；删好友会同时拉黑好友"
       },
       "mute_notify": {
         "description": "禁言通知管理员",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "每次被禁言、触发报复时通知你"
       }
     }
   },
