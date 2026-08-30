@@ -23,6 +23,24 @@
     "default": true,
     "hint": "同意/拒绝之前，先私聊邀请人一句（同意=打招呼，拒绝=委婉原因）"
   },
+  "enable_user_profile": {
+    "description": "决策时附邀请人画像",
+    "type": "bool",
+    "default": true,
+    "hint": "用本地记录拼邀请次数/前科/活跃度，不额外调 LLM"
+  },
+  "alt_account_detect": {
+    "description": "识别黑名单用户的小号",
+    "type": "bool",
+    "default": true,
+    "hint": "新邀请人与黑名单用户的附言/昵称相似时提示 LLM 和管理员"
+  },
+  "alt_similarity_threshold": {
+    "description": "小号相似度阈值",
+    "type": "int",
+    "default": 70,
+    "hint": "相似度（0-100）达到该值视为同一人"
+  },
   "notify_private": {
     "description": "私聊通知管理员",
     "type": "bool",

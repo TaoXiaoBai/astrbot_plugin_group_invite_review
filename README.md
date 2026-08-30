@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.12.2-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.13.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -20,6 +20,8 @@
 - 捕获加群邀请，由 LLM（人格 + 群成员 + 历史印象）判断同意/拒绝
 - 三种处理模式：自动同意 / 自动拒绝 / 仅通知管理员（默认）
 - 决策时顺便以人格身份私聊回复邀请人一句（同意的招呼 / 委婉拒绝），管理员通知里附回复原文
+- 决策附邀请人画像：历史邀请次数、黑名单前科、活跃度（纯本地数据，不额外调 LLM）
+- 小号识别：被拉黑的人换号再来？附言/昵称相似度命中即在决策上下文和通知里提示"疑似小号"
 - 私聊里问"能不能加群"、直接甩邀请链接，也能识别并回复/通知
 
 **记仇与报复**
@@ -86,6 +88,9 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `kick_ban_operator` | `false` | 被踢时把执行踢人的人也拉黑 |
 | `cross_group_retaliation` | `false` | 被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群并拉黑 TA |
 | `reply_inviter_on_decision` | `true` | 同意/拒绝邀请时，先私聊回复邀请人一句再处理 |
+| `enable_user_profile` | `true` | 决策时附邀请人画像（本地记录，不额外调 LLM） |
+| `alt_account_detect` | `true` | 识别黑名单用户的小号 |
+| `alt_similarity_threshold` | `70` | 相似度（0-100）达到该值视为同一人 |
 | `mute_retaliation_enable` | `false` | 被禁言达阈值自动退群并拉黑 |
 | `mute_threshold` | `3` | 禁言次数阈值 |
 | `mute_target` | `operator` | 拉黑对象：`operator` / `inviter` / `both` |

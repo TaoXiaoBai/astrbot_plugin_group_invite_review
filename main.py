@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import inspect
 import json
 import re
@@ -244,7 +245,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.12.2",
+    "1.13.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -353,7 +354,8 @@ class GroupInviteGuardPlugin(Star):
         await self._record_invite(group_id, inviter_qq, comment, result_label)
 
         if bot is not None:
-            note = self._compose_note(inviter_qq, group_id, comment, action, reason, reply, reply_status)
+            alt_warning = str(decision.get("alt_warning") or "").strip()
+            note = self._compose_note(inviter_qq, group_id, comment, action, reason, reply, reply_status, alt_warning)
             await self._notify(bot, note)
 
     @filter.custom_filter(PrivateInviteIntentFilter)
@@ -735,7 +737,7 @@ class GroupInviteGuardPlugin(Star):
         persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
         system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
 
-        context = await self._build_invite_context(inviter_qq, group_id, bot)
+        context, alt_warning = await self._build_invite_context(inviter_qq, group_id, bot, comment)
         prompt = (
             f"收到一个加群邀请：\n"
             f"邀请人 QQ：{inviter_qq}\n"
@@ -758,7 +760,10 @@ class GroupInviteGuardPlugin(Star):
             system_prompt=system_prompt,
         )
         text = (getattr(resp, "completion_text", "") or "").strip()
-        return _parse_json(text)
+        decision = _parse_json(text)
+        if alt_warning:
+            decision["alt_warning"] = alt_warning
+        return decision
 
     async def _resolve_persona_prompt(self, persona_id: str, platform_id: str = None) -> str:
         """加载人格设定的完整 system_prompt，用于给决策 LLM 充当性格；失败返回空。"""
@@ -783,9 +788,9 @@ class GroupInviteGuardPlugin(Star):
             return ""
         return str(getattr(persona, "system_prompt", "") or "").strip()
 
-    async def _build_invite_context(self, inviter_qq: str, group_id: str, bot) -> str:
-        """收集目标群成员列表与历史印象，拼成给 LLM 参考的背景信息；两块都拿不到时返回空字符串。"""
-        # 成员列表与历史印象互不依赖，并发拉取；单个失败按空字符串处理
+    async def _build_invite_context(self, inviter_qq: str, group_id: str, bot, comment: str = ""):
+        """收集画像/成员列表/历史印象/小号提示，拼成给 LLM 参考的背景信息；返回 (context, alt_warning)。"""
+        # 成员列表与历史印象互不依赖，并发拉取；单个失败按空处理
         async def _member():
             if self.config.get("enable_member_context", True):
                 return await self._build_member_section(group_id, bot)
@@ -794,19 +799,165 @@ class GroupInviteGuardPlugin(Star):
         async def _impression():
             if self.config.get("enable_impression_context", True):
                 return await self._build_impression_section(inviter_qq, group_id)
-            return ""
+            return ("", 0)
 
         fetched = await asyncio.gather(_member(), _impression(), return_exceptions=True)
-        sections = [s for s in fetched if isinstance(s, str) and s]
+        member_section = fetched[0] if isinstance(fetched[0], str) else ""
+        impression = fetched[1] if isinstance(fetched[1], tuple) else ("", 0)
+        impression_section, speaker_count = impression
 
-        if not sections:
-            return ""
+        # 画像与小号识别全是本地数据/文本比较，零 LLM、零额外网络请求
+        profile_section = await self._build_profile_section(inviter_qq, speaker_count)
+        alt_warning = await self._detect_alt_account(inviter_qq, comment, bot)
+
+        sections = [s for s in (profile_section, member_section, impression_section) if s]
 
         context = "\n\n".join(sections)
         marker = self.config.get("truncate_marker", "…")
         if len(context) > 4000:
             context = context[:4000] + marker
-        return context
+        if alt_warning:
+            # 小号提示放最前，醒目
+            context = f"{alt_warning}\n\n{context}" if context else alt_warning
+        return context, alt_warning
+
+    async def _build_profile_section(self, inviter_qq: str, speaker_count: int) -> str:
+        """邀请人画像：完全用本地 kv / 黑名单配置拼装，不调 LLM、不发网络请求；全空返回空。"""
+        if not self.config.get("enable_user_profile", True):
+            return ""
+        qq = str(inviter_qq or "").strip()
+        if not qq:
+            return ""
+
+        async def _load(key):
+            try:
+                return await self.get_kv_data(key, {})
+            except Exception:
+                return {}
+
+        invite_records, join_records, mute_records = await asyncio.gather(
+            _load("invite_records"), _load("join_records"), _load("mute_records")
+        )
+        invite_records = invite_records if isinstance(invite_records, dict) else {}
+        join_records = join_records if isinstance(join_records, dict) else {}
+        mute_records = mute_records if isinstance(mute_records, dict) else {}
+
+        invited = [str(gid) for gid, rec in invite_records.items() if self._record_inviter(rec) == qq]
+
+        lines = []
+        if invited:
+            lines.append(f"历史互动：邀请过 bot {len(invited)} 次（群：{'、'.join(invited[:10])}）")
+        operated = [
+            str(gid)
+            for gid, rec in join_records.items()
+            if isinstance(rec, dict) and str(rec.get("operator") or "").strip() == qq
+        ]
+        if operated:
+            lines.append(f"曾操作拉 bot 进群：{'、'.join(operated[:10])}")
+
+        for uid, reason in self._read_ban_entries():
+            if uid == qq:
+                lines.append(f"⚠️ 在黑名单中（原因：{reason}）")
+                break
+        rejected = sum(
+            1
+            for rec in invite_records.values()
+            if self._record_inviter(rec) == qq
+            and isinstance(rec, dict)
+            and "拒绝" in str(rec.get("action") or "")
+        )
+        if rejected:
+            lines.append(f"历史邀请被拒绝 {rejected} 次")
+        mute_total = 0
+        for gid in invited:
+            try:
+                mute_total += int(mute_records.get(gid, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+        if mute_total:
+            lines.append(f"TA 邀请的群累计禁言 bot {mute_total} 次")
+
+        if speaker_count:
+            lines.append(f"活跃度：历史会话中本人发言 {speaker_count} 条")
+
+        if not lines:
+            return ""
+        return "邀请人画像：\n" + "\n".join(lines)
+
+    async def _detect_alt_account(self, inviter_qq: str, comment: str, bot) -> str:
+        """小号识别：新邀请人与黑名单用户做附言/昵称相似度比较；命中阈值返回醒目提示行，否则空。黑名单为空直接跳过，零开销。"""
+        if not _as_bool(self.config.get("alt_account_detect", True)):
+            return ""
+        config, _ = self._get_ban_config()
+        if config is None:
+            return ""
+        try:
+            ban_list = config.get("ban_list")
+        except Exception:
+            return ""
+        if not isinstance(ban_list, list) or not ban_list:
+            return ""
+
+        try:
+            threshold = int(self.config.get("alt_similarity_threshold", 70) or 70)
+        except (TypeError, ValueError):
+            threshold = 70
+        threshold = max(0, min(100, threshold))
+
+        inviter_qq = str(inviter_qq or "").strip()
+        comment = str(comment or "").strip()
+
+        banned_qqs = []
+        banned_nicks = {}
+        for item in ban_list:
+            if not isinstance(item, dict):
+                continue
+            uid = str(item.get("user_id") or "").strip()
+            if not uid:
+                continue
+            banned_qqs.append(uid)
+            nick = str(item.get("nickname") or "").strip()
+            if nick:
+                banned_nicks[uid] = nick
+
+        # 附言维度：黑名单用户历史邀请时的附言（本地 kv）
+        past_comments = {}
+        if comment:
+            try:
+                records = await self.get_kv_data("invite_records", {})
+            except Exception:
+                records = {}
+            if isinstance(records, dict):
+                for rec in records.values():
+                    if not isinstance(rec, dict):
+                        continue
+                    uid = self._record_inviter(rec)
+                    if uid in banned_qqs:
+                        c = str(rec.get("comment") or "").strip()
+                        if c:
+                            past_comments.setdefault(uid, c)
+
+        # 昵称维度：仅黑名单里存了昵称时才比（邀请人昵称走现有 _fetch_nickname 路径）
+        inviter_nick = ""
+        if banned_nicks:
+            inviter_nick = await self._fetch_nickname(bot, inviter_qq)
+
+        best_sim, best_uid, best_dim = 0.0, "", ""
+        for uid in banned_qqs:
+            past = past_comments.get(uid, "")
+            if comment and past:
+                sim = difflib.SequenceMatcher(None, comment, past).ratio() * 100
+                if sim > best_sim:
+                    best_sim, best_uid, best_dim = sim, uid, "附言相似"
+            nick = banned_nicks.get(uid, "")
+            if inviter_nick and nick:
+                sim = difflib.SequenceMatcher(None, inviter_nick, nick).ratio() * 100
+                if sim > best_sim:
+                    best_sim, best_uid, best_dim = sim, uid, "昵称相似"
+
+        if best_sim < threshold:
+            return ""
+        return f"⚠️ 该邀请人与黑名单用户 {best_uid} 相似度 {best_sim:.0f}%（{best_dim}），疑似小号，请谨慎"
 
     async def _build_member_section(self, group_id: str, bot) -> str:
         header = "目标群成员列表："
@@ -836,7 +987,8 @@ class GroupInviteGuardPlugin(Star):
             return fallback
         return header + "\n" + "\n".join(lines)
 
-    async def _build_impression_section(self, inviter_qq: str, group_id: str) -> str:
+    async def _build_impression_section(self, inviter_qq: str, group_id: str):
+        """返回 (印象小节文本, 邀请人发言条数)；发言条数供画像复用，避免重复搜索。"""
         # 三次历史搜索并发执行，单个失败按空列表处理，不影响其它
         searched = await asyncio.gather(
             self._search_impression_lines(inviter_qq),
@@ -855,7 +1007,7 @@ class GroupInviteGuardPlugin(Star):
             parts.append("对邀请人 QQ 的既有印象：\n" + "\n".join(inviter_lines))
         if group_lines:
             parts.append("对该群的既有印象：\n" + "\n".join(group_lines))
-        return "\n\n".join(parts)
+        return "\n\n".join(parts), len(speaker_lines)
 
     async def _search_impression_lines(self, query: str) -> list:
         query = str(query or "").strip()
@@ -1242,7 +1394,7 @@ class GroupInviteGuardPlugin(Star):
         ]
         return "\n".join(lines)
 
-    def _compose_note(self, inviter_qq, group_id, comment, action, reason, reply="", reply_status="") -> str:
+    def _compose_note(self, inviter_qq, group_id, comment, action, reason, reply="", reply_status="", alt_warning="") -> str:
         action_label = {
             "approve": "同意加入",
             "reject": "拒绝",
@@ -1261,6 +1413,8 @@ class GroupInviteGuardPlugin(Star):
             # 发给邀请人的原文让管理员可见；邀请人只看到这条简短回复
             status = f"（{reply_status}）" if reply_status else ""
             lines.append(f"回复邀请人{status}：{reply}")
+        if alt_warning:
+            lines.append(alt_warning)
         return "\n".join(lines)
 
     def _compose_private_note(self, sender_id, text, reply, reason) -> str:
