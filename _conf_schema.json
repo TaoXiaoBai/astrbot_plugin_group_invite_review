@@ -1,31 +1,35 @@
 {
   "enable": {
-    "description": "是否启用本插件",
+    "description": "启用插件",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "关闭后只记录邀请，不接管事件"
   },
   "auto_approve": {
-    "description": "判断要加时，是否自动同意进群",
+    "description": "自动同意进群",
     "type": "bool",
-    "default": false
+    "default": false,
+    "hint": "LLM 判断要加时直接同意；关闭则只通知你"
   },
   "auto_reject": {
-    "description": "判断不要加时，是否自动拒绝",
+    "description": "自动拒绝邀请",
     "type": "bool",
-    "default": false
+    "default": false,
+    "hint": "LLM 判断不要加时直接拒绝；关闭则只通知你"
   },
   "notify_private": {
-    "description": "是否私聊通知管理员",
+    "description": "私聊通知管理员",
     "type": "bool",
     "default": true
   },
   "notify_private_qq": {
-    "description": "通知管理员的 QQ 号（留空用全局管理员）",
+    "description": "通知的 QQ 号",
     "type": "string",
-    "default": ""
+    "default": "",
+    "hint": "留空则用全局管理员"
   },
   "notify_group": {
-    "description": "是否在指定群通知",
+    "description": "在群里通知",
     "type": "bool",
     "default": false
   },
@@ -35,135 +39,150 @@
     "default": ""
   },
   "llm_provider_id": {
-    "description": "判断用的模型（留空用默认）",
+    "description": "决策用的模型",
     "type": "string",
-    "default": ""
-  },
-  "enable_member_context": {
-    "description": "是否参考目标群成员",
-    "type": "bool",
-    "default": true
-  },
-  "enable_impression_context": {
-    "description": "是否参考历史印象",
-    "type": "bool",
-    "default": true
-  },
-  "truncate_marker": {
-    "description": "截断时的占位符",
-    "type": "string",
-    "default": "…"
+    "default": "",
+    "hint": "留空则用默认模型"
   },
   "decision_persona": {
-    "description": "决策用人格（留空=自动用当前账号默认人格）",
+    "description": "决策用人格",
     "type": "string",
     "default": "",
     "options": ["", "Sydney", "LittleSkin支持"],
-    "labels": ["自动（默认）", "Sydney", "LittleSkin支持"]
+    "labels": ["自动（默认）", "Sydney", "LittleSkin支持"],
+    "hint": "LLM 按这个人格的性格做判断"
+  },
+  "enable_member_context": {
+    "description": "参考群成员",
+    "type": "bool",
+    "default": true,
+    "hint": "把目标群的成员列表给 LLM 参考"
+  },
+  "enable_impression_context": {
+    "description": "参考历史印象",
+    "type": "bool",
+    "default": true,
+    "hint": "从历史群聊/私聊里找对邀请人的印象"
+  },
+  "truncate_marker": {
+    "description": "截断占位符",
+    "type": "string",
+    "default": "…"
   },
   "enable_private_intent": {
-    "description": "是否检测私聊加群意图",
+    "description": "检测私聊加群意图",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "私聊问能否加群、发邀请链接也会被识别"
   },
   "private_intent_reply": {
-    "description": "检测到意图时是否回复对方",
+    "description": "回复私聊邀请",
     "type": "bool",
     "default": true
   },
   "private_intent_notify": {
-    "description": "检测到意图时是否通知管理员",
+    "description": "通知私聊邀请",
     "type": "bool",
     "default": true
   },
+  "reply_inviter_on_decision": {
+    "description": "回复邀请人",
+    "type": "bool",
+    "default": true,
+    "hint": "同意/拒绝前先私聊邀请人一句再处理"
+  },
   "revenge_mode": {
-    "description": "被踢后的报复方式",
+    "description": "被踢报复方式",
     "type": "string",
     "default": "off",
     "options": ["off", "delete_friend", "delete_and_ban"],
-    "labels": ["关闭", "删除并拉黑", "删除并加入AstrBot黑名单"]
+    "labels": ["关闭", "删除并拉黑", "删除并加黑名单"]
   },
   "revenge_notify": {
-    "description": "报复后是否通知管理员（被踢且查不到邀请人时也靠它通知）",
+    "description": "被踢通知管理员",
     "type": "bool",
-    "default": true
-  },
-  "record_group_join": {
-    "description": "记录机器人每次进群的时间/操作人",
-    "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "查不到邀请人时也会通知"
   },
   "kick_ban_operator": {
-    "description": "被踢出群时，把执行踢人操作的人加入黑名单",
+    "description": "拉黑踢人者",
     "type": "bool",
-    "default": false
+    "default": false,
+    "hint": "被踢时把执行踢人的人也拉黑"
+  },
+  "record_group_join": {
+    "description": "记录进群",
+    "type": "bool",
+    "default": true,
+    "hint": "记录每次进群的时间和操作人"
   },
   "cross_group_retaliation": {
-    "description": "被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群并拉黑 TA",
+    "description": "跨群连坐",
     "type": "bool",
-    "default": false
-  },
-  "reply_inviter_on_decision": {
-    "description": "同意/拒绝邀请时，先私聊回复邀请人一句再处理",
-    "type": "bool",
-    "default": true
+    "default": false,
+    "hint": "被踢/禁言达阈值时，退出该邀请人邀请的所有群"
   },
   "mute_retaliation_enable": {
-    "description": "被禁言达到次数后自动退群并拉黑",
+    "description": "禁言自动报复",
     "type": "bool",
-    "default": false
+    "default": false,
+    "hint": "被禁言达到次数后自动退群并拉黑"
   },
   "mute_threshold": {
-    "description": "被禁言达到该次数触发退群拉黑",
+    "description": "禁言次数阈值",
     "type": "int",
-    "default": 3
+    "default": 3,
+    "hint": "被禁言几次后触发退群拉黑"
   },
   "mute_target": {
-    "description": "拉黑对象",
+    "description": "禁言拉黑对象",
     "type": "string",
     "default": "operator",
     "options": ["operator", "inviter", "both"],
     "labels": ["禁言者", "邀请人", "都拉黑"]
   },
   "mute_ban_mode": {
-    "description": "拉黑方式",
+    "description": "禁言拉黑方式",
     "type": "string",
     "default": "astrbot_ban",
     "options": ["astrbot_ban", "delete_friend"],
-    "labels": ["加入AstrBot黑名单", "删除好友并拉黑"]
+    "labels": ["加黑名单", "删好友并拉黑"]
   },
   "mute_notify": {
-    "description": "被禁言/报复后是否通知管理员",
+    "description": "禁言通知管理员",
     "type": "bool",
     "default": true
   },
   "ban_notice_message": {
-    "description": "拉黑前私聊发给邀请人的话（留空不发）",
+    "description": "拉黑前留言",
     "type": "string",
-    "default": ""
+    "default": "",
+    "hint": "拉黑前私聊发给对方的话，留空不发"
   },
   "llm_context_inject": {
-    "description": "把封禁/邀请/禁言记录注入 LLM 上下文",
+    "description": "注入封禁记录",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "让 LLM 聊天时知道谁有前科"
   },
   "llm_tool_ban": {
-    "description": "允许 LLM 主动拉黑/解封/查询",
+    "description": "LLM 主动拉黑",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "允许 LLM 自主拉黑/解封/查询"
   },
   "llm_tool_require_admin": {
-    "description": "LLM 拉黑/解封是否需要管理员身份",
+    "description": "LLM 拉黑需管理员",
     "type": "bool",
     "default": false
   },
   "invite_records_show_profile": {
-    "description": "邀请记录图片里显示邀请人头像和昵称",
+    "description": "显示邀请人头像昵称",
     "type": "bool",
     "default": true
   },
   "invite_records_show_group_profile": {
-    "description": "邀请记录图片里显示群头像和群名",
+    "description": "显示群头像群名",
     "type": "bool",
     "default": true
   }

@@ -244,7 +244,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.12.0",
+    "1.12.1",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
