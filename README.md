@@ -1,96 +1,108 @@
-# 加群邀请守卫 (astrbot_plugin_group_invite_guard)
+<div align="center">
+  <img src="logo.png" width="128" alt="logo">
+  <h1>加群邀请守卫</h1>
+  <p>让机器人用<b>自己的人格</b>决定要不要接受加群邀请</p>
+  <p>
+    <img src="https://img.shields.io/badge/version-1.9.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
+    <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
+    <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
+  </p>
+</div>
 
-## 关于 / About
+## 这是什么
 
-让机器人用**自己的人格设定**判断要不要接受加群邀请，并参考目标群成员和历史印象，而不是靠死板的关键词或等级规则；同时识别私聊里的加群意图。
+一个 AstrBot 插件。有人拉你的 bot 进群时，不靠死板的关键词/等级规则，而是让 bot **用自己的人格设定**，结合目标群的成员和历史聊天印象，自己判断「进还是不进」。进了被踢、被禁言，还能记仇报复。
 
-A group-invite guard that decides whether to accept an invite **using the bot's own persona**, with target-group members and chat history as context — instead of hard-coded keyword/level rules. It also detects invite intent in private chats.
+## 功能一览
 
-## 功能
+**进群决策**
+- 捕获加群邀请，由 LLM（人格 + 群成员 + 历史印象）判断同意/拒绝
+- 三种处理模式：自动同意 / 自动拒绝 / 仅通知管理员（默认）
+- 私聊里问"能不能加群"、直接甩邀请链接，也能识别并回复/通知
 
-- 捕获 OneBot 加群邀请请求（`post_type=request / request_type=group / sub_type=invite`）
-- 用机器人人格 + 目标群成员 + 历史印象判断 `approve` / `reject`
-- 按配置决定：自动同意进群、自动拒绝、或仅通知管理员
-- 识别私聊加群意图（问"能不能加群"、发邀请链接）
-- 结果通知管理员（私聊 / 群）
-- 被踢后报复邀请人：自动同意进群时记录邀请人，被该群踢出后按配置删除并拉黑 / 加入 AstrBot 黑名单，并通知管理员；查不到邀请人时也会通知管理员（附进群记录）
-- 进群记录：机器人每次进群成功（被拉/被同意）都记录进群时间和操作人（最近 100 条）
-- 被禁言报复：按群记录被禁言次数，达到阈值自动退群，并按配置拉黑禁言者 / 邀请人，通知管理员
-- 管理员命令：查看/维护邀请记录、查看 AstrBot 黑名单、解封、手动拉黑（退群+拉黑邀请人）（详见「命令」小节）；插件禁用时也会记录邀请但不接管事件
-- LLM 主动拉黑/解封/查询（通过工具调用），并把封禁/邀请/禁言记录注入 LLM 上下文
+**记仇与报复**
+- 自动记录每次进群的邀请人；被该群踢出后可自动删除好友 / 拉黑邀请人，并通知管理员
+- 可选：被踢时连执行踢人的管理员一起拉黑
+- 被禁言自动计数，达到阈值自动退群 + 拉黑
+- 拉黑前可给对方发一句自定义告别留言
+- 管理员直拉进群没有邀请事件？也没关系——进群时间/操作人照样记录，被踢时通知你
 
-## 配置
+**LLM 联动**
+- 封禁/邀请/禁言记录自动注入 LLM 上下文，bot 聊天时知道谁有前科
+- bot 可自主调用拉黑 / 解封 / 查询工具（可选需管理员）
 
-| 配置项 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `enable` | bool | `true` | 是否启用 |
-| `auto_approve` | bool | `false` | 判断要加时是否自动同意进群 |
-| `auto_reject` | bool | `false` | 判断不要加时是否自动拒绝 |
-| `notify_private` | bool | `true` | 是否私聊通知管理员 |
-| `notify_private_qq` | string | `""` | 通知 QQ（留空用全局管理员） |
-| `notify_group` | bool | `false` | 是否在指定群通知 |
-| `notify_group_id` | string | `""` | 通知群号 |
-| `llm_provider_id` | string | `""` | 判断用的模型（留空用默认） |
-| `enable_member_context` | bool | `true` | 是否参考目标群成员 |
-| `enable_impression_context` | bool | `true` | 是否参考历史印象 |
-| `truncate_marker` | string | `…` | 截断占位符 |
-| `decision_persona` | string | `""` | 决策用人格（留空用当前账号默认人格） |
-| `enable_private_intent` | bool | `true` | 是否检测私聊加群意图 |
-| `private_intent_reply` | bool | `true` | 检测到意图时是否回复对方 |
-| `private_intent_notify` | bool | `true` | 检测到意图时是否通知管理员 |
-| `revenge_mode` | string | `"off"` | 被踢后的报复方式：`off` 关闭 / `delete_friend` 删除并拉黑 / `delete_and_ban` 删除并加入AstrBot黑名单 |
-| `revenge_notify` | bool | `true` | 报复后是否通知管理员（被踢且查不到邀请人时也靠它通知） |
-| `record_group_join` | bool | `true` | 记录机器人每次进群的时间/操作人 |
-| `kick_ban_operator` | bool | `false` | 被踢出群时，把执行踢人操作的人加入黑名单 |
-| `mute_retaliation_enable` | bool | `false` | 被禁言达到次数后自动退群并拉黑 |
-| `mute_threshold` | int | `3` | 被禁言达到该次数触发退群拉黑 |
-| `mute_target` | string | `"operator"` | 拉黑对象：`operator` 禁言者 / `inviter` 邀请人 / `both` 都拉黑 |
-| `mute_ban_mode` | string | `"astrbot_ban"` | 拉黑方式：`astrbot_ban` 加入AstrBot黑名单 / `delete_friend` 删除好友并拉黑 |
-| `mute_notify` | bool | `true` | 被禁言/报复后是否通知管理员 |
-| `ban_notice_message` | string | `""` | 拉黑前私聊发给邀请人的话（留空不发） |
-| `llm_context_inject` | bool | `true` | 是否把封禁记录注入 LLM 上下文 |
-| `llm_tool_ban` | bool | `true` | 是否允许 LLM 主动拉黑/解封/查询 |
-| `llm_tool_require_admin` | bool | `false` | LLM 拉黑/解封是否需管理员 |
-| `invite_records_show_profile` | bool | `true` | 邀请记录图片里显示邀请人头像和昵称 |
-| `invite_records_show_group_profile` | bool | `true` | 邀请记录图片里显示群头像和群名 |
+**管理命令**（仅管理员，需唤醒 bot）
 
-默认配置即"让人联系管理员"：判断要加时不会自动进群，只私聊通知管理员。
+| 命令 | 说明 |
+| --- | --- |
+| `/邀请记录` | 图片表格展示邀请记录（头像昵称/群名/处理结果，底部附操作提示） |
+| `/记录邀请 <群号> <QQ>` | 手动补录一条邀请记录 |
+| `/手动拉黑 <QQ> [群号]` | 发通知 + 删好友 + 拉黑；带群号则先退群 |
+| `/拉黑列表` | 查看黑名单（含拉黑原因） |
+| `/解封 <QQ>` | 移出黑名单 |
 
-## 私聊加群意图说明
-
-私聊场景拿不到加群 `request` 事件（没有 `flag`/`group_id`），无法直接调用 `set_group_add_request` 进群，插件会：
-
-1. 粗筛私聊消息（邀请链接特征或"进群/加群/拉你/邀请"等关键词）
-2. 命中后交给 LLM 精判是否为加群意图
-3. 若为意图：按配置回复对方并通知管理员
-
-非加群意图的私聊不会调用 LLM，不影响日常聊天。
+插件被禁用时只记录邀请、不接管事件。
 
 ## 安装
 
-1. 将本目录放到 AstrBot 的 `data/plugins/` 下，目录名保持 `astrbot_plugin_group_invite_guard`
+1. 把本仓库放进 AstrBot 的 `data/plugins/`（或在插件市场搜索安装）
 2. 重启 AstrBot
-3. 在 WebUI → 插件 → 加群邀请守卫 中配置
+3. WebUI → 插件 →「加群邀请守卫」里配置
 
-## 平台
+> 默认配置就是安全模式：判断要加时**不会**自动进群，只私聊通知管理员，由你拍板。
 
-- OneBot V11（`aiocqhttp`），已在 SnowLuma 验证；NapCat / LLOneBot / Lagrange 等 OneBot 实现理论可用
+## 平台要求
 
-## 命令
+OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / Lagrange 理论上也可用。
 
-以下命令仅管理员可用，需先唤醒机器人（@机器人 或唤醒词），命令支持带 `/` 前缀（如 `/邀请记录`）：
+## 配置说明
 
-| 命令 | 别名 | 参数 | 说明 |
-| --- | --- | --- | --- |
-| `/邀请记录` | `/邀请列表` | 无 | 以图片表格列出邀请记录（序号/群头像群名/邀请人头像昵称/时间/处理结果/附言+底部操作提示），渲染失败时回退纯文本 |
-| `/记录邀请` | 无 | `群号` `邀请人QQ` | 手动写入一条邀请记录 |
-| `/拉黑列表` | `/黑名单` | 无 | 列出 AstrBot 黑名单（QQ、拉黑时间、时长、原因） |
-| `/解封` | 无 | `QQ` | 从 AstrBot 黑名单移除指定 QQ |
-| `/手动拉黑` | 无 | `QQ` `[群号]` | 拉黑该QQ（发通知+删好友+加入AstrBot黑名单）；给了群号就先退群 |
+<details>
+<summary>点我展开完整配置表（所有配置都在 WebUI 插件页改）</summary>
 
-## LLM 主动拉黑
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
+| `enable` | `true` | 是否启用 |
+| `auto_approve` | `false` | 判断要加时自动同意进群 |
+| `auto_reject` | `false` | 判断不要加时自动拒绝 |
+| `notify_private` | `true` | 私聊通知管理员 |
+| `notify_private_qq` | `""` | 通知 QQ（留空用全局管理员） |
+| `notify_group` | `false` | 在指定群通知 |
+| `notify_group_id` | `""` | 通知群号 |
+| `llm_provider_id` | `""` | 判断用的模型（留空用默认） |
+| `decision_persona` | `""` | 决策用人格（留空用默认人格） |
+| `enable_member_context` | `true` | 参考目标群成员 |
+| `enable_impression_context` | `true` | 参考历史印象 |
+| `truncate_marker` | `…` | 截断占位符 |
+| `enable_private_intent` | `true` | 检测私聊加群意图 |
+| `private_intent_reply` | `true` | 检测到意图时回复对方 |
+| `private_intent_notify` | `true` | 检测到意图时通知管理员 |
+| `revenge_mode` | `off` | 被踢报复：`off` / `delete_friend` / `delete_and_ban` |
+| `revenge_notify` | `true` | 报复后通知管理员（查不到邀请人也靠它通知） |
+| `record_group_join` | `true` | 记录每次进群的时间/操作人 |
+| `kick_ban_operator` | `false` | 被踢时把执行踢人的人也拉黑 |
+| `mute_retaliation_enable` | `false` | 被禁言达阈值自动退群并拉黑 |
+| `mute_threshold` | `3` | 禁言次数阈值 |
+| `mute_target` | `operator` | 拉黑对象：`operator` / `inviter` / `both` |
+| `mute_ban_mode` | `astrbot_ban` | 拉黑方式：`astrbot_ban` / `delete_friend` |
+| `mute_notify` | `true` | 被禁言/报复后通知管理员 |
+| `ban_notice_message` | `""` | 拉黑前私聊发给对方的话（留空不发） |
+| `llm_context_inject` | `true` | 把封禁记录注入 LLM 上下文 |
+| `llm_tool_ban` | `true` | 允许 LLM 主动拉黑/解封/查询 |
+| `llm_tool_require_admin` | `false` | LLM 拉黑/解封需管理员 |
+| `invite_records_show_profile` | `true` | 邀请记录图显示邀请人头像昵称 |
+| `invite_records_show_group_profile` | `true` | 邀请记录图显示群头像群名 |
 
-机器人聊天时可自主调用三个工具：`group_invite_ban_user`（拉黑）、`group_invite_unban_user`（解封）、`group_invite_query_ban`（查询），并把当前封禁/邀请/禁言记录注入上下文。默认无需管理员，可在配置里开启管理员限制。
+</details>
+
+## 常见问题
+
+**为什么 bot 被踢了却没有报复邀请人？**
+如果拉 bot 进群的人是那个群的管理员/群主，QQ 直接放行、**不产生邀请事件**，插件无从记录邀请人。这种情况会在被踢时私聊通知你（附进群时间和操作人），你可以用 `/手动拉黑` 处理。
+
+**私聊发邀请链接为什么 bot 只是回复，没有直接进群？**
+私聊场景拿不到加群 `request` 事件（没有 `flag`），协议上就无法直接同意，只能通知你手动处理。
 
 ## License
 
