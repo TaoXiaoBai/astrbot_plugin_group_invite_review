@@ -103,6 +103,11 @@
     "type": "bool",
     "default": false
   },
+  "reply_inviter_on_decision": {
+    "description": "同意/拒绝邀请时，先私聊回复邀请人一句再处理",
+    "type": "bool",
+    "default": true
+  },
   "mute_retaliation_enable": {
     "description": "被禁言达到次数后自动退群并拉黑",
     "type": "bool",

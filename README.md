@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.11.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.12.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -19,6 +19,7 @@
 **进群决策**
 - 捕获加群邀请，由 LLM（人格 + 群成员 + 历史印象）判断同意/拒绝
 - 三种处理模式：自动同意 / 自动拒绝 / 仅通知管理员（默认）
+- 决策时顺便以人格身份私聊回复邀请人一句（同意的招呼 / 委婉拒绝），管理员通知里附回复原文
 - 私聊里问"能不能加群"、直接甩邀请链接，也能识别并回复/通知
 
 **记仇与报复**
@@ -84,6 +85,7 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `record_group_join` | `true` | 记录每次进群的时间/操作人 |
 | `kick_ban_operator` | `false` | 被踢时把执行踢人的人也拉黑 |
 | `cross_group_retaliation` | `false` | 被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群并拉黑 TA |
+| `reply_inviter_on_decision` | `true` | 同意/拒绝邀请时，先私聊回复邀请人一句再处理 |
 | `mute_retaliation_enable` | `false` | 被禁言达阈值自动退群并拉黑 |
 | `mute_threshold` | `3` | 禁言次数阈值 |
 | `mute_target` | `operator` | 拉黑对象：`operator` / `inviter` / `both` |

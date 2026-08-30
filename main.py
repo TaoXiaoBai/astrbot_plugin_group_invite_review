@@ -244,7 +244,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.11.0",
+    "1.12.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -293,6 +293,22 @@ class GroupInviteGuardPlugin(Star):
 
         action = str(decision.get("action") or "unknown").strip().lower()
         reason = str(decision.get("reason") or "").strip()
+        reply = str(decision.get("reply") or "").strip()  # 兼容旧格式：没有 reply 字段就跳过回复步骤
+
+        # 执行 approve/reject 之前，先私聊回复邀请人（失败不阻塞后续处理）
+        reply_status = ""
+        if reply and bot is not None and self.config.get("reply_inviter_on_decision", True):
+            try:
+                await self._call_action(
+                    bot, "send_private_msg", user_id=int(inviter_qq), message=reply
+                )
+                reply_status = "已私聊发送"
+                logger.info(f"group_invite_guard: replied to inviter {inviter_qq}")
+            except Exception as exc:
+                logger.error(f"group_invite_guard: reply inviter {inviter_qq} failed: {exc}")
+                reply_status = f"发送失败：{exc}"
+        elif reply:
+            reply_status = "未发送（开关关闭或无 OneBot 客户端）"
 
         result_label = "通知管理员（未自动处理）"
         if bot is None:
@@ -337,7 +353,7 @@ class GroupInviteGuardPlugin(Star):
         await self._record_invite(group_id, inviter_qq, comment, result_label)
 
         if bot is not None:
-            note = self._compose_note(inviter_qq, group_id, comment, action, reason)
+            note = self._compose_note(inviter_qq, group_id, comment, action, reason, reply, reply_status)
             await self._notify(bot, note)
 
     @filter.custom_filter(PrivateInviteIntentFilter)
@@ -730,7 +746,10 @@ class GroupInviteGuardPlugin(Star):
             prompt += f"\n背景信息：\n{context}\n"
         prompt += (
             "\n请以你的身份和性格判断是否同意这个加群邀请。"
-            "只输出一个 JSON 对象：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\"}。"
+            "只输出一个 JSON 对象：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\", "
+            "\"reply\": \"以你人格身份对邀请人说的话\"}。"
+            "其中 reply 要简短（一两句）、符合你的人格、不要暴露详细审核细节："
+            "approve 时是同意前的打招呼/说明，reject 时是委婉的拒绝（不要写太详细的原因）。"
         )
 
         resp = await self.context.llm_generate(
@@ -1223,7 +1242,7 @@ class GroupInviteGuardPlugin(Star):
         ]
         return "\n".join(lines)
 
-    def _compose_note(self, inviter_qq, group_id, comment, action, reason) -> str:
+    def _compose_note(self, inviter_qq, group_id, comment, action, reason, reply="", reply_status="") -> str:
         action_label = {
             "approve": "同意加入",
             "reject": "拒绝",
@@ -1238,6 +1257,10 @@ class GroupInviteGuardPlugin(Star):
         ]
         if reason:
             lines.append(f"理由：{reason}")
+        if reply:
+            # 发给邀请人的原文让管理员可见；邀请人只看到这条简短回复
+            status = f"（{reply_status}）" if reply_status else ""
+            lines.append(f"回复邀请人{status}：{reply}")
         return "\n".join(lines)
 
     def _compose_private_note(self, sender_id, text, reply, reason) -> str:
