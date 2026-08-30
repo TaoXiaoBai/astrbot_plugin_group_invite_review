@@ -132,7 +132,7 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
     <div class="empty">暂无邀请记录</div>
     {% endif %}
     <div class="hint">
-      操作提示：/手动拉黑 &lt;QQ&gt; [群号] —— 拉黑该人（给了群号会先退群） ｜ /解封 &lt;QQ&gt; —— 移出黑名单 ｜ /拉黑列表 —— 查看黑名单 ｜ /记录邀请 &lt;群号&gt; &lt;邀请人QQ&gt; —— 补录一条
+      操作提示：/手动拉黑 &lt;QQ或群号&gt; —— 按邀请记录反查并拉黑该人（匹配到邀请人时自动退其邀请的所有群；旧用法 /手动拉黑 &lt;QQ&gt; &lt;群号&gt; 仍可用） ｜ /解封 &lt;QQ&gt; —— 移出黑名单 ｜ /拉黑列表 —— 查看黑名单 ｜ /记录邀请 &lt;群号&gt; &lt;邀请人QQ&gt; —— 补录一条
     </div>
   </div>
 </body>
@@ -244,7 +244,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.9.0",
+    "1.10.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -727,15 +727,19 @@ class GroupInviteGuardPlugin(Star):
 
     async def _build_invite_context(self, inviter_qq: str, group_id: str, bot) -> str:
         """收集目标群成员列表与历史印象，拼成给 LLM 参考的背景信息；两块都拿不到时返回空字符串。"""
-        sections = []
-        if self.config.get("enable_member_context", True):
-            member_section = await self._build_member_section(group_id, bot)
-            if member_section:
-                sections.append(member_section)
-        if self.config.get("enable_impression_context", True):
-            impression_section = await self._build_impression_section(inviter_qq, group_id)
-            if impression_section:
-                sections.append(impression_section)
+        # 成员列表与历史印象互不依赖，并发拉取；单个失败按空字符串处理
+        async def _member():
+            if self.config.get("enable_member_context", True):
+                return await self._build_member_section(group_id, bot)
+            return ""
+
+        async def _impression():
+            if self.config.get("enable_impression_context", True):
+                return await self._build_impression_section(inviter_qq, group_id)
+            return ""
+
+        fetched = await asyncio.gather(_member(), _impression(), return_exceptions=True)
+        sections = [s for s in fetched if isinstance(s, str) and s]
 
         if not sections:
             return ""
@@ -775,9 +779,16 @@ class GroupInviteGuardPlugin(Star):
         return header + "\n" + "\n".join(lines)
 
     async def _build_impression_section(self, inviter_qq: str, group_id: str) -> str:
-        inviter_lines = await self._search_impression_lines(inviter_qq)
-        speaker_lines = await self._extract_speaker_quotes(inviter_qq)
-        group_lines = await self._search_impression_lines(group_id)
+        # 三次历史搜索并发执行，单个失败按空列表处理，不影响其它
+        searched = await asyncio.gather(
+            self._search_impression_lines(inviter_qq),
+            self._extract_speaker_quotes(inviter_qq),
+            self._search_impression_lines(group_id),
+            return_exceptions=True,
+        )
+        inviter_lines, speaker_lines, group_lines = [
+            item if isinstance(item, list) else [] for item in searched
+        ]
 
         parts = []
         if speaker_lines:
@@ -1341,19 +1352,26 @@ class GroupInviteGuardPlugin(Star):
         for i, it in enumerate(items, 1):
             it["index"] = i
 
+        # 并发拉取邀请人昵称和群名，单个失败不影响整体（helper 内部已降级为空字符串）
+        tasks = []
         if show_profile:
             for it in items:
                 qq = it["inviter"]
                 if qq and qq != "(未知)":
                     it["avatar"] = f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=100"
-                    it["nickname"] = await self._fetch_nickname(bot, qq)
+                    tasks.append((it, "nickname", self._fetch_nickname(bot, qq)))
 
         if show_group_profile:
             for it in items:
                 gid = it["group"]
                 if gid:
                     it["gavatar"] = f"https://p.qlogo.cn/gh/{gid}/{gid}/100"
-                    it["gname"] = await self._fetch_group_name(bot, gid)
+                    tasks.append((it, "gname", self._fetch_group_name(bot, gid)))
+
+        if tasks:
+            fetched = await asyncio.gather(*(t[2] for t in tasks), return_exceptions=True)
+            for (it, key, _), value in zip(tasks, fetched):
+                it[key] = value if isinstance(value, str) else ""
 
         for it in items:
             it.pop("_ts", None)
@@ -1446,25 +1464,72 @@ class GroupInviteGuardPlugin(Star):
         return "；".join(parts)
 
     async def _manual_ban_text(self, event: AstrMessageEvent, args) -> str:
-        """手动拉黑：/手动拉黑 <QQ> [群号]；有群号就退群，没有就直接发通知并拉黑该 QQ。"""
+        """手动拉黑：/手动拉黑 <QQ或群号>，单参数时按邀请记录反查目标并退出相关群；旧用法 /手动拉黑 <QQ> <群号> 行为不变。"""
+        usage = "用法：/手动拉黑 <QQ或群号>（旧用法：/手动拉黑 <QQ> <群号>）"
         if not args:
-            return "用法：/手动拉黑 <QQ> [群号]"
-        target_qq = str(args[0] or "").strip()
-        if not target_qq:
-            return "用法：/手动拉黑 <QQ> [群号]"
-        group_id = str(args[1] or "").strip() if len(args) > 1 else ""
+            return usage
+        target = str(args[0] or "").strip()
+        if not target:
+            return usage
 
         bot = self._find_onebot_client(event)
         if bot is None:
             return "手动拉黑失败：未找到 OneBot 客户端"
 
-        parts = []
-        if group_id:
+        # 旧两参数用法：给了群号就退群，再拉黑该 QQ，行为与旧版一致
+        if len(args) > 1:
+            group_id = str(args[1] or "").strip()
+            parts = []
+            if group_id:
+                try:
+                    await self._call_action(bot, "set_group_leave", group_id=int(group_id), is_dismiss=False)
+                    parts.append(f"已退出群 {group_id}")
+                except Exception as exc:
+                    parts.append(f"退群失败：{exc}")
             try:
-                await self._call_action(bot, "set_group_leave", group_id=int(group_id), is_dismiss=False)
-                parts.append(f"已退出群 {group_id}")
+                result = await self._manual_blacklist(target, bot)
             except Exception as exc:
-                parts.append(f"退群失败：{exc}")
+                result = f"拉黑失败：{exc}"
+            parts.append(f"拉黑 {target}：{result}")
+            return "；".join(parts)
+
+        # 单参数：先查邀请记录
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
+            records = {}
+        if not isinstance(records, dict):
+            records = {}
+
+        target_qq = ""
+        groups = []
+        if target in records:
+            # 参数是群号：取该群记录的邀请人
+            inviter = self._record_inviter(records.get(target))
+            if inviter:
+                target_qq = inviter
+                groups = [target]
+        else:
+            # 参数是邀请人 QQ：收集 TA 邀请过的所有群（一人可能邀请多群）
+            for gid, rec in records.items():
+                if self._record_inviter(rec) == target:
+                    groups.append(gid)
+            if groups:
+                target_qq = target
+
+        parts = []
+        if not target_qq:
+            target_qq = target
+            parts.append(f"未找到 {target} 的相关邀请记录，按 QQ 直接拉黑")
+
+        # 先退群（单个失败不影响后面），再统一拉黑一次（消息只发一次）
+        for gid in groups:
+            try:
+                await self._call_action(bot, "set_group_leave", group_id=int(gid), is_dismiss=False)
+                parts.append(f"已退出群 {gid}")
+            except Exception as exc:
+                parts.append(f"退群 {gid} 失败：{exc}")
 
         try:
             result = await self._manual_blacklist(target_qq, bot)
@@ -1542,20 +1607,22 @@ class GroupInviteGuardPlugin(Star):
             for user_id, reason in entries[:20]:
                 lines.append(f"- QQ {user_id}（{reason}）")
 
-        try:
-            invite = await self.get_kv_data("invite_records", {})
-        except Exception:
-            invite = {}
+        async def _load_kv(key):
+            try:
+                return await self.get_kv_data(key, {})
+            except Exception:
+                return {}
+
+        # 两个 kv 并发读取，失败按空 dict 处理
+        invite, mute = await asyncio.gather(
+            _load_kv("invite_records"), _load_kv("mute_records")
+        )
         if isinstance(invite, dict) and invite:
             lines.append("被邀请进群记录（群号 -> 邀请人）：")
             for gid, rec in list(invite.items())[:20]:
                 inviter = self._record_inviter(rec)
                 lines.append(f"- 群 {gid} 由 {inviter or '(未知)'} 邀请")
 
-        try:
-            mute = await self.get_kv_data("mute_records", {})
-        except Exception:
-            mute = {}
         if isinstance(mute, dict) and mute:
             lines.append("被禁言记录（群号：次数）：")
             for gid, cnt in list(mute.items())[:20]:

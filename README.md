@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.9.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.10.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -38,7 +38,7 @@
 | --- | --- |
 | `/邀请记录` | 图片表格展示邀请记录（头像昵称/群名/处理结果，底部附操作提示） |
 | `/记录邀请 <群号> <QQ>` | 手动补录一条邀请记录 |
-| `/手动拉黑 <QQ> [群号]` | 发通知 + 删好友 + 拉黑；带群号则先退群 |
+| `/手动拉黑 <QQ或群号>` | 记录驱动：先查邀请记录——是群号则拉黑该群邀请人，是邀请人QQ则收集TA邀请过的所有群；先退群（有几组退几群）再统一拉黑（通知只发一次）；查无记录则按QQ直接拉黑并注明。旧用法 `/手动拉黑 <QQ> <群号>` 不变 |
 | `/拉黑列表` | 查看黑名单（含拉黑原因） |
 | `/解封 <QQ>` | 移出黑名单 |
 
