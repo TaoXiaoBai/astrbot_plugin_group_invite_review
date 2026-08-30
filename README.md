@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.14.1-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.15.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -21,7 +21,8 @@
 - 三种处理模式：自动同意 / 自动拒绝 / 仅通知管理员（默认）
 - 决策时顺便以人格身份私聊回复邀请人一句（同意的招呼 / 委婉拒绝），管理员通知里附回复原文
 - 决策附邀请人画像：历史邀请次数、黑名单前科、活跃度（纯本地数据，不额外调 LLM）
-- 小号识别：被拉黑的人换号再来？附言/昵称相似度命中即在决策上下文和通知里提示"疑似小号"
+- 抓到邀请人历史发言原话时，由 LLM 浓缩成一段 100 字内的印象小结（按发言条数缓存，陌生人零开销）
+- 小号识别：被拉黑的人换号再来？附言/昵称相似度命中即在决策上下文和通知里提示"疑似小号"；相似度处于灰色区间时再交 LLM 复判一次（结论缓存 7 天）
 - 私聊里问"能不能加群"、直接甩邀请链接，也能识别并回复/通知
 
 **记仇与报复**
@@ -91,6 +92,7 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `decision_persona` | `""` | 决策用人格（留空用默认人格） |
 | `enable_member_context` | `true` | 参考目标群成员 |
 | `enable_impression_context` | `true` | 参考历史印象 |
+| `impression_llm_summary` | `true` | 抓到发言原话时生成 LLM 印象小结（按发言条数缓存） |
 | `enable_user_profile` | `true` | 决策时附邀请人画像（本地记录，不额外调 LLM） |
 | `truncate_marker` | `…` | 截断占位符 |
 
@@ -100,6 +102,8 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | --- | --- | --- |
 | `alt_account_detect` | `true` | 识别黑名单用户的小号 |
 | `alt_similarity_threshold` | `70` | 相似度（0-100）达到该值视为同一人 |
+| `alt_gray_low` | `40` | 灰色区间下限：相似度在 [该值, 阈值) 时交 LLM 复判 |
+| `alt_llm_review` | `true` | 灰色区间 LLM 复判开关（结论缓存 7 天） |
 
 **私聊意图 `private_intent`**
 

@@ -89,12 +89,15 @@ _CONFIG_GROUPS = {
         "decision_persona": "",
         "enable_member_context": True,
         "enable_impression_context": True,
+        "impression_llm_summary": True,
         "enable_user_profile": True,
         "truncate_marker": "…",
     },
     "alt_detect": {
         "alt_account_detect": True,
         "alt_similarity_threshold": 70,
+        "alt_gray_low": 40,
+        "alt_llm_review": True,
     },
     "private_intent": {
         "enable_private_intent": True,
@@ -305,7 +308,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.14.1",
+    "1.15.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1213,17 +1216,156 @@ class GroupInviteGuardPlugin(Star):
         candidates.sort(key=lambda item: item[1], reverse=True)
         return candidates
 
+    def _alt_gray_low(self) -> int:
+        """小号灰色区间下限（0-100）：相似度在 [该值, 阈值) 之间时交给 LLM 复判。"""
+        try:
+            low = int(self._cfg("alt_detect", "alt_gray_low", 40) or 40)
+        except (TypeError, ValueError):
+            low = 40
+        return max(0, min(100, low))
+
     async def _detect_alt_account(self, inviter_qq: str, comment: str, bot) -> str:
-        """小号识别：新邀请人与黑名单用户做附言/昵称相似度比较；命中阈值返回醒目提示行，否则空。"""
+        """小号识别：新邀请人与黑名单用户做附言/昵称相似度比较；命中阈值返回醒目提示行，灰色区间交 LLM 复判，否则空。"""
         if not _as_bool(self._cfg("alt_detect", "alt_account_detect", True)):
             return ""
         candidates = await self._alt_similarity_candidates(inviter_qq, comment, bot)
         if not candidates:
             return ""
         best_uid, best_sim, best_dim = candidates[0]
-        if best_sim < self._alt_threshold():
+        threshold = self._alt_threshold()
+        if best_sim >= threshold:
+            return f"⚠️ 该邀请人与黑名单用户 {best_uid} 相似度 {best_sim:.0f}%（{best_dim}），疑似小号，请谨慎"
+        # 灰色区间 [alt_gray_low, threshold)：difflib 拿不准，调一次 LLM 复判（结果缓存 7 天）
+        if not _as_bool(self._cfg("alt_detect", "alt_llm_review", True)):
             return ""
-        return f"⚠️ 该邀请人与黑名单用户 {best_uid} 相似度 {best_sim:.0f}%（{best_dim}），疑似小号，请谨慎"
+        if best_sim < self._alt_gray_low():
+            return ""
+        return await self._llm_review_alt(inviter_qq, comment, best_uid, best_sim, best_dim)
+
+    async def _past_comment_of(self, qq: str) -> str:
+        """从邀请记录里取某 QQ 历史邀请时的附言（本地 kv，与 _alt_similarity_candidates 的附言维度同源）；找不到返回空。"""
+        qq = str(qq or "").strip()
+        if not qq:
+            return ""
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception:
+            return ""
+        if not isinstance(records, dict):
+            return ""
+        for rec in records.values():
+            if isinstance(rec, dict) and self._record_inviter(rec) == qq:
+                comment = str(rec.get("comment") or "").strip()
+                if comment:
+                    return comment
+        return ""
+
+    async def _llm_review_alt(self, inviter_qq: str, comment: str, old_uid: str, sim: float, dim: str) -> str:
+        """灰色区间小号复判：一次轻量 LLM 调用判断是否同一人，判定缓存 kv（alt_verdict_cache）7 天；失败按未复判处理返回空。"""
+        inviter_qq = str(inviter_qq or "").strip()
+        old_uid = str(old_uid or "").strip()
+        if not inviter_qq or not old_uid:
+            return ""
+
+        cache_key = f"{inviter_qq}|{old_uid}"
+        now = int(time.time())
+        try:
+            cache = await self.get_kv_data("alt_verdict_cache", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load alt_verdict_cache failed: {exc}")
+            cache = {}
+        if not isinstance(cache, dict):
+            cache = {}
+        entry = cache.get(cache_key)
+        if isinstance(entry, dict):
+            try:
+                updated = int(entry.get("updated") or 0)
+            except (TypeError, ValueError):
+                updated = 0
+            if updated and now - updated < 7 * 86400:
+                return self._alt_verdict_line(entry, old_uid, sim, dim)
+
+        # 双方可对比材料：新邀请人附言/近期发言 vs 黑名单用户旧附言/旧发言
+        comment = str(comment or "").strip()
+        old_comment = await self._past_comment_of(old_uid)
+        fetched = await asyncio.gather(
+            self._extract_speaker_quotes(inviter_qq),
+            self._extract_speaker_quotes(old_uid),
+            return_exceptions=True,
+        )
+        new_quotes = fetched[0] if isinstance(fetched[0], list) else []
+        old_quotes = fetched[1] if isinstance(fetched[1], list) else []
+        if not comment and not old_comment and not new_quotes and not old_quotes:
+            return ""  # 双方都没附言没发言，无可对比数据，零 LLM 开销
+
+        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
+        if not provider_id:
+            return ""
+
+        def _fmt(items):
+            return "\n".join(f"  · {q}" for q in items[:10]) if items else "  (无)"
+
+        prompt = (
+            "判断两个 QQ 用户是否可能是同一个人（小号）。\n\n"
+            f"用户 A（新邀请人，QQ {inviter_qq}）：\n"
+            f"  · 本次邀请附言：{comment or '(无)'}\n"
+            f"  · 近期发言原话：\n{_fmt(new_quotes)}\n\n"
+            f"用户 B（已被拉黑，QQ {old_uid}）：\n"
+            f"  · 历史邀请附言：{old_comment or '(无)'}\n"
+            f"  · 历史发言原话：\n{_fmt(old_quotes)}\n\n"
+            f"两者的附言/昵称文本相似度约 {sim:.0f}%（{dim}）。\n"
+            "请根据用词习惯、语气、内容风格综合判断是否为同一人。"
+            "只输出一个 JSON 对象：{\"same_person\": true 或 false, \"confidence\": 0-100 的整数, \"reason\": \"简短理由\"}。"
+        )
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+            )
+            text = (getattr(resp, "completion_text", "") or "").strip()
+            result = _parse_json(text)
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: alt review {inviter_qq} vs {old_uid} failed: {exc}")
+            return ""
+        if result.get("same_person") is None:
+            return ""  # 复判结果不可解析，按未复判处理
+
+        try:
+            confidence = int(result.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0
+        verdict = {
+            "same_person": _as_bool(result.get("same_person")),
+            "confidence": max(0, min(100, confidence)),
+            "reason": str(result.get("reason") or "").strip()[:200],
+            "updated": now,
+        }
+        cache[cache_key] = verdict
+        try:
+            await self.put_kv_data("alt_verdict_cache", cache)
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: save alt_verdict_cache failed: {exc}")
+        return self._alt_verdict_line(verdict, old_uid, sim, dim)
+
+    @staticmethod
+    def _alt_verdict_line(verdict: dict, old_uid: str, sim: float, dim: str) -> str:
+        """把 LLM 复判结论渲染成决策上下文提示行；未复判/结论不明确返回空。"""
+        if not isinstance(verdict, dict) or verdict.get("same_person") is None:
+            return ""
+        same = _as_bool(verdict.get("same_person"))
+        try:
+            confidence = int(verdict.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0
+        reason = str(verdict.get("reason") or "").strip()
+        if same and confidence >= 70:
+            line = f"⚠️ LLM 判定与黑名单用户 {old_uid} 高度疑似同一人（置信度 {confidence}%）"
+            if reason:
+                line += f"：{reason}"
+            return line
+        if not same:
+            return f"与黑名单用户 {old_uid} 有少量相似（{sim:.0f}%），LLM 复核认为非同一人"
+        return f"与黑名单用户 {old_uid} 相似度 {sim:.0f}%（{dim}），LLM 复核倾向同一人但置信度不足（{confidence}%）"
 
     async def _build_member_section(self, group_id: str, bot) -> str:
         header = "目标群成员列表："
@@ -1268,12 +1410,81 @@ class GroupInviteGuardPlugin(Star):
 
         parts = []
         if speaker_lines:
-            parts.append(f"邀请人（QQ {inviter_qq}）在历史里说过的原话：\n" + "\n".join(speaker_lines))
+            summary = ""
+            if _as_bool(self._cfg("decision", "impression_llm_summary", True)):
+                summary = await self._summarize_impression(inviter_qq, speaker_lines)
+            if summary:
+                # 有小结时原话只留 5 条节选，避免上下文膨胀
+                parts.append(f"对邀请人（QQ {inviter_qq}）的印象小结：{summary}")
+                excerpt = "\n".join(speaker_lines[:5])
+                parts.append(f"邀请人（QQ {inviter_qq}）在历史里说过的原话（节选）：\n{excerpt}")
+            else:
+                parts.append(f"邀请人（QQ {inviter_qq}）在历史里说过的原话：\n" + "\n".join(speaker_lines))
         if inviter_lines:
             parts.append("对邀请人 QQ 的既有印象：\n" + "\n".join(inviter_lines))
         if group_lines:
             parts.append("对该群的既有印象：\n" + "\n".join(group_lines))
         return "\n\n".join(parts), len(speaker_lines)
+
+    async def _summarize_impression(self, inviter_qq: str, quotes: list) -> str:
+        """把邀请人的历史发言原话浓缩成 100 字内的印象小结（一次轻量 LLM 调用）。
+
+        带 kv 缓存（impression_cache）：发言条数比缓存时变多才重新生成，否则直接用缓存；
+        抓不到原话/未配置模型/调用失败一律返回空，调用方降级为只用原话。
+        """
+        qq = str(inviter_qq or "").strip()
+        quotes = [q for q in (quotes or []) if str(q or "").strip()]
+        if not qq or not quotes:
+            return ""
+
+        try:
+            cache = await self.get_kv_data("impression_cache", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load impression_cache failed: {exc}")
+            cache = {}
+        if not isinstance(cache, dict):
+            cache = {}
+        entry = cache.get(qq)
+        if isinstance(entry, dict):
+            try:
+                cached_count = int(entry.get("quote_count") or 0)
+            except (TypeError, ValueError):
+                cached_count = 0
+            cached_summary = str(entry.get("summary") or "").strip()
+            if cached_summary and len(quotes) <= cached_count:
+                return cached_summary
+
+        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
+        if not provider_id:
+            return ""
+        prompt = (
+            "以下是一个 QQ 用户在历史群聊/私聊里的发言原话：\n"
+            + "\n".join(f"· {q}" for q in quotes[:20])
+            + "\n\n请用 100 字以内总结对此人的印象：语言风格、素质、是否可疑。"
+            "直接输出小结文本，不要输出任何额外解释。"
+        )
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+            )
+            summary = (getattr(resp, "completion_text", "") or "").strip()
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: impression summary for {qq} failed: {exc}")
+            return ""
+        if not summary:
+            return ""
+
+        cache[qq] = {
+            "summary": summary,
+            "quote_count": len(quotes),
+            "updated": int(time.time()),
+        }
+        try:
+            await self.put_kv_data("impression_cache", cache)
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: save impression_cache failed: {exc}")
+        return summary
 
     async def _search_impression_lines(self, query: str) -> list:
         query = str(query or "").strip()

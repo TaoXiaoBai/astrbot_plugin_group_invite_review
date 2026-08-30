@@ -83,6 +83,12 @@
         "default": true,
         "hint": "从历史群聊/私聊里找对邀请人的印象"
       },
+      "impression_llm_summary": {
+        "description": "LLM 印象小结",
+        "type": "bool",
+        "default": true,
+        "hint": "抓到邀请人发言原话时浓缩成一段印象小结；按发言条数缓存，陌生人零开销"
+      },
       "enable_user_profile": {
         "description": "决策时附邀请人画像",
         "type": "bool",
@@ -112,6 +118,18 @@
         "type": "int",
         "default": 70,
         "hint": "附言/昵称相似度（0-100）达到该值时提示疑似小号；只提示，不会自动拒绝"
+      },
+      "alt_gray_low": {
+        "description": "灰色区间下限",
+        "type": "int",
+        "default": 40,
+        "hint": "相似度在 [该值, 阈值) 之间时交 LLM 复判是否同一人；低于该值零开销"
+      },
+      "alt_llm_review": {
+        "description": "灰色区间 LLM 复判",
+        "type": "bool",
+        "default": true,
+        "hint": "用 LLM 复核灰色区间的疑似小号；同一对组合 7 天内只判一次"
       }
     }
   },
