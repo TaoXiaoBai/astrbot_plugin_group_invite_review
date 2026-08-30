@@ -244,7 +244,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.10.0",
+    "1.11.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -448,7 +448,10 @@ class GroupInviteGuardPlugin(Star):
         # 报复邀请人（仅 revenge_mode 开启且查到邀请人时）
         banned = set()
         result = ""
+        cross_line = ""
         if inviter_qq and revenge_on:
+            # 跨群连坐：先退出该邀请人邀请过的其它群，再报复（消息仍只发一次）
+            cross_line = await self._cross_group_leave(inviter_qq, group_id, records, bot)
             result = await self._take_revenge(inviter_qq, bot)
             banned.add(inviter_qq)
             logger.info(
@@ -479,9 +482,37 @@ class GroupInviteGuardPlugin(Star):
 
         if notify_on:
             note = self._compose_revenge_note(group_id, inviter_qq, result)
+            if cross_line:
+                note += "\n" + cross_line
             if ban_line:
                 note += "\n" + ban_line
             await self._notify(bot, note)
+
+    async def _cross_group_leave(self, inviter_qq: str, exclude_group: str, records, bot) -> str:
+        """跨群连坐：退出该邀请人邀请过的所有其它群（invite_records 记录保留不删）；返回通知用结果行，未执行返回空。"""
+        if not _as_bool(self.config.get("cross_group_retaliation", False)):
+            return ""
+        inviter_qq = str(inviter_qq or "").strip()
+        if not inviter_qq or bot is None or not isinstance(records, dict):
+            return ""
+        groups = [
+            str(gid)
+            for gid, rec in records.items()
+            if str(gid) != str(exclude_group) and self._record_inviter(rec) == inviter_qq
+        ]
+        if not groups:
+            return ""
+        parts = []
+        for gid in groups:
+            try:
+                await self._call_action(bot, "set_group_leave", group_id=int(gid), is_dismiss=False)
+                parts.append(f"已连带退出群 {gid}")
+            except Exception as exc:
+                parts.append(f"连带退群 {gid} 失败：{exc}")
+        logger.info(
+            f"group_invite_guard: cross-group leave for inviter {inviter_qq}: {'；'.join(parts)}"
+        )
+        return "连坐退群：" + "；".join(parts)
 
     async def _ban_kick_operator(self, operator_id: str, bot, already_banned: set) -> str:
         """被踢时按 kick_ban_operator 拉黑踢人者，走与手动拉黑相同的完整流程；返回通知用结果行，未执行返回空。"""
@@ -622,6 +653,7 @@ class GroupInviteGuardPlugin(Star):
         # 收集拉黑目标
         target = str(self.config.get("mute_target", "operator") or "operator").strip().lower()
         inviter_qq = ""
+        invite_records = {}
         targets = []
         if target in ("operator", "both") and operator_id:
             targets.append(operator_id)
@@ -635,6 +667,11 @@ class GroupInviteGuardPlugin(Star):
             inviter_qq = str(inviter_qq or "").strip()
             if inviter_qq:
                 targets.append(inviter_qq)
+
+        # 跨群连坐：拉黑对象包含邀请人时，先连带退出 TA 邀请过的其它群（operator 模式不连坐）
+        cross_line = ""
+        if inviter_qq:
+            cross_line = await self._cross_group_leave(inviter_qq, group_id, invite_records, bot)
 
         # 去重、去空，逐一对目标执行拉黑（拉黑邀请人前先私聊通知）
         seen = set()
@@ -659,6 +696,8 @@ class GroupInviteGuardPlugin(Star):
 
         if self.config.get("mute_notify", True):
             note = self._compose_mute_revenge_note(group_id, count, leave_result, ban_results)
+            if cross_line:
+                note += "\n" + cross_line
             await self._notify(bot, note)
 
     def _looks_like_invite_intent(self, text: str) -> bool:

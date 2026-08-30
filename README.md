@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.10.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.11.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -24,6 +24,7 @@
 **记仇与报复**
 - 自动记录每次进群的邀请人；被该群踢出后可自动删除好友 / 拉黑邀请人，并通知管理员
 - 可选：被踢时连执行踢人的管理员一起拉黑
+- 可选：跨群连坐——被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群再拉黑 TA
 - 被禁言自动计数，达到阈值自动退群 + 拉黑
 - 拉黑前可给对方发一句自定义告别留言
 - 管理员直拉进群没有邀请事件？也没关系——进群时间/操作人照样记录，被踢时通知你
@@ -82,6 +83,7 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `revenge_notify` | `true` | 报复后通知管理员（查不到邀请人也靠它通知） |
 | `record_group_join` | `true` | 记录每次进群的时间/操作人 |
 | `kick_ban_operator` | `false` | 被踢时把执行踢人的人也拉黑 |
+| `cross_group_retaliation` | `false` | 被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群并拉黑 TA |
 | `mute_retaliation_enable` | `false` | 被禁言达阈值自动退群并拉黑 |
 | `mute_threshold` | `3` | 禁言次数阈值 |
 | `mute_target` | `operator` | 拉黑对象：`operator` / `inviter` / `both` |

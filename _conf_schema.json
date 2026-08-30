@@ -98,6 +98,11 @@
     "type": "bool",
     "default": false
   },
+  "cross_group_retaliation": {
+    "description": "被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群并拉黑 TA",
+    "type": "bool",
+    "default": false
+  },
   "mute_retaliation_enable": {
     "description": "被禁言达到次数后自动退群并拉黑",
     "type": "bool",
