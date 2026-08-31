@@ -309,7 +309,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.15.2",
+    "1.15.3",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -393,6 +393,7 @@ class GroupInviteGuardPlugin(Star):
         comment = str(_get_value(raw, "comment") or "")
         flag = str(_get_value(raw, "flag") or "")
         sub_type = str(_get_value(raw, "sub_type") or "invite")
+        self_id = str(_get_value(raw, "self_id") or "")
 
         # 禁用：不接管（不 stop_event），只记录一条邀请后返回
         if not self._cfg("basic", "enable", True):
@@ -415,6 +416,10 @@ class GroupInviteGuardPlugin(Star):
             platform_id = event.get_platform_id()
         except Exception:
             pass
+
+        # 先记录一条「处理中」，决策与执行完成后再覆盖为最终结果，
+        # 保证即使中途异常记录也不会丢失
+        await self._record_invite(group_id, inviter_qq, comment, "处理中")
 
         try:
             decision = await self._ask_llm(inviter_qq, group_id, comment, bot, platform_id)
@@ -461,7 +466,12 @@ class GroupInviteGuardPlugin(Star):
                 result_label = "自动同意进群"
             except Exception as exc:
                 logger.error(f"group_invite_guard: approve failed: {exc}")
-                result_label = "自动同意失败"
+                # 协议端偶尔已执行成功但响应报错（超时/回包异常），
+                # 报错后实际核实一次群成员状态，避免记录误写「同意失败」
+                if await self._verify_self_in_group(bot, group_id, self_id):
+                    result_label = "自动同意进群（接口报错，已核实进群）"
+                else:
+                    result_label = "自动同意失败"
         elif action == "reject" and self._cfg("decision", "auto_reject", False):
             try:
                 await self._call_action(
@@ -1740,6 +1750,26 @@ class GroupInviteGuardPlugin(Star):
                 result = fn(action, **params)
                 return await result if inspect.isawaitable(result) else result
         raise RuntimeError(f"no usable OneBot action caller for {action}")
+
+    async def _verify_self_in_group(self, bot: Any, group_id: str, self_id: str = "") -> bool:
+        """核实机器人是否已在群内（用于同意接口报错后的状态对账）；查询失败按不在群处理。"""
+        try:
+            uid = str(self_id or "").strip()
+            if not uid:
+                info = await self._call_action(bot, "get_login_info")
+                uid = str(_get_value(info, "user_id") or "")
+            if not uid:
+                return False
+            await self._call_action(
+                bot,
+                "get_group_member_info",
+                group_id=int(group_id),
+                user_id=int(uid),
+                no_cache=True,
+            )
+            return True
+        except Exception:
+            return False
 
     async def _send_ban_notice(self, bot, qq: str) -> str:
         """拉黑前给邀请人发一条自定义私聊消息；未配置则跳过。"""

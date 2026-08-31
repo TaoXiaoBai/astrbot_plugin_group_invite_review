@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.15.2-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.15.3-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
