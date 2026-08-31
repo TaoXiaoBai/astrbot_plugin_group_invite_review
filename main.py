@@ -112,6 +112,7 @@ _CONFIG_GROUPS = {
         "record_group_join": True,
         "cross_group_retaliation": False,
         "ban_notice_message": "",
+        "intercept_banned_messages": True,
     },
     "mute_revenge": {
         "mute_retaliation_enable": False,
@@ -2394,6 +2395,27 @@ class GroupInviteGuardPlugin(Star):
             await event.send(MessageChain(chain=[Plain(result)]))
         except Exception as exc:
             logger.error(f"group_invite_guard: send command result failed: {exc}")
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=1000)
+    async def on_blacklist_message_guard(self, event: AstrMessageEvent):
+        """兜底拦截：被拉黑用户发来的群聊/私聊消息直接停止传播，避免 bot 继续回复。"""
+        if not _as_bool(self._cfg("kick_revenge", "intercept_banned_messages", True)):
+            return
+        sender_id = event.get_sender_id()
+        if not sender_id:
+            return
+        try:
+            ban_entry = self._find_ban_entry(str(sender_id))
+        except Exception:
+            ban_entry = None
+        if ban_entry:
+            reason = str(ban_entry.get("reason") or "未注明").strip()
+            logger.info(
+                f"group_invite_guard: stopped message from banned user {sender_id} "
+                f"(reason: {reason})"
+            )
+            event.stop_event()
 
     def _read_ban_entries(self) -> list:
         """读取 qq_tools 黑名单，返回 [(user_id, reason), ...]。"""

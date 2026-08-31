@@ -204,6 +204,12 @@
         "type": "string",
         "default": "",
         "hint": "拉黑前私聊发给对方的话，手动拉黑也会发送；留空则不发"
+      },
+      "intercept_banned_messages": {
+        "description": "拉黑后拦截消息",
+        "type": "bool",
+        "default": true,
+        "hint": "被拉黑用户发群聊/私聊时，本插件兜底拦截，避免 bot 继续回复"
       }
     }
   },
