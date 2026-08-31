@@ -309,7 +309,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.15.1",
+    "1.15.2",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1025,7 +1025,7 @@ class GroupInviteGuardPlugin(Star):
                 return item
         return None
 
-    async def _fetch_external_profile(self, qq: str) -> str:
+    async def _fetch_external_profile(self, qq: str, event=None) -> str:
         """尝试从「用户画像」插件读取画像文本（其预留接口 get_profile_text）；未安装/失败/无数据返回空。"""
         try:
             md = self.context.get_registered_star("astrbot_plugin_user_profile")
@@ -1036,12 +1036,20 @@ class GroupInviteGuardPlugin(Star):
         if not callable(getter):
             return ""
         try:
-            result = getter(qq, None)
+            result = getter(qq, event)
             text = await result if inspect.isawaitable(result) else result
         except Exception as exc:
             logger.warning(f"group_invite_guard: external profile failed: {exc}")
             return ""
         return str(text or "").strip()
+
+    async def _full_profile(self, qq: str, bot=None, event=None) -> str:
+        """完整画像：装了「用户画像」插件且开关开时优先用它，否则用内置完整画像。"""
+        if self._cfg("decision", "use_profile_plugin", True):
+            external = await self._fetch_external_profile(qq, event)
+            if external:
+                return external
+        return await self._build_full_profile(qq, bot)
 
     async def _build_profile_section(self, inviter_qq: str, speaker_count: int) -> str:
         """邀请人画像（决策用精简版）：完全用本地 kv / 黑名单配置拼装，不调 LLM、不发网络请求；全空返回空。"""
@@ -2264,7 +2272,7 @@ class GroupInviteGuardPlugin(Star):
             return "用法：/画像 <QQ>"
         bot = self._find_onebot_client(event)
         try:
-            return await self._build_full_profile(qq, bot)
+            return await self._full_profile(qq, bot, event)
         except Exception as exc:
             logger.error(f"group_invite_guard: build profile for {qq} failed: {exc}")
             return f"查询画像失败：{exc}"
@@ -2444,6 +2452,6 @@ class GroupInviteGuardPlugin(Star):
             return "查询失败：缺少 qq 参数（QQ 号）。"
         bot = self._find_onebot_client(event)
         try:
-            return await self._build_full_profile(qq, bot)
+            return await self._full_profile(qq, bot, event)
         except Exception as exc:
             return f"查询失败：{exc}"
