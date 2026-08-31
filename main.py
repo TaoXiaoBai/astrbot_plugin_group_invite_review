@@ -300,7 +300,7 @@ class AdminCommandFilter(filter.CustomFilter):
         except Exception:
             return False
         text = (event.get_message_str() or "").strip()
-        cmd = text.lstrip("/").strip()
+        cmd = text.lstrip("/#").strip()
         first = cmd.split(" ", 1)[0] if cmd else ""
         return first in ("邀请记录", "邀请列表", "记录邀请", "拉黑列表", "黑名单", "解封", "手动拉黑", "画像")
 
@@ -309,7 +309,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.15.3",
+    "1.15.4",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -2308,7 +2308,7 @@ class GroupInviteGuardPlugin(Star):
             return f"查询画像失败：{exc}"
 
     async def _dispatch_admin_command(self, event: AstrMessageEvent) -> str:
-        text = (event.get_message_str() or "").strip().lstrip("/").strip()
+        text = (event.get_message_str() or "").strip().lstrip("/#").strip()
         parts = text.split()
         cmd = parts[0] if parts else ""
         args = parts[1:]
@@ -2333,7 +2333,7 @@ class GroupInviteGuardPlugin(Star):
 
     @filter.custom_filter(AdminCommandFilter)
     async def on_admin_command(self, event: AstrMessageEvent):
-        text = (event.get_message_str() or "").strip().lstrip("/").strip()
+        text = (event.get_message_str() or "").strip().lstrip("/#").strip()
         cmd = text.split(" ", 1)[0] if text else ""
         # 邀请记录优先发图片表格，渲染/发送失败则回退纯文本
         if cmd in ("邀请记录", "邀请列表"):
