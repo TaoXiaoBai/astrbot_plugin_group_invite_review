@@ -91,6 +91,7 @@ _CONFIG_GROUPS = {
         "enable_impression_context": True,
         "impression_llm_summary": True,
         "enable_user_profile": True,
+        "use_profile_plugin": True,
         "truncate_marker": "…",
     },
     "alt_detect": {
@@ -308,7 +309,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.15.0",
+    "1.15.1",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -936,7 +937,11 @@ class GroupInviteGuardPlugin(Star):
         impression_section, speaker_count = impression
 
         # 画像与小号识别全是本地数据/文本比较，零 LLM、零额外网络请求
-        profile_section = await self._build_profile_section(inviter_qq, speaker_count)
+        profile_section = ""
+        if self._cfg("decision", "use_profile_plugin", True):
+            profile_section = await self._fetch_external_profile(inviter_qq)
+        if not profile_section:
+            profile_section = await self._build_profile_section(inviter_qq, speaker_count)
         alt_warning = await self._detect_alt_account(inviter_qq, comment, bot)
 
         sections = [s for s in (profile_section, member_section, impression_section) if s]
@@ -1019,6 +1024,24 @@ class GroupInviteGuardPlugin(Star):
             if isinstance(item, dict) and str(item.get("user_id") or "").strip() == qq:
                 return item
         return None
+
+    async def _fetch_external_profile(self, qq: str) -> str:
+        """尝试从「用户画像」插件读取画像文本（其预留接口 get_profile_text）；未安装/失败/无数据返回空。"""
+        try:
+            md = self.context.get_registered_star("astrbot_plugin_user_profile")
+        except Exception:
+            return ""
+        instance = getattr(md, "star_cls", None) if md else None
+        getter = getattr(instance, "get_profile_text", None) if instance else None
+        if not callable(getter):
+            return ""
+        try:
+            result = getter(qq, None)
+            text = await result if inspect.isawaitable(result) else result
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: external profile failed: {exc}")
+            return ""
+        return str(text or "").strip()
 
     async def _build_profile_section(self, inviter_qq: str, speaker_count: int) -> str:
         """邀请人画像（决策用精简版）：完全用本地 kv / 黑名单配置拼装，不调 LLM、不发网络请求；全空返回空。"""

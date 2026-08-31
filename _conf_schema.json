@@ -95,6 +95,12 @@
         "default": true,
         "hint": "用本地记录拼邀请次数/前科/活跃度，不额外调 LLM"
       },
+      "use_profile_plugin": {
+        "description": "接入画像插件",
+        "type": "bool",
+        "default": true,
+        "hint": "装了「用户画像」插件时优先用它的完整画像，没装自动用内置精简画像"
+      },
       "truncate_marker": {
         "description": "截断占位符",
         "type": "string",

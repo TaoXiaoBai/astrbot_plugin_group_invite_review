@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.15.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.15.1-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -17,7 +17,7 @@
 ## 功能一览
 
 **进群决策**
-- 捕获加群邀请，由 LLM（人格 + 群成员 + 历史印象）判断同意/拒绝
+- 捕获加群邀请，由 LLM（人格 + 群成员 + 历史印象 + 邀请人画像）判断同意/拒绝；装了「用户画像」插件时优先用它的完整画像
 - 三种处理模式：自动同意 / 自动拒绝 / 仅通知管理员（默认）
 - 决策时顺便以人格身份私聊回复邀请人一句（同意的招呼 / 委婉拒绝），管理员通知里附回复原文
 - 决策附邀请人画像：历史邀请次数、黑名单前科、活跃度（纯本地数据，不额外调 LLM）
