@@ -157,6 +157,9 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 
 ## 常见问题
 
+**为什么 bot 被踢/被禁言/进群后插件完全没反应？**
+检查 AstrBot「平台设置」里的 **忽略机器人自身的消息**（`ignore_bot_self_message`）。开着它时，所有针对 bot 自身的通知（被踢、进群、被禁言）会在 waking_check 阶段被框架直接丢弃，插件根本收不到。本插件的这些功能依赖该开关**关闭**。只要协议端不上报 bot 自己发的消息（如 NapCat/SnowLuma 的 `reportSelfMessage=false`），关掉它是安全的。
+
 **为什么 bot 被踢了却没有报复邀请人？**
 如果拉 bot 进群的人是那个群的管理员/群主，QQ 直接放行、**不产生邀请事件**，插件无从记录邀请人。这种情况会在被踢时私聊通知你（附进群时间和操作人），你可以用 `/手动拉黑` 处理。
 
