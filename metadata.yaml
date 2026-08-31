@@ -1,7 +1,7 @@
 name: astrbot_plugin_group_invite_guard
 desc: 让 LLM 根据人格设定判断是否通过邀请加群，并识别私聊里的加群邀请；支持被踢、被禁言后自动拉黑报复。
 author: Kimi
-version: 1.15.4
+version: 1.16.0
 repo: "https://github.com/TaoXiaoBai/astrbot_plugin_group_invite_review"
 display_name: 加群邀请守卫
 short_desc: LLM 按人格设定判断加群邀请，支持拉黑报复

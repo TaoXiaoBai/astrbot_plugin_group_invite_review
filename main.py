@@ -128,6 +128,7 @@ _CONFIG_GROUPS = {
     "display": {
         "invite_records_show_profile": True,
         "invite_records_show_group_profile": True,
+        "invite_records_hide_dealt": True,
     },
 }
 
@@ -157,6 +158,8 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
   .nick { font-weight:600; font-size:16px; max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .qq { color:#6b7184; font-size:13px; }
   .hint { margin-top:16px; font-size:12px; color:#9aa0b0; line-height:1.7; }
+  .dealt-tag { display:inline-block; margin-left:6px; padding:1px 8px; font-size:12px; color:#fff; background:#e67e22; border-radius:8px; }
+  tr.dealt td { opacity:.55; }
 </style>
 </head>
 <body>
@@ -167,7 +170,7 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
     <table>
       <tr><th>#</th><th>群</th><th>邀请人</th><th>时间</th><th>处理结果</th><th>附言</th></tr>
       {% for it in items %}
-      <tr>
+      <tr{% if it.dealt %} class="dealt"{% endif %}>
         <td class="idx">{{ it.index }}</td>
         <td>
           <div class="person">
@@ -188,7 +191,7 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
           </div>
         </td>
         <td>{{ it.time }}</td>
-        <td>{{ it.action }}</td>
+        <td>{{ it.action }}{% if it.dealt %}<span class="dealt-tag">已拉黑</span>{% endif %}</td>
         <td class="comment">{{ it.comment }}</td>
       </tr>
       {% endfor %}
@@ -309,7 +312,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.15.4",
+    "1.16.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -611,6 +614,7 @@ class GroupInviteGuardPlugin(Star):
             # 跨群连坐：先退出该邀请人邀请过的其它群，再报复（消息仍只发一次）
             cross_line = await self._cross_group_leave(inviter_qq, group_id, records, bot)
             result = await self._take_revenge(inviter_qq, bot)
+            await self._mark_inviter_dealt(inviter_qq)
             banned.add(inviter_qq)
             logger.info(
                 f"group_invite_guard: revenge on {inviter_qq} for group {group_id}: {result}"
@@ -1842,6 +1846,36 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             logger.warning(f"group_invite_guard: save invite_records failed: {exc}")
 
+    async def _mark_inviter_dealt(self, inviter_qq: str, dealt: bool = True) -> None:
+        """给该邀请人的所有邀请记录打上/清除「已拉黑」标记（一人可能邀请多群）。"""
+        inviter_qq = str(inviter_qq or "").strip()
+        if not inviter_qq:
+            return
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
+            return
+        if not isinstance(records, dict):
+            return
+        changed = False
+        for rec in records.values():
+            if not isinstance(rec, dict) or self._record_inviter(rec) != inviter_qq:
+                continue
+            if dealt:
+                rec["dealt"] = True
+                rec["dealt_time"] = int(time.time())
+            else:
+                rec.pop("dealt", None)
+                rec.pop("dealt_time", None)
+            changed = True
+        if not changed:
+            return
+        try:
+            await self.put_kv_data("invite_records", records)
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: save invite_records failed: {exc}")
+
     def _get_ban_config(self):
         """读取 qq_tools 配置；返回 (config, err)。err 为空表示成功。"""
         instance = self._get_qq_tools_instance()
@@ -2023,19 +2057,26 @@ class GroupInviteGuardPlugin(Star):
                     return 0
             return 0
 
+        hide_dealt = _as_bool(self._cfg("display", "invite_records_hide_dealt", True))
         lines = []
         for gid, rec in sorted(records.items(), key=_sort_key, reverse=True):
             inviter = self._record_inviter(rec) or "(未知)"
             if isinstance(rec, dict):
+                dealt = _as_bool(rec.get("dealt"))
+                if dealt and hide_dealt:
+                    continue
                 try:
                     ts = datetime.fromtimestamp(int(rec.get("time") or 0)).strftime("%m-%d %H:%M")
                 except Exception:
                     ts = "-"
                 comment = str(rec.get("comment") or "").strip() or "(无附言)"
                 action = str(rec.get("action") or "").strip() or "-"
-                lines.append(f"群 {gid} -> {inviter} | {ts} | {action} | {comment}")
+                dealt_tag = " | 已拉黑" if dealt else ""
+                lines.append(f"群 {gid} -> {inviter} | {ts} | {action} | {comment}{dealt_tag}")
             else:
                 lines.append(f"群 {gid} -> {inviter}")
+        if not lines:
+            return "暂无邀请记录"
         return "\n".join(lines)
 
     async def _fetch_nickname(self, bot, qq: str) -> str:
@@ -2074,11 +2115,15 @@ class GroupInviteGuardPlugin(Star):
 
         show_profile = _as_bool(self._cfg("display", "invite_records_show_profile", True))
         show_group_profile = _as_bool(self._cfg("display", "invite_records_show_group_profile", True))
+        hide_dealt = _as_bool(self._cfg("display", "invite_records_hide_dealt", True))
 
         items = []
         for gid, rec in records.items():
             inviter = self._record_inviter(rec) or "(未知)"
             if isinstance(rec, dict):
+                dealt = _as_bool(rec.get("dealt"))
+                if dealt and hide_dealt:
+                    continue
                 try:
                     ts_int = int(rec.get("time") or 0)
                     ts = datetime.fromtimestamp(ts_int).strftime("%Y-%m-%d %H:%M")
@@ -2087,6 +2132,7 @@ class GroupInviteGuardPlugin(Star):
                 comment = str(rec.get("comment") or "").strip() or "(无附言)"
                 action = str(rec.get("action") or "").strip() or "-"
             else:
+                dealt = False
                 ts_int, ts, comment, action = 0, "-", "(无附言)", "-"
             items.append(
                 {
@@ -2095,6 +2141,7 @@ class GroupInviteGuardPlugin(Star):
                     "time": ts,
                     "action": action,
                     "comment": comment,
+                    "dealt": dealt,
                     "avatar": "",
                     "nickname": "",
                     "gavatar": "",
@@ -2199,6 +2246,7 @@ class GroupInviteGuardPlugin(Star):
             msg = f"已解封 {qq}"
             if not persisted:
                 msg += "（未能持久化）"
+            await self._mark_inviter_dealt(qq, dealt=False)
             return msg
         except Exception as exc:
             return f"解封失败：{exc}"
@@ -2245,6 +2293,7 @@ class GroupInviteGuardPlugin(Star):
             except Exception as exc:
                 result = f"拉黑失败：{exc}"
             parts.append(f"拉黑 {target}：{result}")
+            await self._mark_inviter_dealt(target)
             return "；".join(parts)
 
         # 单参数：先查邀请记录
@@ -2290,6 +2339,7 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             result = f"拉黑失败：{exc}"
         parts.append(f"拉黑 {target_qq}：{result}")
+        await self._mark_inviter_dealt(target_qq)
 
         return "；".join(parts)
 

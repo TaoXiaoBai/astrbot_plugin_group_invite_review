@@ -286,6 +286,12 @@
         "type": "bool",
         "default": true,
         "hint": "用于 /邀请记录 图片"
+      },
+      "invite_records_hide_dealt": {
+        "description": "隐藏已拉黑的记录",
+        "type": "bool",
+        "default": true,
+        "hint": "邀请人被拉黑后其记录默认不再显示；关闭则保留显示并带「已拉黑」标记"
       }
     }
   },
