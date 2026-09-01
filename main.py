@@ -87,6 +87,14 @@ _INVITE_KEYWORDS = (
     "邀请链接", "群邀请", "进我们群", "来我们群", "来群里",
 )
 
+_BLACKLIST_INQUIRY_KEYWORDS = (
+    "拉黑", "为什么拉黑", "为啥拉黑", "怎么拉黑", "为何拉黑",
+    "踢我", "为什么踢", "为啥踢", "为何踢", "被踢",
+    "拒绝", "为什么拒绝", "为啥拒绝", "为何拒绝", "不同意",
+    "进不了群", "加不了群", "为什么加不了", "为啥加不了",
+    "解封", "放出来", "取消拉黑", "撤销拉黑",
+)
+
 
 # 配置分组：group -> {key: 默认值}。嵌套读取与旧平铺配置迁移都以它为准，
 # 新增配置项时同步修改这里和 _conf_schema.json。
@@ -121,6 +129,9 @@ _CONFIG_GROUPS = {
         "enable_private_intent": True,
         "private_intent_reply": True,
         "private_intent_notify": True,
+        "enable_blacklist_inquiry": True,
+        "blacklist_inquiry_reply": True,
+        "blacklist_inquiry_notify": True,
     },
     "kick_revenge": {
         "revenge_mode": "off",
@@ -247,6 +258,19 @@ class GroupInviteRequestFilter(filter.CustomFilter):
 
 
 class PrivateInviteIntentFilter(filter.CustomFilter):
+    """只匹配私聊消息（post_type=message, message_type=private）。"""
+
+    def filter(self, event: AstrMessageEvent, cfg) -> bool:
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is None:
+            return False
+        return (
+            _get_value(raw, "post_type") == "message"
+            and _get_value(raw, "message_type") == "private"
+        )
+
+
+class PrivateBlacklistInquiryFilter(filter.CustomFilter):
     """只匹配私聊消息（post_type=message, message_type=private）。"""
 
     def filter(self, event: AstrMessageEvent, cfg) -> bool:
@@ -600,6 +624,145 @@ class GroupInviteGuardPlugin(Star):
             logger.error("group_invite_guard: no OneBot client for private intent notify")
             return
         if self._cfg("private_intent", "private_intent_notify", True):
+            await self._notify(bot, note)
+
+    def _looks_like_blacklist_inquiry(self, text: str) -> bool:
+        """粗筛：消息里出现拉黑/踢/拒绝相关关键词时，才交 LLM 判断。"""
+        return any(kw in text for kw in _BLACKLIST_INQUIRY_KEYWORDS)
+
+    async def _ask_blacklist_inquiry(self, sender_id: str, text: str, platform_id: str = None) -> dict:
+        """让 LLM 判断对方是否在询问拉黑/拒绝/踢人原因，并生成人格化回复。"""
+        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
+        if not provider_id:
+            raise RuntimeError("no llm provider id configured")
+
+        decision_persona = str(self._cfg("decision", "decision_persona") or "").strip()
+        persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
+        system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
+
+        # 查该 QQ 是否在黑名单，以及是否有邀请记录
+        ban_entry = self._find_ban_entry(sender_id)
+        ban_reason = ""
+        ban_time_str = ""
+        if ban_entry:
+            ban_reason = str(ban_entry.get("reason") or "未注明").strip()
+            try:
+                ban_ts = int(ban_entry.get("ban_time") or 0)
+                ban_time_str = datetime.fromtimestamp(ban_ts).strftime("%Y-%m-%d %H:%M") if ban_ts else ""
+            except Exception:
+                ban_time_str = ""
+
+        invited_records = self._find_invite_records_by_inviter(
+            self._normalize_invite_records(await self.get_kv_data("invite_records", {})),
+            sender_id,
+        )
+        invite_summary = ""
+        if invited_records:
+            rec = invited_records[0]
+            action = str(rec.get("action") or "").strip()
+            decision_reason = str(rec.get("decision_reason") or "").strip()
+            invite_summary = f"该用户最近一次邀请记录：处理结果={action}"
+            if decision_reason:
+                invite_summary += f"，理由={decision_reason}"
+
+        prompt = (
+            f"对方 QQ：{sender_id}\n"
+            f"对方私聊消息：{text}\n\n"
+            "请判断对方是否在询问“为什么被拉黑/为什么被踢/为什么被拒绝进群/能不能解封”之类的问题。\n"
+        )
+        if ban_entry:
+            prompt += f"该 QQ 当前在你的黑名单中（拉黑原因：{ban_reason}"
+            if ban_time_str:
+                prompt += f"，拉黑时间：{ban_time_str}"
+            prompt += "）。\n"
+        else:
+            prompt += "该 QQ 不在你的黑名单中。\n"
+        if invite_summary:
+            prompt += invite_summary + "\n"
+        prompt += (
+            "\n只输出一个 JSON 对象：{"
+            "\"is_inquiry\": true 或 false, "
+            "\"reply\": "
+            "\"若为询问，按你的人格和身份给对方的简短回复（一两句），语气坚定但不过激；"
+            "不要暴露管理员 QQ、具体群号、具体审核细节等敏感信息；"
+            "如果对方不是被拉黑的 QQ 本人（如朋友代问或开小号），回复中说明只能由本人沟通。\""
+            ", \"reason\": \"给管理员的简短说明\"}"
+        )
+
+        resp = await self.context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=prompt,
+            system_prompt=system_prompt,
+        )
+        result_text = (getattr(resp, "completion_text", "") or "").strip()
+        return _parse_json(result_text)
+
+    def _compose_blacklist_inquiry_note(self, sender_id: str, text: str, reply: str, reason: str, is_banned: bool) -> str:
+        lines = [
+            "[私聊询问拉黑/拒绝原因]",
+            f"对方 QQ：{sender_id or '(未知)'}",
+            f"是否在黑名单：{'是' if is_banned else '否'}",
+            f"对方消息：{text}",
+        ]
+        if reason:
+            lines.append(f"判断说明：{reason}")
+        if reply:
+            lines.append(f"已自动回复：{reply}")
+        return "\n".join(lines)
+
+    @filter.custom_filter(PrivateBlacklistInquiryFilter)
+    async def on_private_blacklist_inquiry(self, event: AstrMessageEvent):
+        if not self._cfg("basic", "enable", True):
+            return
+        if not self._cfg("private_intent", "enable_blacklist_inquiry", True):
+            return
+
+        text = (event.get_message_str() or "").strip()
+        if not text:
+            return
+
+        if not self._looks_like_blacklist_inquiry(text):
+            return
+
+        platform_id = None
+        try:
+            platform_id = event.get_platform_id()
+        except Exception:
+            pass
+
+        sender_id = event.get_sender_id() or ""
+        try:
+            decision = await self._ask_blacklist_inquiry(sender_id, text, platform_id)
+        except Exception as exc:
+            logger.error(f"group_invite_guard: blacklist inquiry LLM failed: {exc}")
+            return
+
+        if not _as_bool(decision.get("is_inquiry")):
+            return
+
+        # 确认是询问，接管这条私聊
+        try:
+            event.stop_event()
+            event.should_call_llm(False)
+        except Exception:
+            pass
+
+        reply = str(decision.get("reply") or "").strip()
+        reason = str(decision.get("reason") or "").strip()
+
+        if self._cfg("private_intent", "blacklist_inquiry_reply", True) and reply:
+            try:
+                await event.send(MessageChain(chain=[Plain(reply)]))
+            except Exception as exc:
+                logger.error(f"group_invite_guard: reply blacklist inquiry failed: {exc}")
+
+        bot = self._find_onebot_client(event)
+        if bot is None:
+            logger.error("group_invite_guard: no OneBot client for blacklist inquiry notify")
+            return
+        if self._cfg("private_intent", "blacklist_inquiry_notify", True):
+            is_banned = self._find_ban_entry(sender_id) is not None
+            note = self._compose_blacklist_inquiry_note(sender_id, text, reply, reason, is_banned)
             await self._notify(bot, note)
 
     @filter.custom_filter(GroupJoinFilter)

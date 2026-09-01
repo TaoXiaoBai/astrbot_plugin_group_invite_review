@@ -160,6 +160,24 @@
         "type": "bool",
         "default": true,
         "hint": "识别到私聊加群意图时通知管理员"
+      },
+      "enable_blacklist_inquiry": {
+        "description": "识别私聊询问拉黑原因",
+        "type": "bool",
+        "default": true,
+        "hint": "被拉黑/拒绝/踢群的人（或其朋友、小号）私聊问原因时自动识别"
+      },
+      "blacklist_inquiry_reply": {
+        "description": "自动回复询问",
+        "type": "bool",
+        "default": true,
+        "hint": "按人格生成简短解释并回复对方，避免泄露敏感信息"
+      },
+      "blacklist_inquiry_notify": {
+        "description": "通知管理员询问",
+        "type": "bool",
+        "default": true,
+        "hint": "有人私聊询问拉黑原因时通知你"
       }
     }
   },
