@@ -132,6 +132,12 @@ _CONFIG_GROUPS = {
         "enable_blacklist_inquiry": True,
         "blacklist_inquiry_reply": True,
         "blacklist_inquiry_notify": True,
+        "blacklist_inquiry_keywords": "拉黑,为什么拉黑,为啥拉黑,怎么拉黑,踢我,为什么踢,为啥踢,被踢,拒绝,为什么拒绝,为啥拒绝,不同意,进不了群,加不了群,解封,放出来,取消拉黑",
+        "blacklist_inquiry_tone": "persona",
+        "blacklist_inquiry_show_reason": True,
+        "blacklist_inquiry_max_length": 120,
+        "blacklist_inquiry_system_prompt": "",
+        "blacklist_inquiry_user_prompt": "",
     },
     "kick_revenge": {
         "revenge_mode": "off",
@@ -627,23 +633,33 @@ class GroupInviteGuardPlugin(Star):
             await self._notify(bot, note)
 
     def _looks_like_blacklist_inquiry(self, text: str) -> bool:
-        """粗筛：消息里出现拉黑/踢/拒绝相关关键词时，才交 LLM 判断。"""
-        return any(kw in text for kw in _BLACKLIST_INQUIRY_KEYWORDS)
+        """粗筛：消息里出现配置的关键词时，才交 LLM 判断。"""
+        raw = str(self._cfg("private_intent", "blacklist_inquiry_keywords") or "").strip()
+        if not raw:
+            return any(kw in text for kw in _BLACKLIST_INQUIRY_KEYWORDS)
+        keywords = [k.strip() for k in raw.split(",") if k.strip()]
+        if not keywords:
+            return any(kw in text for kw in _BLACKLIST_INQUIRY_KEYWORDS)
+        return any(kw in text for kw in keywords)
 
-    async def _ask_blacklist_inquiry(self, sender_id: str, text: str, platform_id: str = None) -> dict:
-        """让 LLM 判断对方是否在询问拉黑/拒绝/踢人原因，并生成人格化回复。"""
-        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
-        if not provider_id:
-            raise RuntimeError("no llm provider id configured")
+    @staticmethod
+    def _tone_description(tone: str) -> str:
+        """把语气配置转成给 LLM 的自然语言描述。"""
+        return {
+            "serious": "严肃、正式，不带情绪，明确说明规则",
+            "polite": "委婉、客气，给对方留面子，但立场坚定",
+            "cold": "冷漠、简短，不解释太多，只陈述结果",
+        }.get(str(tone or "").strip().lower(), "使用你当前人格设定的语气和风格")
 
+    async def _build_blacklist_inquiry_variables(self, sender_id: str, text: str, platform_id: str = None) -> dict:
+        """拼装黑名单询问提示词可用的所有变量。"""
         decision_persona = str(self._cfg("decision", "decision_persona") or "").strip()
         persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
-        system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
 
-        # 查该 QQ 是否在黑名单，以及是否有邀请记录
         ban_entry = self._find_ban_entry(sender_id)
         ban_reason = ""
         ban_time_str = ""
+        is_banned = ban_entry is not None
         if ban_entry:
             ban_reason = str(ban_entry.get("reason") or "未注明").strip()
             try:
@@ -652,42 +668,88 @@ class GroupInviteGuardPlugin(Star):
             except Exception:
                 ban_time_str = ""
 
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception:
+            records = {}
         invited_records = self._find_invite_records_by_inviter(
-            self._normalize_invite_records(await self.get_kv_data("invite_records", {})),
-            sender_id,
+            self._normalize_invite_records(records), sender_id
         )
         invite_summary = ""
         if invited_records:
             rec = invited_records[0]
             action = str(rec.get("action") or "").strip()
             decision_reason = str(rec.get("decision_reason") or "").strip()
-            invite_summary = f"该用户最近一次邀请记录：处理结果={action}"
+            invite_summary = f"处理结果={action}"
             if decision_reason:
                 invite_summary += f"，理由={decision_reason}"
 
-        prompt = (
-            f"对方 QQ：{sender_id}\n"
-            f"对方私聊消息：{text}\n\n"
-            "请判断对方是否在询问“为什么被拉黑/为什么被踢/为什么被拒绝进群/能不能解封”之类的问题。\n"
-        )
-        if ban_entry:
-            prompt += f"该 QQ 当前在你的黑名单中（拉黑原因：{ban_reason}"
-            if ban_time_str:
-                prompt += f"，拉黑时间：{ban_time_str}"
-            prompt += "）。\n"
+        tone = str(self._cfg("private_intent", "blacklist_inquiry_tone") or "persona").strip().lower()
+        show_reason = _as_bool(self._cfg("private_intent", "blacklist_inquiry_show_reason", True))
+        max_length = int(self._cfg("private_intent", "blacklist_inquiry_max_length", 120) or 120)
+
+        return {
+            "sender_id": str(sender_id or "").strip(),
+            "text": str(text or "").strip(),
+            "is_banned": "是" if is_banned else "否",
+            "ban_reason": ban_reason or "未注明",
+            "ban_time": ban_time_str or "未知",
+            "invite_summary": invite_summary or "无邀请记录",
+            "persona_prompt": persona_prompt or "你是一个 QQ 机器人助手。",
+            "tone": self._tone_description(tone),
+            "show_reason": "是" if show_reason else "否",
+            "max_length": str(max_length),
+        }
+
+    @staticmethod
+    def _format_prompt_template(template: str, variables: dict) -> str:
+        """用变量字典替换模板中的 {key}；模板为空返回空字符串。"""
+        if not template:
+            return ""
+        result = template
+        for key, val in variables.items():
+            result = result.replace("{" + key + "}", str(val))
+        return result
+
+    async def _ask_blacklist_inquiry(self, sender_id: str, text: str, platform_id: str = None) -> dict:
+        """让 LLM 判断对方是否在询问拉黑/拒绝/踢人原因，并生成人格化回复。"""
+        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
+        if not provider_id:
+            raise RuntimeError("no llm provider id configured")
+
+        variables = await self._build_blacklist_inquiry_variables(sender_id, text, platform_id)
+
+        custom_system = str(self._cfg("private_intent", "blacklist_inquiry_system_prompt") or "").strip()
+        if custom_system:
+            system_prompt = self._format_prompt_template(custom_system, variables)
         else:
-            prompt += "该 QQ 不在你的黑名单中。\n"
-        if invite_summary:
-            prompt += invite_summary + "\n"
-        prompt += (
-            "\n只输出一个 JSON 对象：{"
-            "\"is_inquiry\": true 或 false, "
-            "\"reply\": "
-            "\"若为询问，按你的人格和身份给对方的简短回复（一两句），语气坚定但不过激；"
-            "不要暴露管理员 QQ、具体群号、具体审核细节等敏感信息；"
-            "如果对方不是被拉黑的 QQ 本人（如朋友代问或开小号），回复中说明只能由本人沟通。\""
-            ", \"reason\": \"给管理员的简短说明\"}"
-        )
+            system_prompt = (
+                "{persona_prompt}\n\n"
+                "现在有人私聊你，询问为什么被拉黑、被踢、被拒绝进群或能不能解封。"
+                "你的回复语气基调是：{tone}。"
+                "不要暴露管理员 QQ、具体群号、具体审核细节等敏感信息。"
+                "如果对方不是被拉黑 QQ 本人（如朋友代问或开小号），说明只能由本人沟通。"
+            ).format(**variables)
+
+        custom_user = str(self._cfg("private_intent", "blacklist_inquiry_user_prompt") or "").strip()
+        if custom_user:
+            prompt = self._format_prompt_template(custom_user, variables)
+        else:
+            prompt = (
+                "对方 QQ：{sender_id}\n"
+                "对方私聊消息：{text}\n"
+                "该 QQ 是否在你的黑名单中：{is_banned}\n"
+                "拉黑原因：{ban_reason}\n"
+                "拉黑时间：{ban_time}\n"
+                "邀请记录摘要：{invite_summary}\n"
+                "回复中是否说明原因：{show_reason}\n"
+                "回复最大字数：{max_length}\n\n"
+                "请判断对方是否在询问拉黑/拒绝/踢人/解封相关问题。"
+                "只输出一个 JSON 对象：{"
+                "\"is_inquiry\": true 或 false, "
+                "\"reply\": \"若为询问，给对方的简短回复（控制在 {max_length} 字内）；否则空字符串\", "
+                "\"reason\": \"给管理员的简短说明\"}"
+            ).format(**variables)
 
         resp = await self.context.llm_generate(
             chat_provider_id=provider_id,
@@ -695,7 +757,17 @@ class GroupInviteGuardPlugin(Star):
             system_prompt=system_prompt,
         )
         result_text = (getattr(resp, "completion_text", "") or "").strip()
-        return _parse_json(result_text)
+        result = _parse_json(result_text)
+
+        # 后处理：截断过长回复
+        try:
+            max_len = int(self._cfg("private_intent", "blacklist_inquiry_max_length", 120) or 120)
+        except Exception:
+            max_len = 120
+        reply = str(result.get("reply") or "").strip()
+        if reply and max_len > 0 and len(reply) > max_len:
+            result["reply"] = reply[:max_len] + "…"
+        return result
 
     def _compose_blacklist_inquiry_note(self, sender_id: str, text: str, reply: str, reason: str, is_banned: bool) -> str:
         lines = [

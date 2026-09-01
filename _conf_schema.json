@@ -178,6 +178,44 @@
         "type": "bool",
         "default": true,
         "hint": "有人私聊询问拉黑原因时通知你"
+      },
+      "blacklist_inquiry_keywords": {
+        "description": "触发关键词",
+        "type": "string",
+        "default": "拉黑,为什么拉黑,为啥拉黑,怎么拉黑,踢我,为什么踢,为啥踢,被踢,拒绝,为什么拒绝,为啥拒绝,不同意,进不了群,加不了群,解封,放出来,取消拉黑",
+        "hint": "英文逗号分隔；消息中含任一关键词才会交给 LLM 判断"
+      },
+      "blacklist_inquiry_tone": {
+        "description": "回复语气",
+        "type": "string",
+        "default": "persona",
+        "options": ["persona", "serious", "polite", "cold"],
+        "labels": ["跟随人格设定", "严肃", "委婉", "冷漠"],
+        "hint": "自动回复时的语气基调；选跟随人格则使用当前人格设定"
+      },
+      "blacklist_inquiry_show_reason": {
+        "description": "回复中说明原因",
+        "type": "bool",
+        "default": true,
+        "hint": "是否在自动回复里简要提及拉黑/拒绝原因；关闭则更模糊"
+      },
+      "blacklist_inquiry_max_length": {
+        "description": "回复最大字数",
+        "type": "int",
+        "default": 120,
+        "hint": "自动回复控制在多少字以内，避免过长"
+      },
+      "blacklist_inquiry_system_prompt": {
+        "description": "自定义系统提示词（高级）",
+        "type": "text",
+        "default": "",
+        "hint": "留空用默认。可用变量：{persona_prompt} 当前人格设定"
+      },
+      "blacklist_inquiry_user_prompt": {
+        "description": "自定义用户提示词模板（高级）",
+        "type": "text",
+        "default": "",
+        "hint": "留空用默认。可用变量：{sender_id},{text},{is_banned},{ban_reason},{ban_time},{invite_summary},{tone},{show_reason},{max_length}"
       }
     }
   },
