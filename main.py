@@ -53,6 +53,22 @@ def _parse_json(text: str) -> dict:
         return {"action": "unknown", "reason": text[:200]}
 
 
+def _invite_status_label(action: str, dealt: bool) -> tuple[str, str]:
+    """把邀请记录的 action 与 dealt 标志转成 (状态文本, css 类名)。"""
+    if dealt:
+        return "已拉黑", "banned"
+    a = str(action or "").strip().lower()
+    if a == "approve":
+        return "已同意", "approved"
+    if a == "reject":
+        return "已拒绝", "rejected"
+    if a == "手动记录":
+        return "已记录", "recorded"
+    if a in ("unknown", "", "-"):
+        return "待处理", "pending"
+    return str(action or "其他").strip(), "other"
+
+
 _INVITE_LINK_MARKS = (
     "qm.qq.com",
     "jq.qq.com",
@@ -161,6 +177,13 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
   .hint { margin-top:16px; font-size:12px; color:#9aa0b0; line-height:1.7; }
   .dealt-tag { display:inline-block; margin-left:6px; padding:1px 8px; font-size:12px; color:#fff; background:#e67e22; border-radius:8px; }
   tr.dealt td { opacity:.55; }
+  .status-tag { display:inline-block; padding:3px 10px; font-size:13px; color:#fff; border-radius:10px; font-weight:600; white-space:nowrap; }
+  .status-tag.banned { background:#e74c3c; }
+  .status-tag.approved { background:#2ecc71; }
+  .status-tag.rejected { background:#95a5a6; }
+  .status-tag.recorded { background:#3498db; }
+  .status-tag.pending { background:#f39c12; }
+  .status-tag.other { background:#bdc3c7; color:#333; }
 </style>
 </head>
 <body>
@@ -169,7 +192,7 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
     <div class="sub">共 {{ total }} 条（新→旧）</div>
     {% if items %}
     <table>
-      <tr><th>#</th><th>群</th><th>邀请人</th><th>时间</th><th>处理结果</th><th>附言</th></tr>
+      <tr><th>#</th><th>群</th><th>邀请人</th><th>时间</th><th>状态</th><th>附言</th></tr>
       {% for it in items %}
       <tr{% if it.dealt %} class="dealt"{% endif %}>
         <td class="idx">{{ it.index }}</td>
@@ -192,7 +215,7 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
           </div>
         </td>
         <td>{{ it.time }}</td>
-        <td>{{ it.action }}{% if it.dealt %}<span class="dealt-tag">已拉黑</span>{% endif %}</td>
+        <td><span class="status-tag {{ it.status_class }}">{{ it.status_text }}</span></td>
         <td class="comment">{{ it.comment }}</td>
       </tr>
       {% endfor %}
@@ -2072,8 +2095,8 @@ class GroupInviteGuardPlugin(Star):
                     ts = "-"
                 comment = str(rec.get("comment") or "").strip() or "(无附言)"
                 action = str(rec.get("action") or "").strip() or "-"
-                dealt_tag = " | 已拉黑" if dealt else ""
-                lines.append(f"群 {gid} -> {inviter} | {ts} | {action} | {comment}{dealt_tag}")
+                status_text, _ = _invite_status_label(action, dealt)
+                lines.append(f"群 {gid} -> {inviter} | {ts} | [{status_text}] | {comment}")
             else:
                 lines.append(f"群 {gid} -> {inviter}")
         if not lines:
@@ -2135,6 +2158,7 @@ class GroupInviteGuardPlugin(Star):
             else:
                 dealt = False
                 ts_int, ts, comment, action = 0, "-", "(无附言)", "-"
+            status_text, status_class = _invite_status_label(action, dealt)
             items.append(
                 {
                     "group": str(gid),
@@ -2143,6 +2167,8 @@ class GroupInviteGuardPlugin(Star):
                     "action": action,
                     "comment": comment,
                     "dealt": dealt,
+                    "status_text": status_text,
+                    "status_class": status_class,
                     "avatar": "",
                     "nickname": "",
                     "gavatar": "",
