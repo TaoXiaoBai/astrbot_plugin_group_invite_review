@@ -4,6 +4,7 @@ import inspect
 import json
 import re
 import time
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -421,10 +422,18 @@ class GroupInviteGuardPlugin(Star):
         flag = str(_get_value(raw, "flag") or "")
         sub_type = str(_get_value(raw, "sub_type") or "invite")
         self_id = str(_get_value(raw, "self_id") or "")
+        platform_id = None
+        try:
+            platform_id = event.get_platform_id()
+        except Exception:
+            pass
 
         # 禁用：不接管（不 stop_event），只记录一条邀请后返回
         if not self._cfg("basic", "enable", True):
-            await self._record_invite(group_id, inviter_qq, comment, "仅记录（插件已禁用）")
+            await self._record_invite(
+                group_id, inviter_qq, comment, "仅记录（插件已禁用）",
+                decision="unknown", platform_id=platform_id or "", self_id=self_id,
+            )
             return
 
         # 启用：接管这条 request，阻止这条空的 request 消息继续进入 LLM 回复阶段
@@ -438,15 +447,14 @@ class GroupInviteGuardPlugin(Star):
             return
 
         bot = self._find_onebot_client(event)
-        platform_id = None
-        try:
-            platform_id = event.get_platform_id()
-        except Exception:
-            pass
 
-        # 先记录一条「处理中」，决策与执行完成后再覆盖为最终结果，
+        # 先记录一条「处理中」，决策与执行完成后再更新为最终结果，
         # 保证即使中途异常记录也不会丢失
-        await self._record_invite(group_id, inviter_qq, comment, "处理中")
+        record_id = uuid.uuid4().hex[:8]
+        await self._record_invite(
+            group_id, inviter_qq, comment, "处理中", record_id=record_id,
+            decision="unknown", platform_id=platform_id or "", self_id=self_id,
+        )
 
         try:
             decision = await self._ask_llm(inviter_qq, group_id, comment, bot, platform_id)
@@ -517,8 +525,22 @@ class GroupInviteGuardPlugin(Star):
                 logger.error(f"group_invite_guard: reject failed: {exc}")
                 result_label = "自动拒绝失败"
 
-        # 每条邀请都记录（无论是否自动处理），供被踢报复与查询
-        await self._record_invite(group_id, inviter_qq, comment, result_label)
+        # 更新为最终结果（无论是否自动处理），供被踢报复与查询
+        await self._update_invite_record(
+            group_id,
+            record_id,
+            action=result_label,
+            decision=action,
+            decision_reason=reason,
+            auto_executed=(action in ("approve", "reject") and (
+                self._cfg("decision", "auto_approve", False) or
+                self._cfg("decision", "auto_reject", False)
+            )),
+            execution_result=result_label,
+            reply=reply,
+            reply_status=reply_status,
+            alt_warning=str(decision.get("alt_warning") or "").strip(),
+        )
 
         if bot is not None:
             alt_warning = str(decision.get("alt_warning") or "").strip()
@@ -615,7 +637,8 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
             records = {}
-        inviter_qq = self._record_inviter(records.get(group_id)) if isinstance(records, dict) else ""
+        latest_rec = self._latest_invite_record(records, group_id)
+        inviter_qq = self._record_inviter(latest_rec) if latest_rec else ""
 
         mode = str(self._cfg("kick_revenge", "revenge_mode", "off") or "off").strip().lower()
         revenge_on = mode in ("delete_friend", "delete_and_ban")
@@ -679,12 +702,14 @@ class GroupInviteGuardPlugin(Star):
         if not _as_bool(self._cfg("kick_revenge", "cross_group_retaliation", False)):
             return ""
         inviter_qq = str(inviter_qq or "").strip()
-        if not inviter_qq or bot is None or not isinstance(records, dict):
+        if not inviter_qq or bot is None:
             return ""
+        normalized = self._normalize_invite_records(records)
         groups = [
             str(gid)
-            for gid, rec in records.items()
-            if str(gid) != str(exclude_group) and self._record_inviter(rec) == inviter_qq
+            for gid, recs in normalized.items()
+            if str(gid) != str(exclude_group)
+            and any(self._record_inviter(r) == inviter_qq for r in recs)
         ]
         if not groups:
             return ""
@@ -849,8 +874,8 @@ class GroupInviteGuardPlugin(Star):
             except Exception as exc:
                 logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
                 invite_records = {}
-            inviter_qq = self._record_inviter(invite_records.get(group_id)) if isinstance(invite_records, dict) else ""
-            inviter_qq = str(inviter_qq or "").strip()
+            latest_rec = self._latest_invite_record(invite_records, group_id)
+            inviter_qq = str(self._record_inviter(latest_rec) or "").strip()
             if inviter_qq:
                 targets.append(inviter_qq)
 
@@ -1020,9 +1045,11 @@ class GroupInviteGuardPlugin(Star):
         join_records = join_records if isinstance(join_records, dict) else {}
         mute_records = mute_records if isinstance(mute_records, dict) else {}
 
+        normalized = self._normalize_invite_records(invite_records)
         invited = [
             (str(gid), rec)
-            for gid, rec in invite_records.items()
+            for gid, recs in normalized.items()
+            for rec in recs
             if self._record_inviter(rec) == qq
         ]
         data["invited"] = invited
@@ -1252,10 +1279,9 @@ class GroupInviteGuardPlugin(Star):
                 records = await self.get_kv_data("invite_records", {})
             except Exception:
                 records = {}
-            if isinstance(records, dict):
-                for rec in records.values():
-                    if not isinstance(rec, dict):
-                        continue
+            normalized = self._normalize_invite_records(records)
+            for recs in normalized.values():
+                for rec in recs:
                     uid = self._record_inviter(rec)
                     if uid in banned_qqs:
                         c = str(rec.get("comment") or "").strip()
@@ -1320,13 +1346,13 @@ class GroupInviteGuardPlugin(Star):
             records = await self.get_kv_data("invite_records", {})
         except Exception:
             return ""
-        if not isinstance(records, dict):
-            return ""
-        for rec in records.values():
-            if isinstance(rec, dict) and self._record_inviter(rec) == qq:
-                comment = str(rec.get("comment") or "").strip()
-                if comment:
-                    return comment
+        normalized = self._normalize_invite_records(records)
+        for recs in normalized.values():
+            for rec in recs:
+                if self._record_inviter(rec) == qq:
+                    comment = str(rec.get("comment") or "").strip()
+                    if comment:
+                        return comment
         return ""
 
     async def _llm_review_alt(self, inviter_qq: str, comment: str, old_uid: str, sim: float, dim: str) -> str:
@@ -1840,14 +1866,66 @@ class GroupInviteGuardPlugin(Star):
         return getattr(md, "star_cls", None)
 
     @staticmethod
+    def _normalize_invite_records(records: Any) -> dict:
+        """把旧格式 {group_id: dict|str} 统一转成 {group_id: [dict, ...]}，返回新 dict。"""
+        if not isinstance(records, dict):
+            return {}
+        normalized = {}
+        for gid, val in records.items():
+            gid = str(gid)
+            if isinstance(val, list):
+                normalized[gid] = [r for r in val if isinstance(r, dict)]
+            elif isinstance(val, dict):
+                normalized[gid] = [val]
+            elif isinstance(val, str):
+                # 极旧格式：群号 -> QQ 字符串
+                normalized[gid] = [{"inviter": val, "time": 0, "action": "", "comment": ""}]
+            else:
+                normalized[gid] = []
+        return normalized
+
+    @staticmethod
     def _record_inviter(record) -> str:
-        """从邀请记录取邀请人 QQ；兼容旧的纯字符串格式。"""
+        """从单条邀请记录取邀请人 QQ；兼容旧的纯字符串格式。"""
         if isinstance(record, dict):
             return str(record.get("inviter") or "").strip()
         return str(record or "").strip()
 
-    async def _record_invite(self, group_id: str, inviter_qq: str, comment: str = "", action: str = "") -> None:
-        """记录/覆盖一条邀请（按群号取最新），供被踢报复与查询。"""
+    @classmethod
+    def _latest_invite_record(cls, records: dict, group_id: str) -> dict | None:
+        """取某群最新一条邀请记录；无记录返回 None。"""
+        group_id = str(group_id or "").strip()
+        if not group_id:
+            return None
+        recs = cls._normalize_invite_records(records).get(group_id, [])
+        if not recs:
+            return None
+        return max(recs, key=lambda r: int(r.get("time") or 0))
+
+    @classmethod
+    def _find_invite_records_by_inviter(cls, records: dict, inviter_qq: str) -> list[dict]:
+        """返回某邀请人的所有邀请记录（按时间新→旧）。"""
+        inviter_qq = str(inviter_qq or "").strip()
+        if not inviter_qq:
+            return []
+        result = []
+        for recs in cls._normalize_invite_records(records).values():
+            for rec in recs:
+                if cls._record_inviter(rec) == inviter_qq:
+                    result.append(rec)
+        result.sort(key=lambda r: int(r.get("time") or 0), reverse=True)
+        return result
+
+    async def _record_invite(
+        self,
+        group_id: str,
+        inviter_qq: str,
+        comment: str = "",
+        action: str = "",
+        record_id: str = "",
+        **extra,
+    ) -> None:
+        """追加一条邀请记录（同群保留历史），并继承旧记录的 dealt 状态。"""
         group_id = str(group_id or "").strip()
         inviter_qq = str(inviter_qq or "").strip()
         if not group_id or not inviter_qq:
@@ -1857,14 +1935,64 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
             records = {}
-        if not isinstance(records, dict):
-            records = {}
-        records[group_id] = {
+        records = self._normalize_invite_records(records)
+
+        # 同群旧记录：若邀请人相同且已拉黑，新记录继承标记
+        old_dealt = False
+        old_dealt_time = 0
+        for old in records.get(group_id, []):
+            if self._record_inviter(old) == inviter_qq:
+                if _as_bool(old.get("dealt")):
+                    old_dealt = True
+                    old_dealt_time = int(old.get("dealt_time") or 0)
+                break
+
+        now = int(time.time())
+        new_record = {
             "inviter": inviter_qq,
             "comment": str(comment or "").strip(),
-            "time": int(time.time()),
+            "time": now,
             "action": str(action or "").strip(),
+            "record_id": str(record_id or uuid.uuid4().hex[:8]),
         }
+        if old_dealt:
+            new_record["dealt"] = True
+            new_record["dealt_time"] = old_dealt_time or now
+        for k, v in extra.items():
+            if k not in new_record:
+                new_record[k] = v
+
+        records.setdefault(group_id, []).append(new_record)
+        try:
+            await self.put_kv_data("invite_records", records)
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: save invite_records failed: {exc}")
+
+    async def _update_invite_record(
+        self,
+        group_id: str,
+        record_id: str,
+        **fields,
+    ) -> None:
+        """按 record_id 更新某条邀请记录；找不到则忽略。"""
+        group_id = str(group_id or "").strip()
+        record_id = str(record_id or "").strip()
+        if not group_id or not record_id:
+            return
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
+            return
+        records = self._normalize_invite_records(records)
+        changed = False
+        for rec in records.get(group_id, []):
+            if str(rec.get("record_id") or "") == record_id:
+                rec.update(fields)
+                changed = True
+                break
+        if not changed:
+            return
         try:
             await self.put_kv_data("invite_records", records)
         except Exception as exc:
@@ -1880,19 +2008,20 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
             return
-        if not isinstance(records, dict):
-            return
+        records = self._normalize_invite_records(records)
         changed = False
-        for rec in records.values():
-            if not isinstance(rec, dict) or self._record_inviter(rec) != inviter_qq:
-                continue
-            if dealt:
-                rec["dealt"] = True
-                rec["dealt_time"] = int(time.time())
-            else:
-                rec.pop("dealt", None)
-                rec.pop("dealt_time", None)
-            changed = True
+        now = int(time.time())
+        for recs in records.values():
+            for rec in recs:
+                if self._record_inviter(rec) != inviter_qq:
+                    continue
+                if dealt:
+                    rec["dealt"] = True
+                    rec["dealt_time"] = int(rec.get("dealt_time") or now)
+                else:
+                    rec.pop("dealt", None)
+                    rec.pop("dealt_time", None)
+                changed = True
         if not changed:
             return
         try:
@@ -2069,36 +2198,32 @@ class GroupInviteGuardPlugin(Star):
             records = await self.get_kv_data("invite_records", {})
         except Exception as exc:
             return f"读取邀请记录失败：{exc}"
-        if not isinstance(records, dict) or not records:
+        records = self._normalize_invite_records(records)
+        if not records:
             return "暂无邀请记录"
 
-        def _sort_key(item):
-            rec = item[1]
-            if isinstance(rec, dict):
-                try:
-                    return int(rec.get("time") or 0)
-                except Exception:
-                    return 0
-            return 0
-
         hide_dealt = _as_bool(self._cfg("display", "invite_records_hide_dealt", True))
+        # 把所有记录拉平，按时间新→旧排序
+        flat = []
+        for gid, recs in records.items():
+            for rec in recs:
+                flat.append((str(gid), rec))
+        flat.sort(key=lambda x: int(x[1].get("time") or 0), reverse=True)
+
         lines = []
-        for gid, rec in sorted(records.items(), key=_sort_key, reverse=True):
+        for gid, rec in flat:
             inviter = self._record_inviter(rec) or "(未知)"
-            if isinstance(rec, dict):
-                dealt = _as_bool(rec.get("dealt"))
-                if dealt and hide_dealt:
-                    continue
-                try:
-                    ts = datetime.fromtimestamp(int(rec.get("time") or 0)).strftime("%m-%d %H:%M")
-                except Exception:
-                    ts = "-"
-                comment = str(rec.get("comment") or "").strip() or "(无附言)"
-                action = str(rec.get("action") or "").strip() or "-"
-                status_text, _ = _invite_status_label(action, dealt)
-                lines.append(f"群 {gid} -> {inviter} | {ts} | [{status_text}] | {comment}")
-            else:
-                lines.append(f"群 {gid} -> {inviter}")
+            dealt = _as_bool(rec.get("dealt"))
+            if dealt and hide_dealt:
+                continue
+            try:
+                ts = datetime.fromtimestamp(int(rec.get("time") or 0)).strftime("%m-%d %H:%M")
+            except Exception:
+                ts = "-"
+            comment = str(rec.get("comment") or "").strip() or "(无附言)"
+            action = str(rec.get("action") or "").strip() or "-"
+            status_text, _ = _invite_status_label(action, dealt)
+            lines.append(f"群 {gid} -> {inviter} | {ts} | [{status_text}] | {comment}")
         if not lines:
             return "暂无邀请记录"
         return "\n".join(lines)
@@ -2142,9 +2267,10 @@ class GroupInviteGuardPlugin(Star):
         hide_dealt = _as_bool(self._cfg("display", "invite_records_hide_dealt", True))
 
         items = []
-        for gid, rec in records.items():
-            inviter = self._record_inviter(rec) or "(未知)"
-            if isinstance(rec, dict):
+        records = self._normalize_invite_records(records)
+        for gid, recs in records.items():
+            for rec in recs:
+                inviter = self._record_inviter(rec) or "(未知)"
                 dealt = _as_bool(rec.get("dealt"))
                 if dealt and hide_dealt:
                     continue
@@ -2155,27 +2281,24 @@ class GroupInviteGuardPlugin(Star):
                     ts_int, ts = 0, "-"
                 comment = str(rec.get("comment") or "").strip() or "(无附言)"
                 action = str(rec.get("action") or "").strip() or "-"
-            else:
-                dealt = False
-                ts_int, ts, comment, action = 0, "-", "(无附言)", "-"
-            status_text, status_class = _invite_status_label(action, dealt)
-            items.append(
-                {
-                    "group": str(gid),
-                    "inviter": inviter,
-                    "time": ts,
-                    "action": action,
-                    "comment": comment,
-                    "dealt": dealt,
-                    "status_text": status_text,
-                    "status_class": status_class,
-                    "avatar": "",
-                    "nickname": "",
-                    "gavatar": "",
-                    "gname": "",
-                    "_ts": ts_int,
-                }
-            )
+                status_text, status_class = _invite_status_label(action, dealt)
+                items.append(
+                    {
+                        "group": str(gid),
+                        "inviter": inviter,
+                        "time": ts,
+                        "action": action,
+                        "comment": comment,
+                        "dealt": dealt,
+                        "status_text": status_text,
+                        "status_class": status_class,
+                        "avatar": "",
+                        "nickname": "",
+                        "gavatar": "",
+                        "gname": "",
+                        "_ts": ts_int,
+                    }
+                )
         items.sort(key=lambda x: x["_ts"], reverse=True)
         for i, it in enumerate(items, 1):
             it["index"] = i
@@ -2334,16 +2457,18 @@ class GroupInviteGuardPlugin(Star):
 
         target_qq = ""
         groups = []
-        if target in records:
-            # 参数是群号：取该群记录的邀请人
-            inviter = self._record_inviter(records.get(target))
+        normalized = self._normalize_invite_records(records)
+        if target in normalized:
+            # 参数是群号：取该群最新记录的邀请人
+            latest = self._latest_invite_record(records, target)
+            inviter = self._record_inviter(latest) if latest else ""
             if inviter:
                 target_qq = inviter
                 groups = [target]
         else:
             # 参数是邀请人 QQ：收集 TA 邀请过的所有群（一人可能邀请多群）
-            for gid, rec in records.items():
-                if self._record_inviter(rec) == target:
+            for gid in normalized:
+                if any(self._record_inviter(r) == target for r in normalized[gid]):
                     groups.append(gid)
             if groups:
                 target_qq = target
@@ -2485,11 +2610,19 @@ class GroupInviteGuardPlugin(Star):
         invite, mute = await asyncio.gather(
             _load_kv("invite_records"), _load_kv("mute_records")
         )
-        if isinstance(invite, dict) and invite:
+        normalized = self._normalize_invite_records(invite)
+        if normalized:
             lines.append("被邀请进群记录（群号 -> 邀请人）：")
-            for gid, rec in list(invite.items())[:20]:
-                inviter = self._record_inviter(rec)
-                lines.append(f"- 群 {gid} 由 {inviter or '(未知)'} 邀请")
+            shown = 0
+            for gid, recs in normalized.items():
+                if shown >= 20:
+                    break
+                for rec in recs:
+                    if shown >= 20:
+                        break
+                    inviter = self._record_inviter(rec)
+                    lines.append(f"- 群 {gid} 由 {inviter or '(未知)'} 邀请")
+                    shown += 1
 
         if isinstance(mute, dict) and mute:
             lines.append("被禁言记录（群号：次数）：")
