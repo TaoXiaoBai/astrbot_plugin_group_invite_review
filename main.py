@@ -367,13 +367,14 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.16.0",
+    "1.16.6",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config or {}
         self._migrate_flat_config()
+        self._migrate_ban_list_sync()
 
     def _cfg(self, group: str, key: str, default: Any = None) -> Any:
         """读取嵌套分组配置 self.config[group][key]；分组/键缺失时回退旧平铺顶层 key，最后回退 default。"""
@@ -439,6 +440,63 @@ class GroupInviteGuardPlugin(Star):
                 )
         except Exception as exc:
             logger.warning(f"group_invite_guard: 配置迁移失败（不影响运行）: {exc}")
+
+    def _migrate_ban_list_sync(self) -> None:
+        """启动时自动修复 qq_tools 黑名单的历史格式：把 qq / id / uin 统一成 user_id，并去重。"""
+        config, err = self._get_ban_config()
+        if config is None:
+            return
+        try:
+            ban_list = config.get("ban_list")
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: 读取黑名单做迁移失败: {exc}")
+            return
+        if not isinstance(ban_list, list):
+            return
+
+        new_list = []
+        seen = set()
+        migrated = 0
+        for item in ban_list:
+            if not isinstance(item, dict):
+                continue
+            user_id = str(item.get("user_id") or "").strip()
+            if not user_id:
+                for field in ("qq", "id", "uin"):
+                    val = str(item.get(field) or "").strip()
+                    if val:
+                        user_id = val
+                        migrated += 1
+                        break
+            if not user_id:
+                continue
+            if user_id in seen:
+                continue
+            seen.add(user_id)
+            new_item = dict(item)
+            new_item["user_id"] = user_id
+            for field in ("qq", "id", "uin"):
+                new_item.pop(field, None)
+            new_list.append(new_item)
+
+        if migrated > 0 or len(new_list) != len(ban_list):
+            config["ban_list"] = new_list
+            save = getattr(config, "save_config", None)
+            if callable(save):
+                try:
+                    if inspect.iscoroutinefunction(save):
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(save())
+                    else:
+                        save()
+                except RuntimeError:
+                    pass
+                except Exception as exc:
+                    logger.warning(f"group_invite_guard: 黑名单迁移保存失败（运行期仍生效）: {exc}")
+            logger.info(
+                f"group_invite_guard: 已迁移 {migrated} 条旧格式黑名单记录，"
+                f"去重后 {len(new_list)} 条"
+            )
 
     @filter.custom_filter(GroupInviteRequestFilter)
     async def on_group_invite(self, event: AstrMessageEvent):
@@ -1309,7 +1367,10 @@ class GroupInviteGuardPlugin(Star):
         return data
 
     def _find_ban_entry(self, qq: str) -> dict | None:
-        """在 qq_tools 黑名单里找某 QQ 的完整记录（含原因/拉黑时间），找不到或黑名单不可用返回 None。"""
+        """在 qq_tools 黑名单里找某 QQ 的完整记录（含原因/拉黑时间），找不到或黑名单不可用返回 None。
+
+        兼容历史格式字段：优先 user_id，也接受 qq / id / uin。
+        """
         config, _ = self._get_ban_config()
         if config is None:
             return None
@@ -1321,9 +1382,39 @@ class GroupInviteGuardPlugin(Star):
             return None
         qq = str(qq or "").strip()
         for item in ban_list:
-            if isinstance(item, dict) and str(item.get("user_id") or "").strip() == qq:
-                return item
+            if not isinstance(item, dict):
+                continue
+            for field in ("user_id", "qq", "id", "uin"):
+                if str(item.get(field) or "").strip() == qq:
+                    return item
         return None
+
+    async def _is_user_banned(self, qq: str) -> tuple[bool, str]:
+        """综合判断某 QQ 是否应被拦截：qq_tools 黑名单 / 邀请记录已拉黑。
+
+        返回 (是否拦截, 原因文本)。
+        """
+        qq = str(qq or "").strip()
+        if not qq:
+            return False, ""
+
+        entry = self._find_ban_entry(qq)
+        if entry:
+            reason = str(entry.get("reason") or "未注明").strip()
+            return True, f"在黑名单中（{reason}）"
+
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception:
+            records = {}
+        if isinstance(records, dict):
+            normalized = self._normalize_invite_records(records)
+            for recs in normalized.values():
+                for rec in recs:
+                    if self._record_inviter(rec) == qq and _as_bool(rec.get("dealt")):
+                        return True, "邀请记录已标记拉黑"
+
+        return False, ""
 
     async def _fetch_external_profile(self, qq: str, event=None) -> str:
         """尝试从「用户画像」插件读取画像文本（其预留接口 get_profile_text）；未安装/失败/无数据返回空。"""
@@ -2782,8 +2873,8 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             logger.error(f"group_invite_guard: send command result failed: {exc}")
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=1000)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=9999)
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=9999)
     async def on_blacklist_message_guard(self, event: AstrMessageEvent):
         """兜底拦截：被拉黑用户发来的群聊/私聊消息直接停止传播，避免 bot 继续回复。"""
         if not _as_bool(self._cfg("kick_revenge", "intercept_banned_messages", True)):
@@ -2792,14 +2883,12 @@ class GroupInviteGuardPlugin(Star):
         if not sender_id:
             return
         try:
-            ban_entry = self._find_ban_entry(str(sender_id))
+            is_banned, why = await self._is_user_banned(str(sender_id))
         except Exception:
-            ban_entry = None
-        if ban_entry:
-            reason = str(ban_entry.get("reason") or "未注明").strip()
+            is_banned, why = False, ""
+        if is_banned:
             logger.info(
-                f"group_invite_guard: stopped message from banned user {sender_id} "
-                f"(reason: {reason})"
+                f"group_invite_guard: intercepted message from {sender_id}, reason: {why}"
             )
             event.stop_event()
 
