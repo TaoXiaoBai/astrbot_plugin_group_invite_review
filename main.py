@@ -367,7 +367,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.16.6",
+    "1.16.7",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -557,15 +557,19 @@ class GroupInviteGuardPlugin(Star):
         # 执行 approve/reject 之前，先私聊回复邀请人（失败不阻塞后续处理）
         reply_status = ""
         if reply and bot is not None and self._cfg("decision", "reply_inviter_on_decision", True):
-            try:
-                await self._call_action(
-                    bot, "send_private_msg", user_id=int(inviter_qq), message=reply
-                )
-                reply_status = "已私聊发送"
-                logger.info(f"group_invite_guard: replied to inviter {inviter_qq}")
-            except Exception as exc:
-                logger.error(f"group_invite_guard: reply inviter {inviter_qq} failed: {exc}")
-                reply_status = f"发送失败：{exc}"
+            if inviter_qq:
+                try:
+                    await self._call_action(
+                        bot, "send_private_msg", user_id=int(inviter_qq), message=reply
+                    )
+                    reply_status = "已私聊发送"
+                    logger.info(f"group_invite_guard: replied to inviter {inviter_qq}")
+                except Exception as exc:
+                    logger.error(f"group_invite_guard: reply inviter {inviter_qq} failed: {exc}")
+                    reply_status = f"发送失败：{exc}"
+            else:
+                reply_status = "未发送（协议端未识别邀请人 QQ）"
+                logger.warning("group_invite_guard: inviter QQ is empty, skip private reply")
         elif reply:
             reply_status = "未发送（开关关闭或无 OneBot 客户端）"
 
@@ -588,12 +592,19 @@ class GroupInviteGuardPlugin(Star):
                 )
                 result_label = "自动同意进群"
             except Exception as exc:
-                logger.error(f"group_invite_guard: approve failed: {exc}")
+                msg = str(exc).lower()
+                # snowluma/napcat 对同一邀请重复同意会返回 already agree，属幂等成功
+                if "already" in msg or "already agree" in msg or "120162002" in msg:
+                    logger.info(
+                        f"group_invite_guard: approve for group {group_id} already agreed (idempotent)"
+                    )
+                    result_label = "自动同意进群（协议端已同意）"
                 # 协议端偶尔已执行成功但响应报错（超时/回包异常），
                 # 报错后实际核实一次群成员状态，避免记录误写「同意失败」
-                if await self._verify_self_in_group(bot, group_id, self_id):
+                elif await self._verify_self_in_group(bot, group_id, self_id):
                     result_label = "自动同意进群（接口报错，已核实进群）"
                 else:
+                    logger.error(f"group_invite_guard: approve failed: {exc}")
                     result_label = "自动同意失败"
         elif action == "reject" and self._cfg("decision", "auto_reject", False):
             try:
