@@ -367,7 +367,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.16.7",
+    "1.16.8",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -2464,7 +2464,7 @@ class GroupInviteGuardPlugin(Star):
         }.get(action, action)
         lines = [
             "[加群邀请通知]",
-            f"邀请人 QQ：{inviter_qq}",
+            f"邀请人 QQ：{inviter_qq or '未知（协议端未识别）'}",
             f"群号：{group_id}",
             f"附言：{comment or '(无)'}",
             f"LLM 决策：{action_label}",
