@@ -784,7 +784,64 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         await plugin._render_invite_records_image(FakeBot())
         items = plugin.html_render.await_args.args[1]["items"]
         self.assertEqual(items[0]["decision"], "")
-        self.assertEqual(items[0]["detail"], "")
+        self.assertEqual(items[0]["reason"], "")
+        self.assertEqual(items[0]["risk_text"], "")
+        self.assertEqual(items[0]["tags"], [])
+        self.assertEqual(items[0]["relation"], "")
+        self.assertEqual(items[0]["no_snapshot"], "")
+
+    def test_invite_image_template_uses_cards_not_wide_table(self):
+        from main import _INVITE_RECORDS_TEMPLATE
+        self.assertIn('class="records"', _INVITE_RECORDS_TEMPLATE)
+        self.assertIn('class="card', _INVITE_RECORDS_TEMPLATE)
+        self.assertNotIn("<table", _INVITE_RECORDS_TEMPLATE)
+        self.assertIn("邀请附言", _INVITE_RECORDS_TEMPLATE)
+        self.assertIn("LLM 判断理由", _INVITE_RECORDS_TEMPLATE)
+        self.assertIn("决策时用户画像", _INVITE_RECORDS_TEMPLATE)
+        self.assertIn("社交来源 / 关系", _INVITE_RECORDS_TEMPLATE)
+
+    async def test_card_image_data_is_split_into_sections(self):
+        plugin = self.make_plugin()
+        plugin.config["display"] = {
+            "invite_records_show_profile": False,
+            "invite_records_show_group_profile": False,
+            "invite_records_hide_dealt": False,
+            "invite_records_show_decision_detail": True,
+        }
+        plugin._kv["invite_records"] = {
+            "30000": [{
+                "inviter": "20000",
+                "time": 123456,
+                "comment": "请让我加入这个群",
+                "decision": "reject",
+                "decision_reason": "长理由" * 200,
+                "action": "仅通知管理员",
+                "execution_state": "NO_ACTION",
+                "membership_before": "OUT",
+                "membership_after": "OUT",
+                "profile_snapshot": {
+                    "score": 76,
+                    "level": "高",
+                    "tags": [{"tag": f"tag_{i}"} for i in range(12)],
+                    "social_origin": {
+                        "join_sources": [{
+                            "gid": "30001", "sub_type": "invite", "operator": "20001"
+                        }]
+                    },
+                },
+            }]
+        }
+        plugin.html_render = AsyncMock(return_value="card.png")
+        path = await plugin._render_invite_records_image(FakeBot())
+        self.assertEqual(path, "card.png")
+        item = plugin.html_render.await_args.args[1]["items"][0]
+        self.assertEqual(item["decision"], "建议拒绝")
+        self.assertEqual(item["decision_class"], "reject")
+        self.assertEqual(item["risk_text"], "76/100 · 高风险")
+        self.assertEqual(len(item["tags"]), 8)
+        self.assertLessEqual(len(item["reason"]), 240)
+        self.assertIn("群 30001", item["relation"])
+        self.assertNotIn("detail", item)
 
     async def test_image_profile_lookups_are_deduplicated(self):
         plugin = self.make_plugin()

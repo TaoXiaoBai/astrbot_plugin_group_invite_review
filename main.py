@@ -182,82 +182,127 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <style>
-  body { margin:0; background:#f6f7fb; font-family:"Microsoft YaHei",-apple-system,"PingFang SC",sans-serif; color:#1a1a2e; }
-  .wrap { padding:28px; }
-  h1 { font-size:30px; margin:0 0 6px; }
-  .sub { color:#6b7184; font-size:15px; margin:0 0 20px 0; }
-  table { width:100%; border-collapse:collapse; background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 6px 18px rgba(0,0,0,.06); }
-  th, td { padding:10px 12px; text-align:left; font-size:16px; border-bottom:1px solid #eceef3; vertical-align:middle; }
-  th { background:#4a6cf7; color:#fff; font-weight:600; white-space:nowrap; }
-  tr:nth-child(even) td { background:#f8f9fc; }
-  .idx { color:#6b7184; font-family:ui-monospace,Menlo,Consolas,monospace; font-weight:700; }
-  .comment { color:#555; max-width:200px; word-break:break-all; }
-  .empty { color:#6b7184; padding:24px; text-align:center; background:#fff; border-radius:12px; }
-  .person { display:flex; align-items:center; gap:10px; }
-  .avatar { width:44px; height:44px; border-radius:50%; object-fit:cover; background:#eef0f6; border:1px solid #eceef3; }
-  .gavatar { border-radius:12px; }
-  .nick { font-weight:600; font-size:16px; max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .qq { color:#6b7184; font-size:13px; }
-  .hint { margin-top:16px; font-size:12px; color:#9aa0b0; line-height:1.7; }
-  .dealt-tag { display:inline-block; margin-left:6px; padding:1px 8px; font-size:12px; color:#fff; background:#e67e22; border-radius:8px; }
-  tr.dealt td { opacity:.55; }
-  .status-tag { display:inline-block; padding:3px 10px; font-size:13px; color:#fff; border-radius:10px; font-weight:600; white-space:nowrap; }
-  .status-tag.banned { background:#e74c3c; }
-  .status-tag.approved { background:#2ecc71; }
-  .status-tag.rejected { background:#95a5a6; }
-  .status-tag.recorded { background:#3498db; }
-  .status-tag.pending { background:#f39c12; }
-  .status-tag.other { background:#bdc3c7; color:#333; }
+  * { box-sizing:border-box; }
+  body { margin:0; width:1100px; background:#f3f5fa; font-family:"Microsoft YaHei",-apple-system,"PingFang SC",sans-serif; color:#202336; }
+  .wrap { padding:34px 38px; }
+  h1 { margin:0; font-size:32px; letter-spacing:.5px; }
+  .sub { margin:7px 0 24px; color:#73798d; font-size:15px; }
+  .records { display:flex; flex-direction:column; gap:18px; }
+  .card { overflow:hidden; background:#fff; border:1px solid #e5e8f1; border-radius:18px; box-shadow:0 6px 20px rgba(35,47,85,.07); }
+  .card.dealt { opacity:.66; }
+  .top { min-height:56px; padding:13px 20px; display:flex; align-items:center; gap:12px; background:#fafbfe; border-bottom:1px solid #edf0f6; }
+  .idx { width:36px; height:30px; display:flex; align-items:center; justify-content:center; border-radius:9px; background:#edf1ff; color:#4a63d8; font:700 14px ui-monospace,Menlo,Consolas,monospace; }
+  .time { color:#747b90; font-size:14px; }
+  .top-spacer { flex:1; }
+  .pill { display:inline-flex; align-items:center; padding:5px 11px; border-radius:999px; font-size:13px; font-weight:600; white-space:nowrap; }
+  .decision { background:#eef1f7; color:#596178; }
+  .decision.approve { background:#e8f8ef; color:#198754; }
+  .decision.reject { background:#fff0f0; color:#cf3f49; }
+  .decision.skip { background:#f1efff; color:#6d52c7; }
+  .status { color:#fff; }
+  .status.banned { background:#dc3545; }
+  .status.approved { background:#25a765; }
+  .status.rejected { background:#7e8798; }
+  .status.recorded { background:#3d82e3; }
+  .status.pending { background:#e79a22; }
+  .status.other { background:#8b93a5; }
+  .identity-row { padding:20px; display:grid; grid-template-columns:1fr 52px 1fr; align-items:center; gap:16px; }
+  .identity { min-width:0; padding:15px 17px; display:flex; align-items:center; gap:14px; background:#f8f9fc; border-radius:14px; }
+  .identity-label { margin-bottom:4px; color:#8a90a2; font-size:12px; }
+  .avatar { width:54px; height:54px; flex:0 0 54px; border-radius:50%; object-fit:cover; background:#e8ebf3; border:1px solid #e1e5ee; }
+  .gavatar { border-radius:14px; }
+  .person-text { min-width:0; }
+  .nick { max-width:350px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:18px; font-weight:700; }
+  .id { margin-top:3px; color:#686f83; font:14px ui-monospace,Menlo,Consolas,monospace; }
+  .arrow { text-align:center; color:#8090cc; font-size:28px; font-weight:700; }
+  .state-row { padding:0 20px 18px; display:flex; gap:9px; flex-wrap:wrap; }
+  .state { padding:5px 10px; background:#f1f3f8; border-radius:8px; color:#687084; font-size:13px; }
+  .details { padding:0 20px 20px; display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .block { min-width:0; padding:13px 15px; background:#f8f9fc; border-left:4px solid #d9deec; border-radius:10px; }
+  .block.wide { grid-column:1 / -1; }
+  .block.comment { border-left-color:#5b78f0; }
+  .block.reason { border-left-color:#e4a436; }
+  .block.profile { border-left-color:#8a67d5; }
+  .block.relation { border-left-color:#2ba986; }
+  .label { margin-bottom:6px; color:#7f8699; font-size:12px; font-weight:700; letter-spacing:.5px; }
+  .value { color:#33384b; font-size:15px; line-height:1.65; overflow-wrap:anywhere; white-space:pre-wrap; }
+  .risk { color:#6d4fc4; font-size:18px; font-weight:800; }
+  .chips { margin-top:9px; display:flex; flex-wrap:wrap; gap:7px; }
+  .chip { padding:4px 9px; border-radius:8px; background:#eee9fb; color:#6849b8; font-size:12px; font-weight:600; }
+  .muted { color:#9399aa; font-size:13px; }
+  .empty { padding:34px; text-align:center; color:#777e91; background:#fff; border-radius:16px; }
+  .hint { margin-top:20px; color:#9aa0b0; font-size:12px; line-height:1.7; }
 </style>
 </head>
 <body>
   <div class="wrap">
     <h1>加群邀请记录</h1>
-    <div class="sub">共 {{ total }} 条（新→旧）</div>
+    <div class="sub">共 {{ total }} 条 · 按时间从新到旧</div>
     {% if items %}
-    <table>
-      <tr><th>#</th><th>群</th><th>邀请人</th><th>时间</th><th>状态</th><th>成员</th><th>附言</th></tr>
+    <div class="records">
       {% for it in items %}
-      <tr{% if it.dealt %} class="dealt"{% endif %}>
-        <td class="idx">{{ it.index }}</td>
-        <td>
-          <div class="person">
-            {% if it.gavatar %}<img class="avatar gavatar" src="{{ it.gavatar }}" onerror="this.style.display='none'">{% endif %}
-            <div>
-              {% if it.gname %}<div class="nick">{{ it.gname }}</div>{% endif %}
-              <div class="qq">{{ it.group }}</div>
-            </div>
-          </div>
-        </td>
-        <td>
-          <div class="person">
+      <section class="card{% if it.dealt %} dealt{% endif %}">
+        <div class="top">
+          <span class="idx">#{{ it.index }}</span>
+          <span class="time">{{ it.time }}</span>
+          <span class="top-spacer"></span>
+          {% if it.decision %}<span class="pill decision {{ it.decision_class }}">LLM {{ it.decision }}</span>{% endif %}
+          <span class="pill status {{ it.status_class }}">实际 · {{ it.status_text }}</span>
+        </div>
+
+        <div class="identity-row">
+          <div class="identity">
             {% if it.avatar %}<img class="avatar" src="{{ it.avatar }}" onerror="this.style.display='none'">{% endif %}
-            <div>
-              {% if it.nickname %}<div class="nick">{{ it.nickname }}</div>{% endif %}
-              <div class="qq">{{ it.inviter }}</div>
+            <div class="person-text">
+              <div class="identity-label">邀请人</div>
+              <div class="nick">{{ it.nickname or '未知昵称' }}</div>
+              <div class="id">QQ {{ it.inviter }}</div>
             </div>
           </div>
-        </td>
-        <td>{{ it.time }}</td>
-        <td>
-          {% if it.decision %}<div class="qq">LLM：{{ it.decision }}</div>{% endif %}
-          <span class="status-tag {{ it.status_class }}">{{ it.status_text }}</span>
-          <div class="qq">{{ it.execution }}</div>
-        </td>
-        <td>{{ it.membership }}</td>
-        <td class="comment">
-          {{ it.comment }}
-          {% if it.detail %}<div class="qq">{{ it.detail }}</div>{% endif %}
-        </td>
-      </tr>
+          <div class="arrow">→</div>
+          <div class="identity">
+            {% if it.gavatar %}<img class="avatar gavatar" src="{{ it.gavatar }}" onerror="this.style.display='none'">{% endif %}
+            <div class="person-text">
+              <div class="identity-label">目标群</div>
+              <div class="nick">{{ it.gname or '未知群名' }}</div>
+              <div class="id">群 {{ it.group }}</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="state-row">
+          <span class="state">执行状态 · {{ it.execution }}</span>
+          <span class="state">成员状态 · {{ it.membership }}</span>
+        </div>
+
+        {% if it.comment != '(无附言)' or it.reason or it.risk_text or it.tags or it.relation or it.no_snapshot %}
+        <div class="details">
+          {% if it.comment != '(无附言)' %}
+          <div class="block comment wide"><div class="label">邀请附言</div><div class="value">{{ it.comment }}</div></div>
+          {% endif %}
+          {% if it.reason %}
+          <div class="block reason wide"><div class="label">LLM 判断理由</div><div class="value">{{ it.reason }}</div></div>
+          {% endif %}
+          {% if it.risk_text or it.tags %}
+          <div class="block profile{% if not it.relation %} wide{% endif %}">
+            <div class="label">决策时用户画像</div>
+            {% if it.risk_text %}<div class="risk">{{ it.risk_text }}</div>{% endif %}
+            {% if it.tags %}<div class="chips">{% for tag in it.tags %}<span class="chip">{{ tag }}</span>{% endfor %}</div>{% endif %}
+          </div>
+          {% endif %}
+          {% if it.relation %}
+          <div class="block relation{% if not it.risk_text and not it.tags %} wide{% endif %}"><div class="label">社交来源 / 关系</div><div class="value">{{ it.relation }}</div></div>
+          {% endif %}
+          {% if it.no_snapshot and not it.reason %}<div class="block wide"><div class="muted">{{ it.no_snapshot }}</div></div>{% endif %}
+        </div>
+        {% endif %}
+      </section>
       {% endfor %}
-    </table>
+    </div>
     {% else %}
     <div class="empty">暂无邀请记录</div>
     {% endif %}
-    <div class="hint">
-      操作提示：/手动拉黑 &lt;QQ或群号&gt; —— 按邀请记录反查并拉黑该人（匹配到邀请人时自动退其邀请的所有群；旧用法 /手动拉黑 &lt;QQ&gt; &lt;群号&gt; 仍可用） ｜ /解封 &lt;QQ&gt; —— 移出黑名单 ｜ /拉黑列表 —— 查看黑名单 ｜ /画像 &lt;QQ&gt; —— 查看完整画像 ｜ /记录邀请 &lt;群号&gt; &lt;邀请人QQ&gt; —— 补录一条
-    </div>
+    <div class="hint">操作提示：/手动拉黑 &lt;QQ或群号&gt; ｜ /解封 &lt;QQ&gt; ｜ /拉黑列表 ｜ /画像 &lt;QQ&gt; ｜ /记录邀请 &lt;群号&gt; &lt;邀请人QQ&gt;</div>
   </div>
 </body>
 </html>"""
@@ -381,7 +426,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.18.0",
+    "1.18.1",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -3437,7 +3482,7 @@ class GroupInviteGuardPlugin(Star):
 
     @staticmethod
     def _invite_record_detail(rec: dict) -> dict:
-        """把新旧邀请记录统一成文本和图片共用的决策详情。"""
+        """把新旧邀请记录统一成文字与图片卡片共用的结构化详情。"""
         decision = str(rec.get("decision") or "unknown").strip().lower()
         decision_text = {
             "approve": "建议同意",
@@ -3445,44 +3490,69 @@ class GroupInviteGuardPlugin(Star):
             "skipped": "跳过",
             "unknown": "未知/未判断",
         }.get(decision, decision or "未知/未判断")
-        reason = str(rec.get("decision_reason") or "").strip()
+        decision_class = {
+            "approve": "approve",
+            "reject": "reject",
+            "skipped": "skip",
+        }.get(decision, "unknown")
+        reason = str(rec.get("decision_reason") or "").strip()[:240]
         snapshot = rec.get("profile_snapshot")
         snapshot = snapshot if isinstance(snapshot, dict) else {}
-        details = []
-        if reason:
-            details.append("理由：" + reason[:160])
+        risk_text = ""
+        tags = []
+        relation = ""
+        no_snapshot = ""
         if snapshot:
             score = snapshot.get("score")
             level = str(snapshot.get("level") or "").strip()
             if score is not None:
-                details.append(f"画像：{score}/100" + (f"（{level}）" if level else ""))
+                risk_text = f"{score}/100" + (f" · {level}风险" if level else "")
             raw_tags = snapshot.get("tags")
             raw_tags = raw_tags if isinstance(raw_tags, list) else []
             tags = [
-                str(item.get("tag") or "").strip()
+                str(item.get("tag") or "").strip()[:40]
                 for item in raw_tags
                 if isinstance(item, dict) and str(item.get("tag") or "").strip()
-            ]
-            if tags:
-                details.append("标签：" + "、".join(tags[:5]))
+            ][:8]
             social = snapshot.get("social_origin")
             social = social if isinstance(social, dict) else {}
             joins = social.get("join_sources")
             joins = joins if isinstance(joins, list) else []
             if joins and isinstance(joins[-1], dict):
                 latest = joins[-1]
-                details.append(
-                    f"关系：群 {latest.get('gid') or '?'} / "
-                    f"{latest.get('sub_type') or '未知方式'} / "
+                relation = (
+                    f"群 {latest.get('gid') or '?'} · "
+                    f"{latest.get('sub_type') or '未知方式'} · "
                     f"操作者 {latest.get('operator') or '未知'}"
                 )
             elif social.get("friend_add_time"):
-                details.append("关系：已添加 bot 好友")
+                relation = "已添加 bot 好友"
         elif str(rec.get("execution_state") or ""):
-            details.append("画像：无快照")
+            no_snapshot = "无画像快照"
         else:
-            details.append("旧记录：无画像快照")
-        return {"decision": decision_text, "detail": "；".join(details)}
+            no_snapshot = "旧记录 · 无画像快照"
+
+        details = []
+        if reason:
+            details.append("理由：" + reason)
+        if risk_text:
+            details.append("画像：" + risk_text)
+        if tags:
+            details.append("标签：" + "、".join(tags))
+        if relation:
+            details.append("关系：" + relation)
+        if no_snapshot:
+            details.append(no_snapshot)
+        return {
+            "decision": decision_text,
+            "decision_class": decision_class,
+            "reason": reason,
+            "risk_text": risk_text,
+            "tags": tags,
+            "relation": relation,
+            "no_snapshot": no_snapshot,
+            "detail": "；".join(details),
+        }
 
     async def _list_invite_records_text(self) -> str:
         try:
@@ -3587,6 +3657,8 @@ class GroupInviteGuardPlugin(Star):
                 except Exception:
                     ts_int, ts = 0, "-"
                 comment = str(rec.get("comment") or "").strip() or "(无附言)"
+                if len(comment) > 360:
+                    comment = comment[:360] + "…"
                 action = str(rec.get("action") or "").strip() or "-"
                 status_text, status_class = _invite_status_label(action, dealt)
                 view = self._invite_record_detail(rec)
@@ -3601,7 +3673,12 @@ class GroupInviteGuardPlugin(Star):
                         "status_text": status_text,
                         "status_class": status_class,
                         "decision": view["decision"] if show_detail else "",
-                        "detail": view["detail"] if show_detail else "",
+                        "decision_class": view["decision_class"],
+                        "reason": view["reason"] if show_detail else "",
+                        "risk_text": view["risk_text"] if show_detail else "",
+                        "tags": view["tags"] if show_detail else [],
+                        "relation": view["relation"] if show_detail else "",
+                        "no_snapshot": view["no_snapshot"] if show_detail else "",
                         "execution": str(rec.get("execution_state") or "旧记录"),
                         "membership": (
                             f"{rec.get('membership_before') or '-'}→"

@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.18.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.18.1-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -166,6 +166,8 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `invite_records_show_group_profile` | `true` | 邀请记录图显示群头像群名 |
 | `invite_records_hide_dealt` | `true` | 隐藏邀请人已拉黑的记录 |
 | `invite_records_show_decision_detail` | `true` | 文字/图片记录显示 LLM 建议、理由、画像风险分、主要标签和精简社交来源 |
+
+图片版使用纵向卡片：顶栏展示时间与决策状态，邀请人和目标群分栏展示，执行/成员状态使用短标签；邀请附言、LLM 理由、画像标签和社交来源各自占用独立内容块，避免大量文字挤在同一个表格单元格。过长附言和理由会自动截断，画像标签以可换行 chips 展示。
 
 </details>
 
