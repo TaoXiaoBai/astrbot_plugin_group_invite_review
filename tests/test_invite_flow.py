@@ -563,6 +563,251 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(config["basic"]["enable"])
         migrate_ban.assert_not_called()
 
+    async def test_structured_profile_is_used_and_current_request_excluded(self):
+        calls = []
+
+        class Profile:
+            async def get_decision_profile(self, qq, event=None, exclude_request_key=""):
+                calls.append((qq, exclude_request_key))
+                return {
+                    "schema_version": 1,
+                    "provider": "astrbot_plugin_user_profile",
+                    "captured_at": 123,
+                    "score": 72,
+                    "level": "高",
+                    "tags": [
+                        {"tag": "scam_suspect", "confidence": 0.9, "source": "llm", "evidence": "测试证据"},
+                        {"tag": "invite_rejected", "confidence": 0.9, "source": "guard", "evidence": "重复前科"},
+                    ],
+                    "activity": {"group_messages": 8, "private_messages": 2, "active_groups": 2},
+                    "social_origin": {
+                        "friend_add_time": 100,
+                        "friend_request_comment": "来自测试",
+                        "join_sources": [{"gid": "30000", "sub_type": "invite", "operator": "21000", "time": 110}],
+                    },
+                }
+
+        plugin = self.make_plugin()
+        plugin.context = types.SimpleNamespace(
+            get_registered_star=lambda name: types.SimpleNamespace(star_cls=Profile())
+        )
+        plugin._build_member_section = AsyncMock(return_value="成员区块")
+        plugin._build_impression_section = AsyncMock(return_value=("印象区块", 3))
+        plugin._build_profile_section = AsyncMock(return_value="守卫前科区块")
+        plugin._detect_alt_account = AsyncMock(return_value="")
+        text, warning, snapshot = await plugin._build_invite_context(
+            "20000", "30000", None, request_key="current-key"
+        )
+        self.assertEqual(calls, [("20000", "current-key")])
+        self.assertEqual(snapshot["score"], 72)
+        self.assertIn("scam_suspect", text)
+        self.assertNotIn("invite_rejected", text)
+        self.assertIn("守卫前科区块", text)
+        self.assertIn("好友申请验证语", text)
+        self.assertEqual(warning, "")
+
+    async def test_old_profile_api_gracefully_falls_back(self):
+        class OldProfile:
+            async def get_profile_text(self, qq, event=None):
+                return "旧版完整画像"
+
+        plugin = self.make_plugin()
+        plugin.context = types.SimpleNamespace(
+            get_registered_star=lambda name: types.SimpleNamespace(star_cls=OldProfile())
+        )
+        section, snapshot = await plugin._fetch_external_decision_profile("20000")
+        self.assertEqual(section, "旧版完整画像")
+        self.assertEqual(snapshot["provider"], "astrbot_plugin_user_profile_legacy")
+
+    async def test_profile_snapshot_is_persisted_on_decision_record(self):
+        plugin = self.make_plugin("approve")
+        plugin._ask_llm = AsyncMock(return_value={
+            "action": "approve",
+            "reason": "profile ok",
+            "reply": "ok",
+            "_profile_snapshot": {
+                "schema_version": 1,
+                "provider": "astrbot_plugin_user_profile",
+                "captured_at": 123,
+                "score": 20,
+                "level": "低",
+                "tags": [],
+                "activity": {},
+                "social_origin": {},
+            },
+        })
+        _, _, rec = await self.run_invite(plugin)
+        self.assertEqual(rec["profile_snapshot"]["score"], 20)
+        self.assertEqual(rec["decision"], "approve")
+
+    async def test_record_display_distinguishes_decision_and_result(self):
+        plugin = self.make_plugin()
+        plugin._kv["invite_records"] = {
+            "30000": [{
+                "inviter": "20000",
+                "time": 123456,
+                "comment": "hello",
+                "decision": "reject",
+                "decision_reason": "风险偏高",
+                "action": "仅通知管理员（未自动处理）",
+                "execution_state": "NO_ACTION",
+                "membership_before": "OUT",
+                "membership_after": "OUT",
+                "profile_snapshot": {
+                    "score": 75,
+                    "level": "高",
+                    "tags": [{"tag": "scam_suspect"}],
+                    "social_origin": {},
+                },
+            }]
+        }
+        text = await plugin._list_invite_records_text()
+        self.assertIn("LLM 建议拒绝", text)
+        self.assertIn("实际", text)
+        self.assertIn("画像：75/100", text)
+        self.assertIn("理由：风险偏高", text)
+
+    async def test_first_invite_empty_profile_does_not_fallback_and_reinclude_current(self):
+        class Profile:
+            def __init__(self):
+                self.decision_calls = []
+                self.score_calls = 0
+
+            async def get_decision_profile(self, qq, event=None, exclude_request_key=""):
+                self.decision_calls.append(exclude_request_key)
+                return {}
+
+            async def get_profile_tags_with_score(self, qq, event=None):
+                self.score_calls += 1
+                return {"score": 55, "level": "中", "tags": [{"tag": "inviter"}]}
+
+        profile = Profile()
+        plugin = self.make_plugin()
+        plugin.context = types.SimpleNamespace(
+            get_registered_star=lambda name: types.SimpleNamespace(star_cls=profile)
+        )
+        section, snapshot = await plugin._fetch_external_decision_profile(
+            "20000", exclude_request_key="current-key"
+        )
+        self.assertEqual(profile.decision_calls, ["current-key"])
+        self.assertEqual(profile.score_calls, 0)
+        self.assertEqual(section, "")
+        self.assertEqual(snapshot, {})
+
+    async def test_real_ask_llm_carries_profile_snapshot(self):
+        plugin = self.make_plugin()
+        plugin._default_provider_id = lambda: "provider"
+        plugin._resolve_persona_prompt = AsyncMock(return_value="")
+        snapshot = {"provider": "astrbot_plugin_user_profile", "score": 18}
+        plugin._build_invite_context = AsyncMock(
+            return_value=("结构化画像", "", snapshot)
+        )
+        plugin.context = types.SimpleNamespace(
+            llm_generate=AsyncMock(
+                return_value=types.SimpleNamespace(
+                    completion_text='{"action":"approve","reason":"ok","reply":"hi"}'
+                )
+            )
+        )
+        decision = await GroupInviteGuardPlugin._ask_llm(
+            plugin, "20000", "30000", "hello", request_key="current-key"
+        )
+        self.assertEqual(decision["_profile_snapshot"], snapshot)
+        prompt = plugin.context.llm_generate.await_args.kwargs["prompt"]
+        self.assertEqual(prompt.count("结构化画像"), 1)
+
+    async def test_profile_snapshot_sanitizer_handles_bad_values(self):
+        snapshot = GroupInviteGuardPlugin._sanitize_profile_snapshot({
+            "provider": "test",
+            "schema_version": "bad",
+            "captured_at": "bad",
+            "score": "bad",
+            "social_origin": {
+                "friend_add_time": "bad",
+                "friend_request_time": [],
+                "join_sources": [{"gid": "1", "time": "bad"}],
+            },
+        })
+        self.assertEqual(snapshot["score"], 0)
+        self.assertEqual(snapshot["schema_version"], 1)
+        self.assertEqual(snapshot["social_origin"]["join_sources"][0]["time"], 0)
+        self.assertEqual(
+            GroupInviteGuardPlugin._sanitize_profile_snapshot({"unexpected": "value"}),
+            {},
+        )
+        malformed = GroupInviteGuardPlugin._sanitize_profile_snapshot({
+            "provider": "test", "tags": 1,
+            "social_origin": {"join_sources": 1},
+        })
+        self.assertEqual(malformed["tags"], [])
+        self.assertEqual(malformed["social_origin"]["join_sources"], [])
+        detail = GroupInviteGuardPlugin._invite_record_detail({
+            "profile_snapshot": {"tags": 1, "social_origin": {"join_sources": 1}}
+        })
+        self.assertIsInstance(detail["detail"], str)
+
+    async def test_mute_count_uses_unique_invited_groups(self):
+        plugin = self.make_plugin()
+        plugin._kv["invite_records"] = {
+            "30000": [
+                {"inviter": "20000", "time": 1},
+                {"inviter": "20000", "time": 2},
+            ],
+            "30001": [{"inviter": "20000", "time": 3}],
+        }
+        plugin._kv["mute_records"] = {"30000": 2, "30001": 1}
+        data = await plugin._collect_profile_data("20000")
+        self.assertEqual(data["mute_total"], 3)
+
+    async def test_detail_switch_hides_llm_and_profile_detail(self):
+        plugin = self.make_plugin()
+        plugin.config["display"] = {
+            "invite_records_hide_dealt": False,
+            "invite_records_show_decision_detail": False,
+        }
+        plugin._kv["invite_records"] = {
+            "30000": [{
+                "inviter": "20000",
+                "time": 1,
+                "decision": "reject",
+                "decision_reason": "secret reason",
+                "action": "仅通知管理员",
+                "execution_state": "NO_ACTION",
+                "profile_snapshot": {"score": 99, "tags": [{"tag": "secret_tag"}]},
+            }]
+        }
+        text = await plugin._list_invite_records_text()
+        self.assertNotIn("LLM", text)
+        self.assertNotIn("secret reason", text)
+        self.assertNotIn("secret_tag", text)
+        plugin.html_render = AsyncMock(return_value="record.png")
+        await plugin._render_invite_records_image(FakeBot())
+        items = plugin.html_render.await_args.args[1]["items"]
+        self.assertEqual(items[0]["decision"], "")
+        self.assertEqual(items[0]["detail"], "")
+
+    async def test_image_profile_lookups_are_deduplicated(self):
+        plugin = self.make_plugin()
+        plugin.config["display"] = {
+            "invite_records_show_profile": True,
+            "invite_records_show_group_profile": True,
+            "invite_records_hide_dealt": False,
+            "invite_records_show_decision_detail": True,
+        }
+        plugin._kv["invite_records"] = {
+            "30000": [
+                {"inviter": "20000", "time": 2, "action": "自动同意进群"},
+                {"inviter": "20000", "time": 1, "action": "自动拒绝"},
+            ]
+        }
+        plugin._fetch_nickname = AsyncMock(return_value="昵称")
+        plugin._fetch_group_name = AsyncMock(return_value="群名")
+        plugin.html_render = AsyncMock(return_value="record.png")
+        path = await plugin._render_invite_records_image(FakeBot())
+        self.assertEqual(path, "record.png")
+        plugin._fetch_nickname.assert_awaited_once_with(unittest.mock.ANY, "20000")
+        plugin._fetch_group_name.assert_awaited_once_with(unittest.mock.ANY, "30000")
+
 
 if __name__ == "__main__":
     unittest.main()

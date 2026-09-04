@@ -374,6 +374,12 @@
         "type": "bool",
         "default": true,
         "hint": "邀请人被拉黑后其记录默认不再显示；关闭则保留显示并带「已拉黑」标记"
+      },
+      "invite_records_show_decision_detail": {
+        "description": "显示决策与画像详情",
+        "type": "bool",
+        "default": true,
+        "hint": "在 /邀请记录 的文字版和图片版中显示 LLM 建议、判断理由、画像风险分、主要标签和精简社交来源。关闭后仍保留实际执行状态与成员状态。"
       }
     }
   },

@@ -169,6 +169,7 @@ _CONFIG_GROUPS = {
         "invite_records_show_profile": True,
         "invite_records_show_group_profile": True,
         "invite_records_hide_dealt": True,
+        "invite_records_show_decision_detail": True,
     },
 }
 
@@ -238,9 +239,16 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
           </div>
         </td>
         <td>{{ it.time }}</td>
-        <td><span class="status-tag {{ it.status_class }}">{{ it.status_text }}</span><div class="qq">{{ it.execution }}</div></td>
+        <td>
+          {% if it.decision %}<div class="qq">LLM：{{ it.decision }}</div>{% endif %}
+          <span class="status-tag {{ it.status_class }}">{{ it.status_text }}</span>
+          <div class="qq">{{ it.execution }}</div>
+        </td>
         <td>{{ it.membership }}</td>
-        <td class="comment">{{ it.comment }}</td>
+        <td class="comment">
+          {{ it.comment }}
+          {% if it.detail %}<div class="qq">{{ it.detail }}</div>{% endif %}
+        </td>
       </tr>
       {% endfor %}
     </table>
@@ -373,7 +381,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.17.0",
+    "1.18.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -829,6 +837,9 @@ class GroupInviteGuardPlugin(Star):
         reason = str(decision.get("reason") or "").strip()
         reply = str(decision.get("reply") or "").strip()
         alt_warning = str(decision.get("alt_warning") or "").strip()
+        profile_snapshot = decision.get("_profile_snapshot")
+        if not isinstance(profile_snapshot, dict):
+            profile_snapshot = {}
         await self._update_invite_record(
             group_id, record_id,
             decision=action,
@@ -836,6 +847,7 @@ class GroupInviteGuardPlugin(Star):
             review_state="DECIDED",
             execution_state="DECIDED",
             alt_warning=alt_warning,
+            profile_snapshot=profile_snapshot,
         )
 
         membership_after = await self._membership_state(bot, group_id, self_id)
@@ -1783,7 +1795,7 @@ class GroupInviteGuardPlugin(Star):
         persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
         system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
 
-        context, alt_warning = await self._build_invite_context(
+        context, alt_warning, profile_snapshot = await self._build_invite_context(
             inviter_qq, group_id, bot, comment, request_key=request_key
         )
         prompt = (
@@ -1811,6 +1823,8 @@ class GroupInviteGuardPlugin(Star):
         decision = _parse_json(text)
         if alt_warning:
             decision["alt_warning"] = alt_warning
+        if profile_snapshot:
+            decision["_profile_snapshot"] = profile_snapshot
         return decision
 
     async def _resolve_persona_prompt(self, persona_id: str, platform_id: str = None) -> str:
@@ -1840,8 +1854,7 @@ class GroupInviteGuardPlugin(Star):
         self, inviter_qq: str, group_id: str, bot, comment: str = "",
         request_key: str = "",
     ):
-        """收集画像/成员列表/历史印象/小号提示，拼成给 LLM 参考的背景信息。"""
-        # 成员列表与历史印象互不依赖，并发拉取；单个失败按空处理
+        """收集决策背景，返回 (文本, 小号提示, 结构化画像快照)。"""
         async def _member():
             if self._cfg("decision", "enable_member_context", True):
                 return await self._build_member_section(group_id, bot)
@@ -1857,28 +1870,42 @@ class GroupInviteGuardPlugin(Star):
         impression = fetched[1] if isinstance(fetched[1], tuple) else ("", 0)
         impression_section, speaker_count = impression
 
-        # 画像与小号识别全是本地数据/文本比较，零 LLM、零额外网络请求
-        profile_section = ""
-        if self._cfg("decision", "use_profile_plugin", True):
-            profile_section = await self._fetch_external_profile(inviter_qq)
-        if not profile_section:
-            profile_section = await self._build_profile_section(
+        profile_snapshot = {}
+        external_section = ""
+        internal_section = ""
+        if self._cfg("decision", "enable_user_profile", True):
+            if self._cfg("decision", "use_profile_plugin", True):
+                external_section, profile_snapshot = await self._fetch_external_decision_profile(
+                    inviter_qq, exclude_request_key=request_key
+                )
+            # 守卫前科始终独立补充，不能因外部画像有内容而丢失。
+            internal_section = await self._build_profile_section(
                 inviter_qq, speaker_count, exclude_request_key=request_key
             )
+
         alt_warning = await self._detect_alt_account(
             inviter_qq, comment, bot, exclude_request_key=request_key
         )
 
-        sections = [s for s in (profile_section, member_section, impression_section) if s]
+        marker = str(self._cfg("decision", "truncate_marker", "…") or "…")
 
-        context = "\n\n".join(sections)
-        marker = self._cfg("decision", "truncate_marker", "…")
+        def _clip(text: str, limit: int) -> str:
+            text = str(text or "").strip()
+            return text if len(text) <= limit else text[:limit] + marker
+
+        # 重要风险信息优先，且每个区块单独限长，避免成员/原话挤掉画像。
+        sections = [
+            _clip(external_section, 1200),
+            _clip(internal_section, 800),
+            _clip(member_section, 900),
+            _clip(impression_section, 1300),
+        ]
+        context = "\n\n".join(section for section in sections if section)
+        if alt_warning:
+            context = f"{_clip(alt_warning, 600)}\n\n{context}" if context else _clip(alt_warning, 600)
         if len(context) > 4000:
             context = context[:4000] + marker
-        if alt_warning:
-            # 小号提示放最前，醒目
-            context = f"{alt_warning}\n\n{context}" if context else alt_warning
-        return context, alt_warning
+        return context, alt_warning, profile_snapshot
 
     async def _collect_profile_data(self, qq: str, exclude_request_key: str = "") -> dict:
         """汇总某 QQ 的本地画像数据，可排除正在审核的邀请。"""
@@ -1913,7 +1940,10 @@ class GroupInviteGuardPlugin(Star):
             for gid, recs in normalized.items()
             for rec in recs
             if self._record_inviter(rec) == qq
-            and str(rec.get("request_key") or "") != exclude_request_key
+            and (
+                not exclude_request_key
+                or str(rec.get("request_key") or "") != exclude_request_key
+            )
         ]
         data["invited"] = invited
         data["operated"] = [
@@ -1925,10 +1955,16 @@ class GroupInviteGuardPlugin(Star):
         data["rejected"] = sum(
             1
             for _, rec in invited
-            if isinstance(rec, dict) and "拒绝" in str(rec.get("action") or "")
+            if isinstance(rec, dict)
+            and (
+                str(rec.get("decision") or "").strip().lower() == "reject"
+                or str(rec.get("execution_state") or "").strip().upper() == "REJECTED"
+                or "拒绝" in str(rec.get("action") or "")
+            )
         )
         mute_total = 0
-        for gid, _ in invited:
+        # mute_records 是按群累计；同群多次邀请不能重复叠加同一群的禁言数。
+        for gid in {group_id for group_id, _ in invited}:
             try:
                 mute_total += int(mute_records.get(gid, 0) or 0)
             except (TypeError, ValueError):
@@ -1985,6 +2021,234 @@ class GroupInviteGuardPlugin(Star):
                         return True, "邀请记录已标记拉黑"
 
         return False, ""
+
+    def _get_profile_plugin_instance(self):
+        """获取用户画像插件实例；未安装或不可用时返回 None。"""
+        try:
+            md = self.context.get_registered_star("astrbot_plugin_user_profile")
+        except Exception:
+            return None
+        return getattr(md, "star_cls", None) if md else None
+
+    @staticmethod
+    def _sanitize_profile_snapshot(raw: Any) -> dict:
+        """限制外部画像快照字段和体积，避免复制原话或不可序列化对象。"""
+        if not isinstance(raw, dict) or not raw:
+            return {}
+        recognized = {"provider", "score", "level", "tags", "activity", "social_origin"}
+        if not recognized.intersection(raw):
+            return {}
+
+        def _safe_int(value, default=0) -> int:
+            try:
+                return int(value or default)
+            except (TypeError, ValueError):
+                return int(default)
+
+        tags = []
+        raw_tags = raw.get("tags")
+        if not isinstance(raw_tags, list):
+            raw_tags = []
+        for item in raw_tags:
+            if not isinstance(item, dict):
+                continue
+            try:
+                confidence = max(0.0, min(1.0, float(item.get("confidence") or 0)))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            tags.append(
+                {
+                    "tag": str(item.get("tag") or "")[:64],
+                    "confidence": round(confidence, 2),
+                    "source": str(item.get("source") or "")[:32],
+                    "evidence": str(item.get("evidence") or "")[:200],
+                }
+            )
+            if len(tags) >= 12:
+                break
+
+        activity_raw = raw.get("activity") if isinstance(raw.get("activity"), dict) else {}
+        activity = {}
+        for key in (
+            "group_messages", "private_messages", "active_groups", "first_seen", "last_seen"
+        ):
+            try:
+                activity[key] = max(0, int(activity_raw.get(key) or 0))
+            except (TypeError, ValueError):
+                activity[key] = 0
+
+        social_raw = raw.get("social_origin") if isinstance(raw.get("social_origin"), dict) else {}
+        joins = []
+        raw_joins = social_raw.get("join_sources")
+        if not isinstance(raw_joins, list):
+            raw_joins = []
+        for item in raw_joins:
+            if not isinstance(item, dict):
+                continue
+            joins.append(
+                {
+                    "gid": str(item.get("gid") or "")[:32],
+                    "sub_type": str(item.get("sub_type") or "")[:24],
+                    "operator": str(item.get("operator") or "")[:32],
+                    "time": _safe_int(item.get("time")),
+                }
+            )
+            if len(joins) >= 10:
+                break
+        try:
+            score = max(0, min(100, int(raw.get("score") or 0)))
+        except (TypeError, ValueError):
+            score = 0
+        return {
+            "schema_version": _safe_int(raw.get("schema_version"), 1),
+            "provider": str(raw.get("provider") or "astrbot_plugin_user_profile")[:64],
+            "captured_at": _safe_int(raw.get("captured_at"), int(time.time())),
+            "score": score,
+            "level": str(raw.get("level") or "")[:16],
+            "tags": tags,
+            "activity": activity,
+            "social_origin": {
+                "friend_add_time": _safe_int(social_raw.get("friend_add_time")),
+                "friend_request_time": _safe_int(social_raw.get("friend_request_time")),
+                "friend_request_comment": str(
+                    social_raw.get("friend_request_comment") or ""
+                )[:200],
+                "join_sources": joins,
+            },
+        }
+
+    @staticmethod
+    def _format_external_decision_profile(snapshot: dict) -> str:
+        """把结构化画像变成决策上下文；守卫来源标签交给内置前科区块展示。"""
+        if not snapshot:
+            return ""
+        lines = [
+            f"用户画像插件：综合风险 {snapshot.get('score', 0)}/100"
+            f"（{snapshot.get('level') or '未知'}）"
+        ]
+        tags = [
+            item
+            for item in snapshot.get("tags") or []
+            if item.get("tag") and item.get("source") not in ("guard", "ban_list")
+        ]
+        if tags:
+            rendered = []
+            for item in tags[:8]:
+                label = f"{item['tag']}({int(float(item.get('confidence') or 0) * 100)}%)"
+                evidence = str(item.get("evidence") or "").strip()
+                rendered.append(label + (f"：{evidence}" if evidence else ""))
+            lines.append("画像标签：" + "；".join(rendered))
+
+        activity = snapshot.get("activity") or {}
+        total = int(activity.get("group_messages") or 0) + int(activity.get("private_messages") or 0)
+        if total or int(activity.get("active_groups") or 0):
+            lines.append(
+                "活跃度：发言 %d 条（群聊 %d / 私聊 %d），活跃群 %d 个"
+                % (
+                    total,
+                    int(activity.get("group_messages") or 0),
+                    int(activity.get("private_messages") or 0),
+                    int(activity.get("active_groups") or 0),
+                )
+            )
+
+        social = snapshot.get("social_origin") or {}
+        if int(social.get("friend_add_time") or 0):
+            lines.append("社交来源：已记录添加 bot 好友")
+        comment = str(social.get("friend_request_comment") or "").strip()
+        if comment:
+            lines.append(f"好友申请验证语：{comment}")
+        joins = social.get("join_sources") or []
+        if joins:
+            rendered = []
+            for item in joins[-5:]:
+                rendered.append(
+                    f"群 {item.get('gid') or '?'} / {item.get('sub_type') or '未知方式'}"
+                    f" / 操作者 {item.get('operator') or '未知'}"
+                )
+            lines.append("进群关系：" + "；".join(rendered))
+        return "\n".join(lines)
+
+    async def _fetch_external_decision_profile(
+        self, qq: str, exclude_request_key: str = ""
+    ) -> tuple[str, dict]:
+        """读取结构化决策画像；兼容旧 API，任何失败都优雅降级。"""
+        instance = self._get_profile_plugin_instance()
+        if instance is None:
+            return "", {}
+
+        getter = getattr(instance, "get_decision_profile", None)
+        if callable(getter):
+            try:
+                try:
+                    params = inspect.signature(getter).parameters.values()
+                    supports_exclude = any(
+                        param.name == "exclude_request_key"
+                        or param.kind == inspect.Parameter.VAR_KEYWORD
+                        for param in params
+                    )
+                except (TypeError, ValueError):
+                    supports_exclude = False
+                if supports_exclude:
+                    result = getter(qq, None, exclude_request_key=exclude_request_key)
+                else:
+                    result = getter(qq, None)
+                raw = await result if inspect.isawaitable(result) else result
+                snapshot = self._sanitize_profile_snapshot(raw)
+                if snapshot:
+                    return self._format_external_decision_profile(snapshot), snapshot
+                # 新 API 成功返回空，表示确实无历史画像；不能再用无排除参数回查。
+                return "", {}
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: decision profile failed: {exc}")
+
+        score_getter = getattr(instance, "get_profile_tags_with_score", None)
+        social_getter = getattr(instance, "get_social_origin", None)
+        if callable(score_getter):
+            try:
+                try:
+                    params = inspect.signature(score_getter).parameters.values()
+                    supports_exclude = any(
+                        param.name == "exclude_request_key"
+                        or param.kind == inspect.Parameter.VAR_KEYWORD
+                        for param in params
+                    )
+                except (TypeError, ValueError):
+                    supports_exclude = False
+                if supports_exclude:
+                    score_result = score_getter(
+                        qq, None, exclude_request_key=exclude_request_key
+                    )
+                else:
+                    score_result = score_getter(qq, None)
+                score_data = await score_result if inspect.isawaitable(score_result) else score_result
+                social_data = {}
+                if callable(social_getter):
+                    social_result = social_getter(qq)
+                    social_data = await social_result if inspect.isawaitable(social_result) else social_result
+                raw = dict(score_data) if isinstance(score_data, dict) else {}
+                raw.update(
+                    {
+                        "schema_version": 0,
+                        "provider": "astrbot_plugin_user_profile_compat",
+                        "captured_at": int(time.time()),
+                        "social_origin": social_data if isinstance(social_data, dict) else {},
+                    }
+                )
+                snapshot = self._sanitize_profile_snapshot(raw)
+                if snapshot and (snapshot.get("tags") or social_data):
+                    return self._format_external_decision_profile(snapshot), snapshot
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: structured profile fallback failed: {exc}")
+
+        legacy = await self._fetch_external_profile(qq)
+        if legacy:
+            return legacy, {
+                "schema_version": 0,
+                "provider": "astrbot_plugin_user_profile_legacy",
+                "captured_at": int(time.time()),
+            }
+        return "", {}
 
     async def _fetch_external_profile(self, qq: str, event=None) -> str:
         """尝试从「用户画像」插件读取画像文本（其预留接口 get_profile_text）；未安装/失败/无数据返回空。"""
@@ -3171,6 +3435,55 @@ class GroupInviteGuardPlugin(Star):
             result["group"] = group_id
         return result
 
+    @staticmethod
+    def _invite_record_detail(rec: dict) -> dict:
+        """把新旧邀请记录统一成文本和图片共用的决策详情。"""
+        decision = str(rec.get("decision") or "unknown").strip().lower()
+        decision_text = {
+            "approve": "建议同意",
+            "reject": "建议拒绝",
+            "skipped": "跳过",
+            "unknown": "未知/未判断",
+        }.get(decision, decision or "未知/未判断")
+        reason = str(rec.get("decision_reason") or "").strip()
+        snapshot = rec.get("profile_snapshot")
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        details = []
+        if reason:
+            details.append("理由：" + reason[:160])
+        if snapshot:
+            score = snapshot.get("score")
+            level = str(snapshot.get("level") or "").strip()
+            if score is not None:
+                details.append(f"画像：{score}/100" + (f"（{level}）" if level else ""))
+            raw_tags = snapshot.get("tags")
+            raw_tags = raw_tags if isinstance(raw_tags, list) else []
+            tags = [
+                str(item.get("tag") or "").strip()
+                for item in raw_tags
+                if isinstance(item, dict) and str(item.get("tag") or "").strip()
+            ]
+            if tags:
+                details.append("标签：" + "、".join(tags[:5]))
+            social = snapshot.get("social_origin")
+            social = social if isinstance(social, dict) else {}
+            joins = social.get("join_sources")
+            joins = joins if isinstance(joins, list) else []
+            if joins and isinstance(joins[-1], dict):
+                latest = joins[-1]
+                details.append(
+                    f"关系：群 {latest.get('gid') or '?'} / "
+                    f"{latest.get('sub_type') or '未知方式'} / "
+                    f"操作者 {latest.get('operator') or '未知'}"
+                )
+            elif social.get("friend_add_time"):
+                details.append("关系：已添加 bot 好友")
+        elif str(rec.get("execution_state") or ""):
+            details.append("画像：无快照")
+        else:
+            details.append("旧记录：无画像快照")
+        return {"decision": decision_text, "detail": "；".join(details)}
+
     async def _list_invite_records_text(self) -> str:
         try:
             records = await self.get_kv_data("invite_records", {})
@@ -3181,6 +3494,9 @@ class GroupInviteGuardPlugin(Star):
             return "暂无邀请记录"
 
         hide_dealt = _as_bool(self._cfg("display", "invite_records_hide_dealt", True))
+        show_detail = _as_bool(
+            self._cfg("display", "invite_records_show_decision_detail", True)
+        )
         # 把所有记录拉平，按时间新→旧排序
         flat = []
         for gid, recs in records.items():
@@ -3204,10 +3520,14 @@ class GroupInviteGuardPlugin(Star):
             before = str(rec.get("membership_before") or "-")
             after = str(rec.get("membership_after") or "-")
             execution = str(rec.get("execution_state") or "旧记录")
+            view = self._invite_record_detail(rec)
+            decision_part = f" | LLM {view['decision']}" if show_detail else ""
             lines.append(
-                f"群 {gid} -> {inviter} | {ts} | [{status_text}] "
-                f"| 成员 {before}→{after} | {execution} | {comment}"
+                f"群 {gid} -> {inviter} | {ts}{decision_part} "
+                f"| 实际 [{status_text}]/{execution} | 成员 {before}→{after} | {comment}"
             )
+            if show_detail and view["detail"]:
+                lines.append("  └ " + view["detail"])
         if not lines:
             return "暂无邀请记录"
         return "\n".join(lines)
@@ -3249,6 +3569,9 @@ class GroupInviteGuardPlugin(Star):
         show_profile = _as_bool(self._cfg("display", "invite_records_show_profile", True))
         show_group_profile = _as_bool(self._cfg("display", "invite_records_show_group_profile", True))
         hide_dealt = _as_bool(self._cfg("display", "invite_records_hide_dealt", True))
+        show_detail = _as_bool(
+            self._cfg("display", "invite_records_show_decision_detail", True)
+        )
 
         items = []
         records = self._normalize_invite_records(records)
@@ -3266,6 +3589,7 @@ class GroupInviteGuardPlugin(Star):
                 comment = str(rec.get("comment") or "").strip() or "(无附言)"
                 action = str(rec.get("action") or "").strip() or "-"
                 status_text, status_class = _invite_status_label(action, dealt)
+                view = self._invite_record_detail(rec)
                 items.append(
                     {
                         "group": str(gid),
@@ -3276,6 +3600,8 @@ class GroupInviteGuardPlugin(Star):
                         "dealt": dealt,
                         "status_text": status_text,
                         "status_class": status_class,
+                        "decision": view["decision"] if show_detail else "",
+                        "detail": view["detail"] if show_detail else "",
                         "execution": str(rec.get("execution_state") or "旧记录"),
                         "membership": (
                             f"{rec.get('membership_before') or '-'}→"
@@ -3292,26 +3618,31 @@ class GroupInviteGuardPlugin(Star):
         for i, it in enumerate(items, 1):
             it["index"] = i
 
-        # 并发拉取邀请人昵称和群名，单个失败不影响整体（helper 内部已降级为空字符串）
-        tasks = []
-        if show_profile:
-            for it in items:
-                qq = it["inviter"]
-                if qq and qq != "(未知)":
-                    it["avatar"] = f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=100"
-                    tasks.append((it, "nickname", self._fetch_nickname(bot, qq)))
-
-        if show_group_profile:
-            for it in items:
-                gid = it["group"]
-                if gid:
-                    it["gavatar"] = f"https://p.qlogo.cn/gh/{gid}/{gid}/100"
-                    tasks.append((it, "gname", self._fetch_group_name(bot, gid)))
-
-        if tasks:
-            fetched = await asyncio.gather(*(t[2] for t in tasks), return_exceptions=True)
-            for (it, key, _), value in zip(tasks, fetched):
-                it[key] = value if isinstance(value, str) else ""
+        # 按唯一 QQ/群号并发拉取资料，同一页不重复请求 OneBot。
+        qqs = sorted(
+            {it["inviter"] for it in items if it["inviter"] not in ("", "(未知)")}
+        ) if show_profile else []
+        gids = sorted({it["group"] for it in items if it["group"]}) if show_group_profile else []
+        calls = [self._fetch_nickname(bot, qq) for qq in qqs]
+        calls.extend(self._fetch_group_name(bot, gid) for gid in gids)
+        fetched = await asyncio.gather(*calls, return_exceptions=True) if calls else []
+        nicknames = {
+            qq: (value if isinstance(value, str) else "")
+            for qq, value in zip(qqs, fetched[: len(qqs)])
+        }
+        group_names = {
+            gid: (value if isinstance(value, str) else "")
+            for gid, value in zip(gids, fetched[len(qqs) :])
+        }
+        for it in items:
+            qq = it["inviter"]
+            gid = it["group"]
+            if qq in nicknames:
+                it["avatar"] = f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=100"
+                it["nickname"] = nicknames[qq]
+            if gid in group_names:
+                it["gavatar"] = f"https://p.qlogo.cn/gh/{gid}/{gid}/100"
+                it["gname"] = group_names[gid]
 
         for it in items:
             it.pop("_ts", None)

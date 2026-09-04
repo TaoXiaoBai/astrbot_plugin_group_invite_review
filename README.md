@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.17.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.18.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -23,6 +23,7 @@
 - 三种处理模式：自动同意 / 自动拒绝 / 仅通知管理员（默认）
 - 审批或补偿结果确定后才按人格私聊邀请人；动作失败时不会发送承诺成功的话术
 - 决策附邀请人画像：历史邀请次数、黑名单前科、活跃度，并排除当前审核记录（纯本地数据，不额外调 LLM）
+- 安装用户画像插件时优先读取结构化风险分、标签、活跃度和社交来源，并把决策时快照写入邀请记录；旧版画像插件自动降级兼容
 - 抓到邀请人历史发言原话时，由 LLM 浓缩成一段 100 字内的印象小结（按发言条数缓存，陌生人零开销）
 - 小号识别：被拉黑的人换号再来？附言/昵称相似度命中即在决策上下文和通知里提示"疑似小号"；相似度处于灰色区间时再交 LLM 复判一次（结论缓存 7 天）
 - 私聊里问"能不能加群"、直接甩邀请链接，也能识别并回复/通知
@@ -64,7 +65,9 @@
 
 ## 可选联动
 
-单独安装即可完整使用。如果装了「[用户画像](https://github.com/TaoXiaoBai/astrbot_plugin_user_profile)」插件，决策、`/画像` 命令和 LLM 查画像工具会优先使用它的完整画像（活跃度/发言风格/前科），没装则自动用内置精简画像，无影响。
+单独安装即可完整使用。如果装了「[用户画像](https://github.com/TaoXiaoBai/astrbot_plugin_user_profile)」插件，邀请审核优先调用 `get_decision_profile()`，读取结构化风险分、标签、活跃度和社交来源；同时保留守卫自己的邀请/禁言/黑名单前科，不再二选一。当前审核记录会按 `request_key` 排除，避免把本次邀请算成历史前科。旧版画像插件会依次降级到标签 API 或文本 API，未安装时使用内置精简画像。
+
+结构化画像快照只保存标签、风险分、活跃度和精简社交来源，不复制发言原话；`/邀请记录` 可以同时查看 LLM 建议与实际执行结果。SnowLuma 的 `friend_add` 不提供具体加好友来源，因此画像只能记录好友添加时间；群号、邀请/同意方式和操作者来自后续 `group_increase` 事件。
 
 ## 平台要求
 
@@ -161,6 +164,8 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | --- | --- | --- |
 | `invite_records_show_profile` | `true` | 邀请记录图显示邀请人头像昵称 |
 | `invite_records_show_group_profile` | `true` | 邀请记录图显示群头像群名 |
+| `invite_records_hide_dealt` | `true` | 隐藏邀请人已拉黑的记录 |
+| `invite_records_show_decision_detail` | `true` | 文字/图片记录显示 LLM 建议、理由、画像风险分、主要标签和精简社交来源 |
 
 </details>
 
