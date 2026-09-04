@@ -367,7 +367,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.16.8",
+    "1.16.9",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -536,13 +536,21 @@ class GroupInviteGuardPlugin(Star):
 
         bot = self._find_onebot_client(event)
 
-        # 先记录一条「处理中」，决策与执行完成后再更新为最终结果，
-        # 保证即使中途异常记录也不会丢失
-        record_id = uuid.uuid4().hex[:8]
-        await self._record_invite(
-            group_id, inviter_qq, comment, "处理中", record_id=record_id,
-            decision="unknown", platform_id=platform_id or "", self_id=self_id,
-        )
+        if bot is not None and await self._verify_self_in_group(bot, group_id, self_id):
+            result_label = "已入群（迟到邀请）"
+            execution_result = "机器人已先入群，本次邀请请求已失效/未执行审核"
+            await self._record_invite(
+                group_id, inviter_qq, comment, result_label,
+                decision="skipped", decision_reason=execution_result,
+                auto_executed=False, execution_result=execution_result,
+                platform_id=platform_id or "", self_id=self_id,
+            )
+            note = self._compose_note(
+                inviter_qq, group_id, comment, "skipped", execution_result,
+                result_label=execution_result,
+            )
+            await self._notify(bot, note)
+            return
 
         try:
             decision = await self._ask_llm(inviter_qq, group_id, comment, bot, platform_id)
@@ -553,6 +561,37 @@ class GroupInviteGuardPlugin(Star):
         action = str(decision.get("action") or "unknown").strip().lower()
         reason = str(decision.get("reason") or "").strip()
         reply = str(decision.get("reply") or "").strip()  # 兼容旧格式：没有 reply 字段就跳过回复步骤
+        alt_warning = str(decision.get("alt_warning") or "").strip()
+
+        # LLM 已完成后才写入当前邀请，避免本条「处理中」记录污染决策画像
+        record_id = uuid.uuid4().hex[:8]
+        await self._record_invite(
+            group_id, inviter_qq, comment, "处理中", record_id=record_id,
+            decision=action, decision_reason=reason,
+            platform_id=platform_id or "", self_id=self_id,
+        )
+
+        if bot is not None and await self._verify_self_in_group(bot, group_id, self_id):
+            result_label = "审核期间已入群，未执行"
+            reply_status = "未发送（审核期间已入群，请求已失效）" if reply else ""
+            await self._update_invite_record(
+                group_id,
+                record_id,
+                action=result_label,
+                decision=action,
+                decision_reason=reason,
+                auto_executed=False,
+                execution_result=result_label,
+                reply=reply,
+                reply_status=reply_status,
+                alt_warning=alt_warning,
+            )
+            note = self._compose_note(
+                inviter_qq, group_id, comment, action, reason, reply,
+                reply_status, alt_warning, result_label,
+            )
+            await self._notify(bot, note)
+            return
 
         # 执行 approve/reject 之前，先私聊回复邀请人（失败不阻塞后续处理）
         reply_status = ""
@@ -574,11 +613,13 @@ class GroupInviteGuardPlugin(Star):
             reply_status = "未发送（开关关闭或无 OneBot 客户端）"
 
         result_label = "通知管理员（未自动处理）"
+        auto_executed = False
         if bot is None:
             logger.error("group_invite_guard: no OneBot client found")
             result_label = "判断失败（无 OneBot 客户端）"
         elif action == "approve" and self._cfg("decision", "auto_approve", False):
             try:
+                auto_executed = True
                 await self._call_action(
                     bot,
                     "set_group_add_request",
@@ -608,6 +649,7 @@ class GroupInviteGuardPlugin(Star):
                     result_label = "自动同意失败"
         elif action == "reject" and self._cfg("decision", "auto_reject", False):
             try:
+                auto_executed = True
                 await self._call_action(
                     bot,
                     "set_group_add_request",
@@ -631,19 +673,18 @@ class GroupInviteGuardPlugin(Star):
             action=result_label,
             decision=action,
             decision_reason=reason,
-            auto_executed=(action in ("approve", "reject") and (
-                self._cfg("decision", "auto_approve", False) or
-                self._cfg("decision", "auto_reject", False)
-            )),
+            auto_executed=auto_executed,
             execution_result=result_label,
             reply=reply,
             reply_status=reply_status,
-            alt_warning=str(decision.get("alt_warning") or "").strip(),
+            alt_warning=alt_warning,
         )
 
         if bot is not None:
-            alt_warning = str(decision.get("alt_warning") or "").strip()
-            note = self._compose_note(inviter_qq, group_id, comment, action, reason, reply, reply_status, alt_warning)
+            note = self._compose_note(
+                inviter_qq, group_id, comment, action, reason, reply,
+                reply_status, alt_warning, result_label,
+            )
             await self._notify(bot, note)
 
     @filter.custom_filter(PrivateInviteIntentFilter)
@@ -2143,7 +2184,7 @@ class GroupInviteGuardPlugin(Star):
         raise RuntimeError(f"no usable OneBot action caller for {action}")
 
     async def _verify_self_in_group(self, bot: Any, group_id: str, self_id: str = "") -> bool:
-        """核实机器人是否已在群内（用于同意接口报错后的状态对账）；查询失败按不在群处理。"""
+        """核实机器人是否已在群内；查询失败按不在群处理。"""
         try:
             uid = str(self_id or "").strip()
             if not uid:
@@ -2456,11 +2497,12 @@ class GroupInviteGuardPlugin(Star):
         ]
         return "\n".join(lines)
 
-    def _compose_note(self, inviter_qq, group_id, comment, action, reason, reply="", reply_status="", alt_warning="") -> str:
+    def _compose_note(self, inviter_qq, group_id, comment, action, reason, reply="", reply_status="", alt_warning="", result_label="") -> str:
         action_label = {
             "approve": "同意加入",
             "reject": "拒绝",
             "unknown": "判断失败（未处理）",
+            "skipped": "未调用（机器人已先入群）",
         }.get(action, action)
         lines = [
             "[加群邀请通知]",
@@ -2468,6 +2510,7 @@ class GroupInviteGuardPlugin(Star):
             f"群号：{group_id}",
             f"附言：{comment or '(无)'}",
             f"LLM 决策：{action_label}",
+            f"实际执行：{result_label or '未记录'}",
         ]
         if reason:
             lines.append(f"理由：{reason}")
