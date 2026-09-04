@@ -52,10 +52,10 @@
         "hint": "LLM 判断不要加时直接拒绝；关闭则只通知你"
       },
       "reply_inviter_on_decision": {
-        "description": "先回复邀请人",
+        "description": "结果确定后回复邀请人",
         "type": "bool",
         "default": true,
-        "hint": "处理邀请前先私聊邀请人一句：同意=打招呼，拒绝=委婉告知"
+        "hint": "审批或补偿动作成功后再私聊，失败时不承诺结果"
       },
       "llm_provider_id": {
         "description": "决策模型",
@@ -106,6 +106,26 @@
         "type": "string",
         "default": "…",
         "hint": "内容过长被截断时的结尾符号，一般不用改"
+      }
+    }
+  },
+  "unexpected_join": {
+    "description": "异常提前入群",
+    "type": "object",
+    "items": {
+      "mode": {
+        "description": "LLM 拒绝后的处理",
+        "type": "string",
+        "default": "notify_only",
+        "options": ["notify_only", "leave", "message_then_leave"],
+        "labels": ["仅通知", "直接退群", "发消息后退群"],
+        "hint": "审核前或审核期间已入群且 LLM 拒绝时执行"
+      },
+      "custom_leave_message": {
+        "description": "退群前消息",
+        "type": "string",
+        "default": "",
+        "hint": "仅「发消息后退群」使用；发送失败仍会退群"
       }
     }
   },

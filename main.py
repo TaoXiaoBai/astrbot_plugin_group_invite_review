@@ -1,5 +1,6 @@
 import asyncio
 import difflib
+import hashlib
 import inspect
 import json
 import re
@@ -59,14 +60,14 @@ def _invite_status_label(action: str, dealt: bool) -> tuple[str, str]:
     if dealt:
         return "已拉黑", "banned"
     a = str(action or "").strip().lower()
-    if a == "approve":
-        return "已同意", "approved"
-    if a == "reject":
-        return "已拒绝", "rejected"
-    if a == "手动记录":
-        return "已记录", "recorded"
-    if a in ("unknown", "", "-"):
-        return "待处理", "pending"
+    if a == "reject" or "拒绝" in a or "不同意" in a or "未同意" in a:
+        return str(action or "已拒绝"), "rejected"
+    if a == "approve" or "同意" in a:
+        return str(action or "已同意"), "approved"
+    if a == "手动记录" or "仅记录" in a or "非本机器人" in a:
+        return str(action or "已记录"), "recorded"
+    if a in ("unknown", "", "-") or "待审核" in a or "审核中" in a:
+        return str(action or "待处理"), "pending"
     return str(action or "其他").strip(), "other"
 
 
@@ -118,6 +119,10 @@ _CONFIG_GROUPS = {
         "enable_user_profile": True,
         "use_profile_plugin": True,
         "truncate_marker": "…",
+    },
+    "unexpected_join": {
+        "mode": "notify_only",
+        "custom_leave_message": "",
     },
     "alt_detect": {
         "alt_account_detect": True,
@@ -210,7 +215,7 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
     <div class="sub">共 {{ total }} 条（新→旧）</div>
     {% if items %}
     <table>
-      <tr><th>#</th><th>群</th><th>邀请人</th><th>时间</th><th>状态</th><th>附言</th></tr>
+      <tr><th>#</th><th>群</th><th>邀请人</th><th>时间</th><th>状态</th><th>成员</th><th>附言</th></tr>
       {% for it in items %}
       <tr{% if it.dealt %} class="dealt"{% endif %}>
         <td class="idx">{{ it.index }}</td>
@@ -233,7 +238,8 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
           </div>
         </td>
         <td>{{ it.time }}</td>
-        <td><span class="status-tag {{ it.status_class }}">{{ it.status_text }}</span></td>
+        <td><span class="status-tag {{ it.status_class }}">{{ it.status_text }}</span><div class="qq">{{ it.execution }}</div></td>
+        <td>{{ it.membership }}</td>
         <td class="comment">{{ it.comment }}</td>
       </tr>
       {% endfor %}
@@ -367,14 +373,18 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.16.9",
+    "1.17.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config or {}
+        self._invite_kv_lock = asyncio.Lock()
+        self._invite_state_lock = asyncio.Lock()
+        self._invite_inflight = set()
         self._migrate_flat_config()
-        self._migrate_ban_list_sync()
+        if self._cfg("basic", "enable", True):
+            self._migrate_ban_list_sync()
 
     def _cfg(self, group: str, key: str, default: Any = None) -> Any:
         """读取嵌套分组配置 self.config[group][key]；分组/键缺失时回退旧平铺顶层 key，最后回退 default。"""
@@ -504,188 +514,604 @@ class GroupInviteGuardPlugin(Star):
         if raw is None:
             return
 
-        inviter_qq = str(_get_value(raw, "user_id") or "")
-        group_id = str(_get_value(raw, "group_id") or "")
-        comment = str(_get_value(raw, "comment") or "")
-        flag = str(_get_value(raw, "flag") or "")
-        sub_type = str(_get_value(raw, "sub_type") or "invite")
-        self_id = str(_get_value(raw, "self_id") or "")
-        platform_id = None
+        inviter_qq = str(_get_value(raw, "user_id") or "").strip()
+        group_id = str(_get_value(raw, "group_id") or "").strip()
+        comment = str(_get_value(raw, "comment") or "").strip()
+        flag = str(_get_value(raw, "flag") or "").strip()
+        sub_type = str(_get_value(raw, "sub_type") or "invite").strip()
+        self_id = str(_get_value(raw, "self_id") or "").strip()
+        invited_id = str(_get_value(raw, "invited_id") or "").strip()
+        target_state = "UNVERIFIED"
+        if invited_id and self_id:
+            target_state = "VERIFIED" if invited_id == self_id else "NOT_FOR_BOT"
+        platform_id = ""
         try:
-            platform_id = event.get_platform_id()
+            platform_id = str(event.get_platform_id() or "")
         except Exception:
             pass
 
-        # 禁用：不接管（不 stop_event），只记录一条邀请后返回
-        if not self._cfg("basic", "enable", True):
-            await self._record_invite(
-                group_id, inviter_qq, comment, "仅记录（插件已禁用）",
-                decision="unknown", platform_id=platform_id or "", self_id=self_id,
-            )
+        request_key = self._make_request_key(raw, flag)
+        record_id, duplicate, reconcile = await self._begin_invite_request(
+            group_id, inviter_qq, comment, request_key, target_state,
+            platform_id, self_id, invited_id, bool(flag),
+        )
+        if duplicate:
+            logger.info(f"group_invite_guard: duplicate invite ignored: {request_key}")
             return
 
-        # 启用：接管这条 request，阻止这条空的 request 消息继续进入 LLM 回复阶段
+        if target_state == "NOT_FOR_BOT":
+            await self._finish_not_for_bot(group_id, record_id)
+            await self._release_invite_request(request_key)
+            return
+
+        if not self._cfg("basic", "enable", True):
+            await self._update_invite_record(
+                group_id, record_id,
+                action="仅记录（插件已禁用）",
+                review_state="DISABLED",
+                execution_state="DISABLED_RECORDED",
+                execution_result="插件已禁用，仅持久化记录",
+            )
+            await self._release_invite_request(request_key)
+            return
+
         try:
             event.stop_event()
         except Exception:
             pass
 
-        if not flag:
-            logger.warning("group_invite_guard: request event missing flag, skip")
-            return
-
         bot = self._find_onebot_client(event)
-
-        if bot is not None and await self._verify_self_in_group(bot, group_id, self_id):
-            result_label = "已入群（迟到邀请）"
-            execution_result = "机器人已先入群，本次邀请请求已失效/未执行审核"
-            await self._record_invite(
-                group_id, inviter_qq, comment, result_label,
-                decision="skipped", decision_reason=execution_result,
-                auto_executed=False, execution_result=execution_result,
-                platform_id=platform_id or "", self_id=self_id,
-            )
-            note = self._compose_note(
-                inviter_qq, group_id, comment, "skipped", execution_result,
-                result_label=execution_result,
-            )
-            await self._notify(bot, note)
+        target_state, self_id, target_error = await self._resolve_invite_target(
+            bot, self_id, invited_id
+        )
+        await self._update_invite_record(
+            group_id, record_id, target_state=target_state, self_id=self_id,
+            target_error=target_error,
+        )
+        if target_state == "NOT_FOR_BOT":
+            await self._finish_not_for_bot(group_id, record_id, target_error)
+            await self._release_invite_request(request_key)
             return
 
         try:
-            decision = await self._ask_llm(inviter_qq, group_id, comment, bot, platform_id)
+            if reconcile:
+                await self._reconcile_inflight_request(
+                    bot, group_id, record_id, inviter_qq, comment, self_id
+                )
+            else:
+                await self._review_invite_request(
+                    bot=bot,
+                    group_id=group_id,
+                    inviter_qq=inviter_qq,
+                    comment=comment,
+                    flag=flag,
+                    sub_type=sub_type,
+                    self_id=self_id,
+                    platform_id=platform_id,
+                    request_key=request_key,
+                    record_id=record_id,
+                    target_state=target_state,
+                    target_error=target_error,
+                )
+        except Exception as exc:
+            logger.error(f"group_invite_guard: invite review crashed: {exc}")
+            await self._mark_processing_failure(group_id, record_id, exc)
+        finally:
+            await self._release_invite_request(request_key)
+
+    @staticmethod
+    def _make_request_key(raw: Any, flag: str) -> str:
+        if flag:
+            source = f"flag:{flag}"
+        else:
+            fields = {
+                key: str(_get_value(raw, key) or "")
+                for key in ("self_id", "invited_id", "group_id", "user_id", "sub_type", "comment", "time")
+            }
+            source = "event:" + json.dumps(fields, ensure_ascii=False, sort_keys=True)
+        return "req_" + hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+
+    def _invite_lock(self, name: str) -> asyncio.Lock:
+        lock = getattr(self, name, None)
+        if lock is None:
+            lock = asyncio.Lock()
+            setattr(self, name, lock)
+        return lock
+
+    async def _begin_invite_request(
+        self, group_id: str, inviter_qq: str, comment: str, request_key: str,
+        target_state: str, platform_id: str, self_id: str, invited_id: str,
+        has_flag: bool,
+    ) -> tuple[str, bool, bool]:
+        async with self._invite_lock("_invite_state_lock"):
+            inflight = getattr(self, "_invite_inflight", None)
+            if inflight is None:
+                inflight = set()
+                self._invite_inflight = inflight
+            if request_key in inflight:
+                return "", True, False
+            try:
+                records = await self.get_kv_data("invite_records", {})
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: load invite_records for dedupe failed: {exc}")
+                records = {}
+            for recs in self._normalize_invite_records(records).values():
+                for rec in recs:
+                    if str(rec.get("request_key") or "") != request_key:
+                        continue
+                    state = str(rec.get("execution_state") or "")
+                    if state.endswith("_IN_FLIGHT") or state == "ACTION_IN_FLIGHT":
+                        inflight.add(request_key)
+                        return str(rec.get("record_id") or ""), False, True
+                    if state and state not in ("RECEIVED", "REVIEWING", "DECIDED"):
+                        return str(rec.get("record_id") or ""), True, False
+                    inflight.add(request_key)
+                    return str(rec.get("record_id") or ""), False, False
+
+            record_id = uuid.uuid4().hex[:8]
+            protocol_error = "" if has_flag else "邀请请求缺少 flag，无法调用审批接口"
+            persisted = await self._record_invite(
+                group_id, inviter_qq, comment, "已收到，待审核", record_id=record_id,
+                request_key=request_key,
+                target_state=target_state,
+                review_state="RECEIVED",
+                membership_before="UNKNOWN",
+                membership_after="UNKNOWN",
+                action_attempted=False,
+                action_succeeded=False,
+                auto_executed=False,
+                execution_state="RECEIVED",
+                execution_result="已持久化，等待审核",
+                protocol_error=protocol_error,
+                platform_id=platform_id,
+                self_id=self_id,
+                invited_id=invited_id,
+                decision="unknown",
+            )
+            if not persisted:
+                raise RuntimeError("邀请记录持久化失败，已停止自动处理")
+            inflight.add(request_key)
+            return record_id, False, False
+
+    async def _release_invite_request(self, request_key: str) -> None:
+        async with self._invite_lock("_invite_state_lock"):
+            getattr(self, "_invite_inflight", set()).discard(request_key)
+
+    async def _get_invite_record(self, group_id: str, record_id: str) -> dict | None:
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load invite record failed: {exc}")
+            return None
+        storage_group = str(group_id or "").strip() or "(未知群)"
+        for rec in self._normalize_invite_records(records).get(storage_group, []):
+            if str(rec.get("record_id") or "") == str(record_id or ""):
+                return rec
+        return None
+
+    async def _finish_not_for_bot(
+        self, group_id: str, record_id: str, error: str = ""
+    ) -> None:
+        await self._update_invite_record(
+            group_id, record_id,
+            action="非本机器人邀请",
+            review_state="NOT_REQUIRED",
+            execution_state="NOT_FOR_BOT",
+            execution_result="非本机器人邀请，未审核未执行",
+            protocol_error=error,
+        )
+
+    async def _resolve_invite_target(
+        self, bot, raw_self_id: str, invited_id: str
+    ) -> tuple[str, str, str]:
+        raw_self_id = str(raw_self_id or "").strip()
+        invited_id = str(invited_id or "").strip()
+        login_id = ""
+        if bot is not None:
+            try:
+                info = await self._call_action(bot, "get_login_info")
+                login_id = str(_get_value(info, "user_id") or "").strip()
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: get_login_info for target check failed: {exc}")
+
+        if raw_self_id and login_id and raw_self_id != login_id:
+            return "NOT_FOR_BOT", login_id, "事件 self_id 与当前客户端账号不一致"
+        self_id = login_id or raw_self_id
+        if invited_id and self_id and invited_id != self_id:
+            return "NOT_FOR_BOT", self_id, "invited_id 与当前客户端账号不一致"
+        if self_id:
+            return "VERIFIED", self_id, ""
+        return "UNVERIFIED", "", "无法确认当前客户端账号，已禁止自动外部动作"
+
+    async def _reconcile_inflight_request(
+        self, bot, group_id: str, record_id: str, inviter_qq: str,
+        comment: str, self_id: str,
+    ) -> None:
+        rec = await self._get_invite_record(group_id, record_id)
+        if not rec:
+            logger.error("group_invite_guard: cannot reconcile missing in-flight record")
+            return
+        old_state = str(rec.get("execution_state") or "ACTION_IN_FLIGHT")
+        membership = await self._membership_state(bot, group_id, self_id)
+        action = str(rec.get("decision") or "unknown")
+        reason = str(rec.get("decision_reason") or "")
+        succeeded = False
+        if old_state == "LEAVE_IN_FLIGHT" and membership == "OUT":
+            state = "UNEXPECTED_JOIN_LEFT"
+            result = "重启后对账：已确认机器人不在群内，退群结果成立"
+            succeeded = True
+        elif old_state == "LEAVE_IN_FLIGHT" and membership == "IN":
+            state = "LEAVE_UNCONFIRMED"
+            result = "重启后对账：机器人仍在群内，未重放退群动作"
+        elif old_state == "APPROVE_IN_FLIGHT" and membership == "IN":
+            state = "APPROVED_RECONCILED"
+            result = "重启后对账：已确认入群，未重放同意动作"
+            succeeded = True
+        else:
+            state = "ACTION_OUTCOME_UNKNOWN"
+            result = f"重启后对账：{old_state} 的结果无法确认，未重放外部动作"
+        saved = await self._update_invite_record(
+            group_id, record_id,
+            action=result,
+            review_state="COMPLETED",
+            membership_after=membership,
+            action_attempted=True,
+            action_succeeded=succeeded,
+            auto_executed=True,
+            execution_state=state,
+            execution_result=result,
+            protocol_error="动作结果需人工确认" if not succeeded else "",
+        )
+        if not saved:
+            logger.error(
+                "group_invite_guard: failed to persist in-flight reconciliation; "
+                "external action will still not be replayed in this process"
+            )
+        if bot is not None:
+            await self._notify(
+                bot,
+                self._compose_note(
+                    inviter_qq, group_id, comment, action, reason,
+                    result_label=result, membership_before=str(rec.get("membership_before") or "UNKNOWN"),
+                    membership_after=membership,
+                    protocol_error="动作结果需人工确认" if not succeeded else "",
+                ),
+            )
+
+    async def _mark_processing_failure(
+        self, group_id: str, record_id: str, exc: Exception
+    ) -> None:
+        rec = await self._get_invite_record(group_id, record_id)
+        state = str((rec or {}).get("execution_state") or "")
+        if state.endswith("_IN_FLIGHT") or state == "ACTION_IN_FLIGHT":
+            await self._update_invite_record(
+                group_id, record_id,
+                action="动作结果未知",
+                review_state="COMPLETED",
+                execution_state="ACTION_OUTCOME_UNKNOWN",
+                execution_result="外部动作后处理异常，结果需人工确认",
+                protocol_error=str(exc)[:300],
+            )
+            return
+        await self._update_invite_record(
+            group_id, record_id,
+            action="处理异常",
+            review_state="FAILED",
+            execution_state="FAILED",
+            execution_result="处理流程异常终止",
+            protocol_error=str(exc)[:300],
+        )
+
+    async def _review_invite_request(
+        self, *, bot, group_id: str, inviter_qq: str, comment: str, flag: str,
+        sub_type: str, self_id: str, platform_id: str, request_key: str,
+        record_id: str, target_state: str, target_error: str,
+    ) -> None:
+        membership_before = await self._membership_state(bot, group_id, self_id)
+        await self._update_invite_record(
+            group_id, record_id,
+            action="审核中",
+            review_state="REVIEWING",
+            membership_before=membership_before,
+            execution_state="REVIEWING",
+        )
+        try:
+            decision = await self._ask_llm(
+                inviter_qq, group_id, comment, bot, platform_id, request_key=request_key
+            )
         except Exception as exc:
             logger.error(f"group_invite_guard: LLM decision failed: {exc}")
             decision = {"action": "unknown", "reason": f"LLM error: {exc}"}
 
         action = str(decision.get("action") or "unknown").strip().lower()
+        if action not in ("approve", "reject"):
+            action = "unknown"
         reason = str(decision.get("reason") or "").strip()
-        reply = str(decision.get("reply") or "").strip()  # 兼容旧格式：没有 reply 字段就跳过回复步骤
+        reply = str(decision.get("reply") or "").strip()
         alt_warning = str(decision.get("alt_warning") or "").strip()
-
-        # LLM 已完成后才写入当前邀请，避免本条「处理中」记录污染决策画像
-        record_id = uuid.uuid4().hex[:8]
-        await self._record_invite(
-            group_id, inviter_qq, comment, "处理中", record_id=record_id,
-            decision=action, decision_reason=reason,
-            platform_id=platform_id or "", self_id=self_id,
+        await self._update_invite_record(
+            group_id, record_id,
+            decision=action,
+            decision_reason=reason,
+            review_state="DECIDED",
+            execution_state="DECIDED",
+            alt_warning=alt_warning,
         )
 
-        if bot is not None and await self._verify_self_in_group(bot, group_id, self_id):
-            result_label = "审核期间已入群，未执行"
-            reply_status = "未发送（审核期间已入群，请求已失效）" if reply else ""
-            await self._update_invite_record(
-                group_id,
-                record_id,
-                action=result_label,
-                decision=action,
-                decision_reason=reason,
-                auto_executed=False,
-                execution_result=result_label,
-                reply=reply,
-                reply_status=reply_status,
-                alt_warning=alt_warning,
-            )
-            note = self._compose_note(
-                inviter_qq, group_id, comment, action, reason, reply,
-                reply_status, alt_warning, result_label,
-            )
-            await self._notify(bot, note)
-            return
+        membership_after = await self._membership_state(bot, group_id, self_id)
+        outcome = await self._execute_invite_decision(
+            bot, group_id, record_id, flag, sub_type, self_id, action, reason,
+            membership_after, target_state,
+        )
+        if "membership_after" in outcome:
+            membership_after = str(outcome["membership_after"])
+        elif outcome.get("refresh_membership"):
+            membership_after = await self._membership_state(bot, group_id, self_id)
 
-        # 执行 approve/reject 之前，先私聊回复邀请人（失败不阻塞后续处理）
         reply_status = ""
-        if reply and bot is not None and self._cfg("decision", "reply_inviter_on_decision", True):
-            if inviter_qq:
+        may_reply = bool(outcome.get("decision_succeeded"))
+        if reply and self._cfg("decision", "reply_inviter_on_decision", True):
+            if not may_reply:
+                reply_status = "未发送（实际动作未成功，避免承诺结果）"
+            elif bot is None:
+                reply_status = "未发送（无 OneBot 客户端）"
+            elif not inviter_qq:
+                reply_status = "未发送（协议端未识别邀请人 QQ）"
+            else:
                 try:
                     await self._call_action(
                         bot, "send_private_msg", user_id=int(inviter_qq), message=reply
                     )
                     reply_status = "已私聊发送"
-                    logger.info(f"group_invite_guard: replied to inviter {inviter_qq}")
                 except Exception as exc:
                     logger.error(f"group_invite_guard: reply inviter {inviter_qq} failed: {exc}")
                     reply_status = f"发送失败：{exc}"
-            else:
-                reply_status = "未发送（协议端未识别邀请人 QQ）"
-                logger.warning("group_invite_guard: inviter QQ is empty, skip private reply")
         elif reply:
-            reply_status = "未发送（开关关闭或无 OneBot 客户端）"
+            reply_status = "未发送（回复开关关闭）"
 
-        result_label = "通知管理员（未自动处理）"
-        auto_executed = False
-        if bot is None:
-            logger.error("group_invite_guard: no OneBot client found")
-            result_label = "判断失败（无 OneBot 客户端）"
-        elif action == "approve" and self._cfg("decision", "auto_approve", False):
-            try:
-                auto_executed = True
-                await self._call_action(
-                    bot,
-                    "set_group_add_request",
-                    flag=flag,
-                    sub_type=sub_type,
-                    approve=True,
-                    reason="",
-                )
-                logger.info(
-                    f"group_invite_guard: approved invite from {inviter_qq} to group {group_id}"
-                )
-                result_label = "自动同意进群"
-            except Exception as exc:
-                msg = str(exc).lower()
-                # snowluma/napcat 对同一邀请重复同意会返回 already agree，属幂等成功
-                if "already" in msg or "already agree" in msg or "120162002" in msg:
-                    logger.info(
-                        f"group_invite_guard: approve for group {group_id} already agreed (idempotent)"
-                    )
-                    result_label = "自动同意进群（协议端已同意）"
-                # 协议端偶尔已执行成功但响应报错（超时/回包异常），
-                # 报错后实际核实一次群成员状态，避免记录误写「同意失败」
-                elif await self._verify_self_in_group(bot, group_id, self_id):
-                    result_label = "自动同意进群（接口报错，已核实进群）"
-                else:
-                    logger.error(f"group_invite_guard: approve failed: {exc}")
-                    result_label = "自动同意失败"
-        elif action == "reject" and self._cfg("decision", "auto_reject", False):
-            try:
-                auto_executed = True
-                await self._call_action(
-                    bot,
-                    "set_group_add_request",
-                    flag=flag,
-                    sub_type=sub_type,
-                    approve=False,
-                    reason=reason or "bot 自动拒绝",
-                )
-                logger.info(
-                    f"group_invite_guard: rejected invite from {inviter_qq} to group {group_id}"
-                )
-                result_label = "自动拒绝"
-            except Exception as exc:
-                logger.error(f"group_invite_guard: reject failed: {exc}")
-                result_label = "自动拒绝失败"
-
-        # 更新为最终结果（无论是否自动处理），供被踢报复与查询
-        await self._update_invite_record(
-            group_id,
-            record_id,
+        errors = [str(target_error or ""), str(outcome.get("protocol_error") or "")]
+        if not flag:
+            errors.append("邀请请求缺少 flag，无法调用审批接口")
+        protocol_error = "；".join(dict.fromkeys(err for err in errors if err))
+        result_label = str(outcome["result"])
+        saved = await self._update_invite_record(
+            group_id, record_id,
             action=result_label,
             decision=action,
             decision_reason=reason,
-            auto_executed=auto_executed,
+            review_state="COMPLETED",
+            membership_after=membership_after,
+            action_attempted=bool(outcome["attempted"]),
+            action_succeeded=bool(outcome["succeeded"]),
+            auto_executed=bool(outcome["attempted"]),
+            execution_state=str(outcome["state"]),
             execution_result=result_label,
+            protocol_error=protocol_error,
             reply=reply,
             reply_status=reply_status,
             alt_warning=alt_warning,
         )
+        if not saved:
+            replay_guard = (
+                "persisted IN_FLIGHT state prevents automatic replay"
+                if outcome["attempted"] else "no external action was attempted"
+            )
+            logger.error(
+                f"group_invite_guard: final invite state persistence failed for "
+                f"{record_id}; {replay_guard}"
+            )
 
         if bot is not None:
             note = self._compose_note(
                 inviter_qq, group_id, comment, action, reason, reply,
                 reply_status, alt_warning, result_label,
+                membership_before=membership_before,
+                membership_after=membership_after,
+                protocol_error=protocol_error,
             )
             await self._notify(bot, note)
+
+    async def _execute_invite_decision(
+        self, bot, group_id: str, record_id: str, flag: str, sub_type: str,
+        self_id: str, action: str, reason: str, membership: str,
+        target_state: str,
+    ) -> dict:
+        outcome = {
+            "attempted": False, "succeeded": False, "decision_succeeded": False,
+            "refresh_membership": False, "state": "NO_ACTION",
+            "result": "仅通知管理员（未自动处理）", "protocol_error": "",
+        }
+        if action == "unknown":
+            outcome.update(state="LLM_FAILED", result="LLM 未给出有效决策")
+            return outcome
+        if bot is None:
+            outcome.update(state="NO_CLIENT", result="未执行（无 OneBot 客户端）")
+            return outcome
+        if target_state != "VERIFIED":
+            outcome.update(
+                state="TARGET_UNVERIFIED",
+                result="目标机器人身份未确认，仅保留 LLM 审核结果",
+            )
+            return outcome
+        if membership == "UNKNOWN":
+            outcome.update(state="MEMBERSHIP_UNKNOWN", result="未执行（成员状态未知）")
+            return outcome
+
+        if membership == "IN":
+            if action == "approve":
+                outcome.update(
+                    succeeded=True, decision_succeeded=True,
+                    state="EXTERNAL_JOIN_APPROVED",
+                    result="外部提前入群，LLM 审核同意（未重复审批）",
+                )
+                return outcome
+            return await self._compensate_unexpected_join(
+                bot, group_id, self_id, record_id, action, reason
+            )
+
+        enabled = (
+            action == "approve" and _as_bool(self._cfg("decision", "auto_approve", False))
+        ) or (
+            action == "reject" and _as_bool(self._cfg("decision", "auto_reject", False))
+        )
+        if not enabled:
+            return outcome
+        if not flag:
+            outcome.update(state="MISSING_FLAG", result="未执行（请求缺少 flag）")
+            return outcome
+
+        in_flight = "APPROVE_IN_FLIGHT" if action == "approve" else "REJECT_IN_FLIGHT"
+        prepared = await self._update_invite_record(
+            group_id, record_id,
+            decision=action,
+            decision_reason=reason,
+            review_state="DECIDED",
+            execution_state=in_flight,
+            execution_result="外部审批动作即将执行",
+            action_attempted=True,
+            action_succeeded=False,
+            auto_executed=True,
+        )
+        if not prepared:
+            logger.error(
+                f"group_invite_guard: refused {action}; failed to persist {in_flight}"
+            )
+            outcome.update(
+                state="PRE_ACTION_PERSIST_FAILED",
+                result="动作前状态持久化失败，未执行自动审批",
+                protocol_error="无法持久化动作前状态",
+            )
+            return outcome
+
+        outcome["attempted"] = True
+        outcome["refresh_membership"] = True
+        try:
+            await self._call_action(
+                bot, "set_group_add_request", flag=flag, sub_type=sub_type,
+                approve=action == "approve",
+                reason="" if action == "approve" else (reason or "bot 自动拒绝"),
+            )
+            outcome.update(
+                succeeded=True, decision_succeeded=True,
+                state="APPROVED" if action == "approve" else "REJECTED",
+                result="自动同意进群" if action == "approve" else "自动拒绝",
+            )
+        except Exception as exc:
+            error = str(exc)
+            if action == "approve" and self._is_explicit_already_agreed(exc):
+                verified = await self._membership_state(bot, group_id, self_id)
+                if verified == "IN":
+                    outcome.update(
+                        succeeded=True, decision_succeeded=True,
+                        state="ALREADY_APPROVED_VERIFIED",
+                        result="协议端明确已同意，且已核实入群",
+                    )
+                    return outcome
+            logger.error(f"group_invite_guard: {action} action failed: {exc}")
+            outcome.update(
+                state="ACTION_FAILED",
+                result="自动同意失败" if action == "approve" else "自动拒绝失败",
+                protocol_error=error[:300],
+            )
+        return outcome
+
+    async def _compensate_unexpected_join(
+        self, bot, group_id: str, self_id: str, record_id: str,
+        action: str, reason: str,
+    ) -> dict:
+        mode = str(
+            self._cfg("unexpected_join", "mode", "notify_only") or "notify_only"
+        ).strip().lower()
+        if mode not in ("notify_only", "leave", "message_then_leave"):
+            mode = "notify_only"
+        if mode == "notify_only":
+            return {
+                "attempted": False, "succeeded": False, "decision_succeeded": False,
+                "refresh_membership": False, "state": "UNEXPECTED_JOIN_NOTIFIED",
+                "result": "异常提前入群；LLM 拒绝，按配置仅通知未退群", "protocol_error": "",
+            }
+
+        prepared = await self._update_invite_record(
+            group_id, record_id,
+            decision=action,
+            decision_reason=reason,
+            review_state="DECIDED",
+            execution_state="LEAVE_IN_FLIGHT",
+            execution_result="异常入群补偿即将执行",
+            action_attempted=True,
+            action_succeeded=False,
+            auto_executed=True,
+        )
+        if not prepared:
+            logger.error("group_invite_guard: refused leave; failed to persist LEAVE_IN_FLIGHT")
+            return {
+                "attempted": False, "succeeded": False, "decision_succeeded": False,
+                "refresh_membership": False, "state": "PRE_ACTION_PERSIST_FAILED",
+                "result": "动作前状态持久化失败，未执行退群",
+                "protocol_error": "无法持久化动作前状态",
+            }
+
+        errors = []
+        if mode == "message_then_leave":
+            message = str(
+                self._cfg("unexpected_join", "custom_leave_message", "") or ""
+            ).strip()
+            if message:
+                try:
+                    await self._call_action(
+                        bot, "send_group_msg", group_id=int(group_id), message=message
+                    )
+                except Exception as exc:
+                    errors.append(f"群消息发送失败：{exc}")
+            else:
+                errors.append("自定义退群语句为空")
+        try:
+            await self._call_action(
+                bot, "set_group_leave", group_id=int(group_id), is_dismiss=False
+            )
+        except Exception as exc:
+            errors.append(f"退群失败：{exc}")
+            membership_after = await self._membership_state(bot, group_id, self_id)
+            return {
+                "attempted": True, "succeeded": False, "decision_succeeded": False,
+                "refresh_membership": False, "membership_after": membership_after,
+                "state": "UNEXPECTED_JOIN_LEAVE_FAILED",
+                "result": "异常提前入群；LLM 拒绝，但退群调用失败",
+                "protocol_error": "；".join(errors),
+            }
+
+        membership_after = await self._membership_state(bot, group_id, self_id)
+        if membership_after == "OUT":
+            result = "异常提前入群；LLM 拒绝，已核实退群"
+            if errors:
+                result += "（" + "；".join(errors) + "）"
+            return {
+                "attempted": True, "succeeded": True, "decision_succeeded": True,
+                "refresh_membership": False, "membership_after": membership_after,
+                "state": "UNEXPECTED_JOIN_LEFT", "result": result,
+                "protocol_error": "；".join(errors),
+            }
+        if membership_after == "IN":
+            errors.append("退群调用后机器人仍在群内")
+            state = "LEAVE_UNCONFIRMED"
+            result = "异常提前入群；退群调用未确认成功，机器人仍在群内"
+        else:
+            errors.append("退群调用后成员状态未知")
+            state = "ACTION_OUTCOME_UNKNOWN"
+            result = "异常提前入群；退群结果未知，需人工确认"
+        return {
+            "attempted": True, "succeeded": False, "decision_succeeded": False,
+            "refresh_membership": False, "membership_after": membership_after,
+            "state": state, "result": result, "protocol_error": "；".join(errors),
+        }
+
+    @staticmethod
+    def _is_explicit_already_agreed(exc: Exception) -> bool:
+        text = str(exc or "")
+        return "120162002" in text or bool(
+            re.search(r"\balready[ _-]+agree(?:d)?\b", text, re.I)
+            or re.search(r"(?:请求|邀请)?已(?:经)?同意", text)
+        )
 
     @filter.custom_filter(PrivateInviteIntentFilter)
     async def on_private_invite_intent(self, event: AstrMessageEvent):
@@ -700,6 +1126,11 @@ class GroupInviteGuardPlugin(Star):
 
         # 粗筛：明显不是加群意图就交还给正常私聊，不额外调 LLM
         if not self._looks_like_invite_intent(text):
+            return
+        if (
+            self._cfg("private_intent", "enable_blacklist_inquiry", True)
+            and self._looks_like_blacklist_inquiry(text)
+        ):
             return
 
         platform_id = None
@@ -949,6 +1380,8 @@ class GroupInviteGuardPlugin(Star):
 
     @filter.custom_filter(GroupJoinFilter)
     async def on_group_join(self, event: AstrMessageEvent):
+        if not self._cfg("basic", "enable", True):
+            return
         if not self._cfg("kick_revenge", "record_group_join", True):
             return
 
@@ -960,10 +1393,27 @@ class GroupInviteGuardPlugin(Star):
         if not group_id:
             return
         operator_id = str(_get_value(raw, "operator_id") or "")
-        await self._record_join(group_id, operator_id)
+        self_id = str(_get_value(raw, "self_id") or "")
+        admission = await self._find_admission_for_join(group_id, self_id)
+        await self._record_join(
+            group_id,
+            operator_id,
+            request_key=str((admission or {}).get("request_key") or ""),
+            inviter=str((admission or {}).get("inviter") or ""),
+        )
+        if admission:
+            await self._update_invite_record(
+                group_id,
+                str(admission.get("record_id") or ""),
+                membership_after="IN",
+                admission_bound=True,
+                admission_time=int(time.time()),
+            )
 
     @filter.custom_filter(GroupKickFilter)
     async def on_group_kick(self, event: AstrMessageEvent):
+        if not self._cfg("basic", "enable", True):
+            return
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
         if raw is None:
             return
@@ -982,8 +1432,7 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
             records = {}
-        latest_rec = self._latest_invite_record(records, group_id)
-        inviter_qq = self._record_inviter(latest_rec) if latest_rec else ""
+        inviter_qq = await self._admission_inviter(group_id, records)
 
         mode = str(self._cfg("kick_revenge", "revenge_mode", "off") or "off").strip().lower()
         revenge_on = mode in ("delete_friend", "delete_and_ban")
@@ -1085,8 +1534,63 @@ class GroupInviteGuardPlugin(Star):
         logger.info(f"group_invite_guard: banned kick operator {operator_id}: {result}")
         return f"已按设置拉黑踢人者 {operator_id}：{result}"
 
-    async def _record_join(self, group_id: str, operator_id: str) -> None:
-        """记录/覆盖一条机器人进群记录（按群号取最新），最多保留最近 100 条。"""
+    async def _find_admission_for_join(self, group_id: str, self_id: str) -> dict | None:
+        try:
+            records = await self.get_kv_data("invite_records", {})
+        except Exception:
+            return None
+        now = int(time.time())
+        candidates = []
+        for rec in self._normalize_invite_records(records).get(str(group_id), []):
+            if str(rec.get("target_state") or "") == "NOT_FOR_BOT":
+                continue
+            target_self = str(rec.get("self_id") or "")
+            if self_id and target_self and self_id != target_self:
+                continue
+            try:
+                age = now - int(rec.get("time") or 0)
+            except Exception:
+                continue
+            if age < -60 or age > 600:
+                continue
+            state = str(rec.get("execution_state") or "")
+            if state == "REJECTED" and _as_bool(rec.get("action_succeeded")):
+                continue
+            if state == "UNEXPECTED_JOIN_LEFT" and _as_bool(rec.get("action_succeeded")):
+                continue
+            candidates.append(rec)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda rec: int(rec.get("time") or 0))
+
+    async def _admission_inviter(self, group_id: str, invite_records=None) -> str:
+        try:
+            joins = await self.get_kv_data("join_records", {})
+        except Exception:
+            joins = {}
+        join = joins.get(str(group_id)) if isinstance(joins, dict) else None
+        if isinstance(join, dict):
+            inviter = str(join.get("inviter") or "").strip()
+            if inviter:
+                return inviter
+        if invite_records is None:
+            try:
+                invite_records = await self.get_kv_data("invite_records", {})
+            except Exception:
+                invite_records = {}
+        relevant = [
+            rec for rec in self._normalize_invite_records(invite_records).get(str(group_id), [])
+            if str(rec.get("target_state") or "") != "NOT_FOR_BOT"
+        ]
+        if not relevant:
+            return ""
+        latest = max(relevant, key=lambda rec: int(rec.get("time") or 0))
+        return self._record_inviter(latest)
+
+    async def _record_join(
+        self, group_id: str, operator_id: str, request_key: str = "", inviter: str = ""
+    ) -> None:
+        """记录机器人进群及其关联邀请。"""
         group_id = str(group_id or "").strip()
         if not group_id:
             return
@@ -1100,6 +1604,8 @@ class GroupInviteGuardPlugin(Star):
         records[group_id] = {
             "time": int(time.time()),
             "operator": str(operator_id or "").strip(),
+            "request_key": str(request_key or "").strip(),
+            "inviter": str(inviter or "").strip(),
         }
         if len(records) > 100:
             def _join_ts(item):
@@ -1145,6 +1651,8 @@ class GroupInviteGuardPlugin(Star):
 
     @filter.custom_filter(GroupMuteFilter)
     async def on_group_mute(self, event: AstrMessageEvent):
+        if not self._cfg("basic", "enable", True):
+            return
         if not self._cfg("mute_revenge", "mute_retaliation_enable", False):
             return
 
@@ -1219,8 +1727,7 @@ class GroupInviteGuardPlugin(Star):
             except Exception as exc:
                 logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
                 invite_records = {}
-            latest_rec = self._latest_invite_record(invite_records, group_id)
-            inviter_qq = str(self._record_inviter(latest_rec) or "").strip()
+            inviter_qq = await self._admission_inviter(group_id, invite_records)
             if inviter_qq:
                 targets.append(inviter_qq)
 
@@ -1265,7 +1772,8 @@ class GroupInviteGuardPlugin(Star):
         return False
 
     async def _ask_llm(
-        self, inviter_qq: str, group_id: str, comment: str, bot=None, platform_id: str = None
+        self, inviter_qq: str, group_id: str, comment: str, bot=None,
+        platform_id: str = None, request_key: str = "",
     ) -> dict:
         provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
         if not provider_id:
@@ -1275,7 +1783,9 @@ class GroupInviteGuardPlugin(Star):
         persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
         system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
 
-        context, alt_warning = await self._build_invite_context(inviter_qq, group_id, bot, comment)
+        context, alt_warning = await self._build_invite_context(
+            inviter_qq, group_id, bot, comment, request_key=request_key
+        )
         prompt = (
             f"收到一个加群邀请：\n"
             f"邀请人 QQ：{inviter_qq}\n"
@@ -1326,8 +1836,11 @@ class GroupInviteGuardPlugin(Star):
             return ""
         return str(getattr(persona, "system_prompt", "") or "").strip()
 
-    async def _build_invite_context(self, inviter_qq: str, group_id: str, bot, comment: str = ""):
-        """收集画像/成员列表/历史印象/小号提示，拼成给 LLM 参考的背景信息；返回 (context, alt_warning)。"""
+    async def _build_invite_context(
+        self, inviter_qq: str, group_id: str, bot, comment: str = "",
+        request_key: str = "",
+    ):
+        """收集画像/成员列表/历史印象/小号提示，拼成给 LLM 参考的背景信息。"""
         # 成员列表与历史印象互不依赖，并发拉取；单个失败按空处理
         async def _member():
             if self._cfg("decision", "enable_member_context", True):
@@ -1349,8 +1862,12 @@ class GroupInviteGuardPlugin(Star):
         if self._cfg("decision", "use_profile_plugin", True):
             profile_section = await self._fetch_external_profile(inviter_qq)
         if not profile_section:
-            profile_section = await self._build_profile_section(inviter_qq, speaker_count)
-        alt_warning = await self._detect_alt_account(inviter_qq, comment, bot)
+            profile_section = await self._build_profile_section(
+                inviter_qq, speaker_count, exclude_request_key=request_key
+            )
+        alt_warning = await self._detect_alt_account(
+            inviter_qq, comment, bot, exclude_request_key=request_key
+        )
 
         sections = [s for s in (profile_section, member_section, impression_section) if s]
 
@@ -1363,8 +1880,8 @@ class GroupInviteGuardPlugin(Star):
             context = f"{alt_warning}\n\n{context}" if context else alt_warning
         return context, alt_warning
 
-    async def _collect_profile_data(self, qq: str) -> dict:
-        """汇总某 QQ 的画像原始数据：纯本地 kv / 黑名单读取，不调 LLM、不发网络请求。决策版与完整版画像共用。"""
+    async def _collect_profile_data(self, qq: str, exclude_request_key: str = "") -> dict:
+        """汇总某 QQ 的本地画像数据，可排除正在审核的邀请。"""
         qq = str(qq or "").strip()
         data = {
             "qq": qq,
@@ -1396,6 +1913,7 @@ class GroupInviteGuardPlugin(Star):
             for gid, recs in normalized.items()
             for rec in recs
             if self._record_inviter(rec) == qq
+            and str(rec.get("request_key") or "") != exclude_request_key
         ]
         data["invited"] = invited
         data["operated"] = [
@@ -1494,15 +2012,17 @@ class GroupInviteGuardPlugin(Star):
                 return external
         return await self._build_full_profile(qq, bot)
 
-    async def _build_profile_section(self, inviter_qq: str, speaker_count: int) -> str:
-        """邀请人画像（决策用精简版）：完全用本地 kv / 黑名单配置拼装，不调 LLM、不发网络请求；全空返回空。"""
+    async def _build_profile_section(
+        self, inviter_qq: str, speaker_count: int, exclude_request_key: str = ""
+    ) -> str:
+        """邀请人画像（决策用精简版）；全空返回空。"""
         if not self._cfg("decision", "enable_user_profile", True):
             return ""
         qq = str(inviter_qq or "").strip()
         if not qq:
             return ""
 
-        data = await self._collect_profile_data(qq)
+        data = await self._collect_profile_data(qq, exclude_request_key)
         invited = [gid for gid, _ in data["invited"]]
 
         lines = []
@@ -1622,8 +2142,10 @@ class GroupInviteGuardPlugin(Star):
             threshold = 70
         return max(0, min(100, threshold))
 
-    async def _alt_similarity_candidates(self, inviter_qq: str, comment: str, bot) -> list:
-        """计算邀请人与每个黑名单用户的附言/昵称相似度，返回 [(黑名单QQ, 相似度, 维度)] 按相似度降序；黑名单为空直接返回 []，零开销。"""
+    async def _alt_similarity_candidates(
+        self, inviter_qq: str, comment: str, bot, exclude_request_key: str = ""
+    ) -> list:
+        """计算邀请人与黑名单用户的附言/昵称相似度。"""
         config, _ = self._get_ban_config()
         if config is None:
             return []
@@ -1660,6 +2182,8 @@ class GroupInviteGuardPlugin(Star):
             normalized = self._normalize_invite_records(records)
             for recs in normalized.values():
                 for rec in recs:
+                    if str(rec.get("request_key") or "") == exclude_request_key:
+                        continue
                     uid = self._record_inviter(rec)
                     if uid in banned_qqs:
                         c = str(rec.get("comment") or "").strip()
@@ -1697,11 +2221,15 @@ class GroupInviteGuardPlugin(Star):
             low = 40
         return max(0, min(100, low))
 
-    async def _detect_alt_account(self, inviter_qq: str, comment: str, bot) -> str:
-        """小号识别：新邀请人与黑名单用户做附言/昵称相似度比较；命中阈值返回醒目提示行，灰色区间交 LLM 复判，否则空。"""
+    async def _detect_alt_account(
+        self, inviter_qq: str, comment: str, bot, exclude_request_key: str = ""
+    ) -> str:
+        """识别邀请人是否疑似黑名单用户的小号。"""
         if not _as_bool(self._cfg("alt_detect", "alt_account_detect", True)):
             return ""
-        candidates = await self._alt_similarity_candidates(inviter_qq, comment, bot)
+        candidates = await self._alt_similarity_candidates(
+            inviter_qq, comment, bot, exclude_request_key
+        )
         if not candidates:
             return ""
         best_uid, best_sim, best_dim = candidates[0]
@@ -2169,39 +2697,124 @@ class GroupInviteGuardPlugin(Star):
                     return True
             except Exception:
                 continue
-        return False
-
-    async def _call_action(self, bot: Any, action: str, **params: Any) -> Any:
-        method = getattr(bot, action, None)
-        if callable(method):
-            result = method(**params)
-            return await result if inspect.isawaitable(result) else result
-        for name in ("call_action", "call_api"):
-            fn = getattr(bot, name, None)
-            if callable(fn):
-                result = fn(action, **params)
-                return await result if inspect.isawaitable(result) else result
-        raise RuntimeError(f"no usable OneBot action caller for {action}")
-
-    async def _verify_self_in_group(self, bot: Any, group_id: str, self_id: str = "") -> bool:
-        """核实机器人是否已在群内；查询失败按不在群处理。"""
         try:
-            uid = str(self_id or "").strip()
-            if not uid:
-                info = await self._call_action(bot, "get_login_info")
-                uid = str(_get_value(info, "user_id") or "")
-            if not uid:
-                return False
-            await self._call_action(
-                bot,
-                "get_group_member_info",
-                group_id=int(group_id),
-                user_id=int(uid),
-                no_cache=True,
-            )
-            return True
+            return callable(getattr(getattr(obj, "api", None), "call_action", None))
         except Exception:
             return False
+
+    @staticmethod
+    def _unwrap_onebot_response(response: Any) -> Any:
+        if not isinstance(response, dict):
+            return response
+        is_wrapper = (
+            "retcode" in response
+            or "status" in response
+            or (
+                "data" in response
+                and any(key in response for key in ("msg", "message", "wording"))
+            )
+        )
+        if not is_wrapper:
+            return response
+        status = str(response.get("status") or "").strip().lower()
+        retcode = response.get("retcode")
+        try:
+            retcode_failed = retcode is not None and int(retcode) != 0
+        except (TypeError, ValueError):
+            retcode_failed = bool(str(retcode or "").strip())
+        if status in ("failed", "failure", "error") or retcode_failed:
+            message = response.get("message") or response.get("msg") or ""
+            wording = response.get("wording") or ""
+            raise RuntimeError(
+                "OneBot action failed: "
+                f"status={status or '-'}, retcode={retcode!r}, "
+                f"message={message or '-'}, wording={wording or '-'}"
+            )
+        return response.get("data")
+
+    @staticmethod
+    def _is_unsupported_action_error(exc: Exception) -> bool:
+        if isinstance(exc, AttributeError):
+            return True
+        text = str(exc or "").strip().lower()
+        marks = (
+            "unsupported method", "method not supported", "not implemented",
+            "no such action", "unknown action", "api not found",
+            "接口不存在", "方法不存在", "不支持此接口", "不支持的api",
+        )
+        return any(mark in text for mark in marks)
+
+    async def _invoke_action(self, fn, action: str | None, params: dict) -> Any:
+        result = fn(**params) if action is None else fn(action, **params)
+        result = await result if inspect.isawaitable(result) else result
+        return self._unwrap_onebot_response(result)
+
+    async def _call_action(self, bot: Any, action: str, **params: Any) -> Any:
+        unsupported_error = None
+        method = getattr(bot, action, None)
+        if callable(method):
+            try:
+                return await self._invoke_action(method, None, params)
+            except Exception as exc:
+                if not self._is_unsupported_action_error(exc):
+                    raise
+                unsupported_error = exc
+
+        for name in ("call_action", "call_api"):
+            fn = getattr(bot, name, None)
+            if not callable(fn):
+                continue
+            try:
+                return await self._invoke_action(fn, action, params)
+            except Exception as exc:
+                if not self._is_unsupported_action_error(exc):
+                    raise
+                unsupported_error = exc
+
+        api_call = getattr(getattr(bot, "api", None), "call_action", None)
+        if callable(api_call):
+            return await self._invoke_action(api_call, action, params)
+        if unsupported_error is not None:
+            raise unsupported_error
+        raise RuntimeError(f"no usable OneBot action caller for {action}")
+
+    async def _membership_state(self, bot: Any, group_id: str, self_id: str = "") -> str:
+        """返回 IN / OUT / UNKNOWN；查询异常绝不当作 OUT。"""
+        if bot is None or not str(group_id or "").strip():
+            return "UNKNOWN"
+        uid = str(self_id or "").strip()
+        if not uid:
+            try:
+                info = await self._call_action(bot, "get_login_info")
+                uid = str(_get_value(info, "user_id") or "").strip()
+            except Exception:
+                uid = ""
+        if uid:
+            try:
+                await self._call_action(
+                    bot, "get_group_member_info", group_id=int(group_id),
+                    user_id=int(uid), no_cache=True,
+                )
+                return "IN"
+            except Exception:
+                pass
+        try:
+            groups = await self._call_action(bot, "get_group_list", no_cache=True)
+            if isinstance(groups, dict):
+                groups = groups.get("data", groups.get("groups"))
+            if not isinstance(groups, list):
+                return "UNKNOWN"
+            group_ids = {
+                str(_get_value(item, "group_id") or "").strip()
+                for item in groups
+            }
+            return "IN" if str(group_id) in group_ids else "OUT"
+        except Exception:
+            return "UNKNOWN"
+
+    async def _verify_self_in_group(self, bot: Any, group_id: str, self_id: str = "") -> bool:
+        """旧内部接口兼容。"""
+        return await self._membership_state(bot, group_id, self_id) == "IN"
 
     async def _send_ban_notice(self, bot, qq: str) -> str:
         """拉黑前给邀请人发一条自定义私聊消息；未配置则跳过。"""
@@ -2294,118 +2907,100 @@ class GroupInviteGuardPlugin(Star):
         result.sort(key=lambda r: int(r.get("time") or 0), reverse=True)
         return result
 
+    async def _mutate_invite_records(self, mutate) -> bool:
+        async with self._invite_lock("_invite_kv_lock"):
+            try:
+                records = await self.get_kv_data("invite_records", {})
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
+                records = {}
+            records = self._normalize_invite_records(records)
+            if not mutate(records):
+                return False
+            try:
+                await self.put_kv_data("invite_records", records)
+                return True
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: save invite_records failed: {exc}")
+                return False
+
     async def _record_invite(
-        self,
-        group_id: str,
-        inviter_qq: str,
-        comment: str = "",
-        action: str = "",
-        record_id: str = "",
-        **extra,
-    ) -> None:
-        """追加一条邀请记录（同群保留历史），并继承旧记录的 dealt 状态。"""
-        group_id = str(group_id or "").strip()
+        self, group_id: str, inviter_qq: str, comment: str = "", action: str = "",
+        record_id: str = "", **extra,
+    ) -> bool:
+        """追加一条邀请记录；未知群号或邀请人也不会丢失。"""
+        storage_group = str(group_id or "").strip() or "(未知群)"
         inviter_qq = str(inviter_qq or "").strip()
-        if not group_id or not inviter_qq:
-            return
-        try:
-            records = await self.get_kv_data("invite_records", {})
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
-            records = {}
-        records = self._normalize_invite_records(records)
 
-        # 同群旧记录：若邀请人相同且已拉黑，新记录继承标记
-        old_dealt = False
-        old_dealt_time = 0
-        for old in records.get(group_id, []):
-            if self._record_inviter(old) == inviter_qq:
-                if _as_bool(old.get("dealt")):
-                    old_dealt = True
-                    old_dealt_time = int(old.get("dealt_time") or 0)
-                break
+        def mutate(records):
+            old_dealt = False
+            old_dealt_time = 0
+            if inviter_qq:
+                for old in records.get(storage_group, []):
+                    if self._record_inviter(old) == inviter_qq and _as_bool(old.get("dealt")):
+                        old_dealt = True
+                        old_dealt_time = int(old.get("dealt_time") or 0)
+                        break
+            now = int(time.time())
+            new_record = {
+                "inviter": inviter_qq,
+                "comment": str(comment or "").strip(),
+                "time": now,
+                "action": str(action or "").strip(),
+                "record_id": str(record_id or uuid.uuid4().hex[:8]),
+            }
+            if old_dealt:
+                new_record["dealt"] = True
+                new_record["dealt_time"] = old_dealt_time or now
+            for key, value in extra.items():
+                if key not in new_record:
+                    new_record[key] = value
+            records.setdefault(storage_group, []).append(new_record)
+            return True
 
-        now = int(time.time())
-        new_record = {
-            "inviter": inviter_qq,
-            "comment": str(comment or "").strip(),
-            "time": now,
-            "action": str(action or "").strip(),
-            "record_id": str(record_id or uuid.uuid4().hex[:8]),
-        }
-        if old_dealt:
-            new_record["dealt"] = True
-            new_record["dealt_time"] = old_dealt_time or now
-        for k, v in extra.items():
-            if k not in new_record:
-                new_record[k] = v
-
-        records.setdefault(group_id, []).append(new_record)
-        try:
-            await self.put_kv_data("invite_records", records)
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: save invite_records failed: {exc}")
+        return await self._mutate_invite_records(mutate)
 
     async def _update_invite_record(
-        self,
-        group_id: str,
-        record_id: str,
-        **fields,
-    ) -> None:
-        """按 record_id 更新某条邀请记录；找不到则忽略。"""
-        group_id = str(group_id or "").strip()
+        self, group_id: str, record_id: str, **fields,
+    ) -> bool:
+        """按 record_id 更新某条邀请记录。"""
+        storage_group = str(group_id or "").strip() or "(未知群)"
         record_id = str(record_id or "").strip()
-        if not group_id or not record_id:
+        if not record_id:
             return
-        try:
-            records = await self.get_kv_data("invite_records", {})
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
-            return
-        records = self._normalize_invite_records(records)
-        changed = False
-        for rec in records.get(group_id, []):
-            if str(rec.get("record_id") or "") == record_id:
-                rec.update(fields)
-                changed = True
-                break
-        if not changed:
-            return
-        try:
-            await self.put_kv_data("invite_records", records)
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: save invite_records failed: {exc}")
+
+        def mutate(records):
+            for rec in records.get(storage_group, []):
+                if str(rec.get("record_id") or "") == record_id:
+                    rec.update(fields)
+                    return True
+            return False
+
+        return await self._mutate_invite_records(mutate)
 
     async def _mark_inviter_dealt(self, inviter_qq: str, dealt: bool = True) -> None:
-        """给该邀请人的所有邀请记录打上/清除「已拉黑」标记（一人可能邀请多群）。"""
+        """给该邀请人的所有邀请记录打上或清除已拉黑标记。"""
         inviter_qq = str(inviter_qq or "").strip()
         if not inviter_qq:
             return
-        try:
-            records = await self.get_kv_data("invite_records", {})
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
-            return
-        records = self._normalize_invite_records(records)
-        changed = False
-        now = int(time.time())
-        for recs in records.values():
-            for rec in recs:
-                if self._record_inviter(rec) != inviter_qq:
-                    continue
-                if dealt:
-                    rec["dealt"] = True
-                    rec["dealt_time"] = int(rec.get("dealt_time") or now)
-                else:
-                    rec.pop("dealt", None)
-                    rec.pop("dealt_time", None)
-                changed = True
-        if not changed:
-            return
-        try:
-            await self.put_kv_data("invite_records", records)
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: save invite_records failed: {exc}")
+
+        def mutate(records):
+            changed = False
+            now = int(time.time())
+            for recs in records.values():
+                for rec in recs:
+                    if self._record_inviter(rec) != inviter_qq:
+                        continue
+                    if dealt:
+                        rec["dealt"] = True
+                        rec["dealt_time"] = int(rec.get("dealt_time") or now)
+                    else:
+                        rec.pop("dealt", None)
+                        rec.pop("dealt_time", None)
+                    changed = True
+            return changed
+
+        await self._mutate_invite_records(mutate)
 
     def _get_ban_config(self):
         """读取 qq_tools 配置；返回 (config, err)。err 为空表示成功。"""
@@ -2497,27 +3092,30 @@ class GroupInviteGuardPlugin(Star):
         ]
         return "\n".join(lines)
 
-    def _compose_note(self, inviter_qq, group_id, comment, action, reason, reply="", reply_status="", alt_warning="", result_label="") -> str:
+    def _compose_note(
+        self, inviter_qq, group_id, comment, action, reason, reply="",
+        reply_status="", alt_warning="", result_label="",
+        membership_before="UNKNOWN", membership_after="UNKNOWN", protocol_error="",
+    ) -> str:
         action_label = {
-            "approve": "同意加入",
-            "reject": "拒绝",
-            "unknown": "判断失败（未处理）",
-            "skipped": "未调用（机器人已先入群）",
+            "approve": "同意加入", "reject": "拒绝", "unknown": "判断失败（未处理）",
         }.get(action, action)
         lines = [
             "[加群邀请通知]",
             f"邀请人 QQ：{inviter_qq or '未知（协议端未识别）'}",
-            f"群号：{group_id}",
+            f"群号：{group_id or '(未知)'}",
             f"附言：{comment or '(无)'}",
             f"LLM 决策：{action_label}",
             f"实际执行：{result_label or '未记录'}",
+            f"成员状态：审核前 {membership_before} / 执行前后 {membership_after}",
         ]
         if reason:
-            lines.append(f"理由：{reason}")
+            lines.append(f"审核理由：{reason}")
+        if protocol_error:
+            lines.append(f"异常原因：{protocol_error}")
         if reply:
-            # 发给邀请人的原文让管理员可见；邀请人只看到这条简短回复
             status = f"（{reply_status}）" if reply_status else ""
-            lines.append(f"回复邀请人{status}：{reply}")
+            lines.append(f"邀请人话术{status}：{reply}")
         if alt_warning:
             lines.append(alt_warning)
         return "\n".join(lines)
@@ -2603,7 +3201,13 @@ class GroupInviteGuardPlugin(Star):
             comment = str(rec.get("comment") or "").strip() or "(无附言)"
             action = str(rec.get("action") or "").strip() or "-"
             status_text, _ = _invite_status_label(action, dealt)
-            lines.append(f"群 {gid} -> {inviter} | {ts} | [{status_text}] | {comment}")
+            before = str(rec.get("membership_before") or "-")
+            after = str(rec.get("membership_after") or "-")
+            execution = str(rec.get("execution_state") or "旧记录")
+            lines.append(
+                f"群 {gid} -> {inviter} | {ts} | [{status_text}] "
+                f"| 成员 {before}→{after} | {execution} | {comment}"
+            )
         if not lines:
             return "暂无邀请记录"
         return "\n".join(lines)
@@ -2672,6 +3276,11 @@ class GroupInviteGuardPlugin(Star):
                         "dealt": dealt,
                         "status_text": status_text,
                         "status_class": status_class,
+                        "execution": str(rec.get("execution_state") or "旧记录"),
+                        "membership": (
+                            f"{rec.get('membership_before') or '-'}→"
+                            f"{rec.get('membership_after') or '-'}"
+                        ),
                         "avatar": "",
                         "nickname": "",
                         "gavatar": "",
@@ -2930,7 +3539,9 @@ class GroupInviteGuardPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=9999)
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=9999)
     async def on_blacklist_message_guard(self, event: AstrMessageEvent):
-        """兜底拦截：被拉黑用户发来的群聊/私聊消息直接停止传播，避免 bot 继续回复。"""
+        """兜底拦截：被拉黑用户发来的群聊/私聊消息直接停止传播。"""
+        if not self._cfg("basic", "enable", True):
+            return
         if not _as_bool(self._cfg("kick_revenge", "intercept_banned_messages", True)):
             return
         sender_id = event.get_sender_id()

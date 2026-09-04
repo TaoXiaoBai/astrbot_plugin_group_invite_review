@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.16.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.17.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -17,10 +17,12 @@
 ## 功能一览
 
 **进群决策**
-- 捕获加群邀请，由 LLM（人格 + 群成员 + 历史印象 + 邀请人画像）判断同意/拒绝
+- 收到针对 bot 的邀请后立即持久化，再收集上下文、调用 LLM、执行前复核成员状态，最后同意或拒绝
+- 外部动作前持久化执行中状态；重启遇到未确认动作只对账和通知，不自动重放
+- bot 已提前入群或审核期间入群也不会跳过 LLM；LLM 拒绝时可仅通知、直接退群或发自定义消息后退群
 - 三种处理模式：自动同意 / 自动拒绝 / 仅通知管理员（默认）
-- 决策时顺便以人格身份私聊回复邀请人一句（同意的招呼 / 委婉拒绝），管理员通知里附回复原文
-- 决策附邀请人画像：历史邀请次数、黑名单前科、活跃度（纯本地数据，不额外调 LLM）
+- 审批或补偿结果确定后才按人格私聊邀请人；动作失败时不会发送承诺成功的话术
+- 决策附邀请人画像：历史邀请次数、黑名单前科、活跃度，并排除当前审核记录（纯本地数据，不额外调 LLM）
 - 抓到邀请人历史发言原话时，由 LLM 浓缩成一段 100 字内的印象小结（按发言条数缓存，陌生人零开销）
 - 小号识别：被拉黑的人换号再来？附言/昵称相似度命中即在决策上下文和通知里提示"疑似小号"；相似度处于灰色区间时再交 LLM 复判一次（结论缓存 7 天）
 - 私聊里问"能不能加群"、直接甩邀请链接，也能识别并回复/通知
@@ -50,7 +52,7 @@
 
 > `/手动拉黑` 兼容旧用法 `/手动拉黑 <QQ> <群号>`（指定退哪个群）。各命令的详细行为见配置页分组说明。
 
-插件被禁用时只记录邀请、不接管事件。
+插件被禁用时只记录邀请；不会自动审批、退群、拉黑或拦截，管理员显式手动命令与查询仍可用。
 
 ## 安装
 
@@ -91,7 +93,7 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | --- | --- | --- |
 | `auto_approve` | `false` | 判断要加时自动同意进群 |
 | `auto_reject` | `false` | 判断不要加时自动拒绝 |
-| `reply_inviter_on_decision` | `true` | 同意/拒绝邀请时，先私聊回复邀请人一句再处理 |
+| `reply_inviter_on_decision` | `true` | 审批/退群结果确定且成功后私聊邀请人 |
 | `llm_provider_id` | `""` | 判断用的模型（留空用默认） |
 | `decision_persona` | `""` | 决策用人格（留空用默认人格） |
 | `enable_member_context` | `true` | 参考目标群成员 |
@@ -99,6 +101,13 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `impression_llm_summary` | `true` | 抓到发言原话时生成 LLM 印象小结（按发言条数缓存） |
 | `enable_user_profile` | `true` | 决策时附邀请人画像（本地记录，不额外调 LLM） |
 | `truncate_marker` | `…` | 截断占位符 |
+
+**异常提前入群 `unexpected_join`**
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
+| `mode` | `notify_only` | LLM 拒绝但 bot 已入群时：`notify_only` / `leave` / `message_then_leave` |
+| `custom_leave_message` | `""` | `message_then_leave` 模式退群前发送；发送失败仍会继续退群 |
 
 **小号识别 `alt_detect`**
 
