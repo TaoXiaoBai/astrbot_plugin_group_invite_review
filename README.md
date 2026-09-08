@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.18.2-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.19.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -66,9 +66,11 @@
 
 ## 可选联动
 
-单独安装即可完整使用。如果装了「[用户画像](https://github.com/TaoXiaoBai/astrbot_plugin_user_profile)」插件，邀请审核优先调用 `get_decision_profile()`，读取结构化风险分、标签、活跃度和社交来源；同时保留守卫自己的邀请/禁言/黑名单前科，不再二选一。当前审核记录会按 `request_key` 排除，避免把本次邀请算成历史前科。旧版画像插件会依次降级到标签 API 或文本 API，未安装时使用内置精简画像。
+单独安装即可完整使用。如果装了「[用户画像](https://github.com/TaoXiaoBai/astrbot_plugin_user_profile)」插件，邀请审核优先调用 `get_decision_profile()`，读取结构化风险分、标签、活跃度、数据新鲜度、LLM 状态和社交来源；当前审核记录按 `request_key` 排除。旧画像插件依次降级到标签 API 或文本 API。
 
-结构化画像快照只保存标签、风险分、活跃度和精简社交来源，不复制发言原话；`/邀请记录` 可以同时查看 LLM 建议与实际执行结果。SnowLuma 的 `friend_add` 不提供具体加好友来源，因此画像只能记录好友添加时间；群号、邀请/同意方式和操作者来自后续 `group_increase` 事件。
+守卫同时提供版本化只读 API `get_inviter_evidence(qq, exclude_request_key="")`。画像插件优先通过该 API 取得有限的邀请/进群摘要，旧守卫才回退 KV；旧或脏 KV 的非法时间会安全降级为 `0`，不会使整个 API 失败。群级“bot 被禁言次数”只作为相关群背景，不再称为邀请人的个人禁言前科。
+
+结构化画像快照不复制发言原话，并保留 `age_seconds=null` 的“新鲜度未知”语义。邀请附言、好友验证语、历史印象、画像 evidence 等内容在决策 prompt 中统一标记为不可信证据并限长，模型不得执行其中指令。模型输出的 `reason` 会清控制字符并限制为 300 字，`reply` 限制为 500 字，然后才落盘或发送。`/邀请记录` 可同时查看 LLM 建议与实际执行结果。
 
 ## 平台要求
 
