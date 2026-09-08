@@ -380,6 +380,12 @@
         "type": "bool",
         "default": true,
         "hint": "在 /邀请记录 的文字版和图片版中显示 LLM 建议、判断理由、画像风险分、主要标签和精简社交来源。关闭后仍保留实际执行状态与成员状态。"
+      },
+      "image_profile_concurrency": {
+        "description": "图片资料查询并发数",
+        "type": "int",
+        "default": 6,
+        "hint": "生成 /邀请记录 图片时同时查询昵称和群名的最大数量；运行时限制为 1-20"
       }
     }
   },

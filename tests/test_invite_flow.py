@@ -1,9 +1,10 @@
 import asyncio
 import copy
+import json
 import sys
 import types
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 def _identity_decorator(*args, **kwargs):
@@ -169,13 +170,17 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             },
         }
         plugin._kv = {}
+        plugin.get_calls = []
+        plugin.put_calls = []
         plugin.fail_put_states = {}
         plugin.put_delay = 0
 
         async def get_kv(key, default):
+            plugin.get_calls.append(key)
             return copy.deepcopy(plugin._kv.get(key, default))
 
         async def put_kv(key, value):
+            plugin.put_calls.append(key)
             if plugin.put_delay:
                 await asyncio.sleep(plugin.put_delay)
             if key == "invite_records":
@@ -864,6 +869,781 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(path, "record.png")
         plugin._fetch_nickname.assert_awaited_once_with(unittest.mock.ANY, "20000")
         plugin._fetch_group_name.assert_awaited_once_with(unittest.mock.ANY, "30000")
+
+    async def test_inviter_history_reuses_query_without_expanding_impression_scope(self):
+        plugin = self.make_plugin()
+        conversations = [
+            types.SimpleNamespace(
+                history=json.dumps([{
+                    "role": "user",
+                    "content": f"昵称{i} (ID: 20000): 原话{i}",
+                }], ensure_ascii=False)
+            )
+            for i in range(1, 11)
+        ]
+        manager = types.SimpleNamespace(
+            get_filtered_conversations=AsyncMock(return_value=(conversations, 10))
+        )
+        plugin.context = types.SimpleNamespace(conversation_manager=manager)
+        lines, quotes = await plugin._search_inviter_history("20000")
+        self.assertEqual(manager.get_filtered_conversations.await_count, 1)
+        self.assertEqual(
+            manager.get_filtered_conversations.await_args.kwargs["page_size"], 10
+        )
+        self.assertTrue(any("原话5" in line for line in lines))
+        self.assertFalse(any("原话6" in line for line in lines))
+        self.assertFalse(any("原话10" in line for line in lines))
+        self.assertEqual(quotes, [f"原话{i}" for i in range(1, 11)])
+
+    async def test_speaker_history_stops_scanning_at_twenty_quotes(self):
+        plugin = self.make_plugin()
+        first_history = json.dumps([{
+            "role": "user",
+            "content": "\n".join(
+                f"昵称 (ID: 20000): 原话{i}" for i in range(1, 21)
+            ),
+        }], ensure_ascii=False)
+
+        class UnreadableConversation:
+            @property
+            def history(self):
+                raise AssertionError("speaker scan continued after reaching 20")
+
+        conversations = [types.SimpleNamespace(history=first_history)]
+        conversations.extend(types.SimpleNamespace(history="[]") for _ in range(4))
+        conversations.append(UnreadableConversation())
+        plugin.context = types.SimpleNamespace(
+            conversation_manager=types.SimpleNamespace(
+                get_filtered_conversations=AsyncMock(
+                    return_value=(conversations, len(conversations))
+                )
+            )
+        )
+        _, quotes = await plugin._search_inviter_history("20000")
+        self.assertEqual(quotes, [f"原话{i}" for i in range(1, 21)])
+
+    async def test_invite_snapshot_avoids_duplicate_invite_kv_read(self):
+        plugin = self.make_plugin()
+        snapshot = {"30000": [{"inviter": "20000", "request_key": "old"}]}
+        data = await plugin._collect_profile_data(
+            "20000", "current", invite_records=snapshot
+        )
+        self.assertEqual(data["invited"][0][0], "30000")
+        self.assertNotIn("invite_records", plugin.get_calls)
+        self.assertCountEqual(plugin.get_calls, ["join_records", "mute_records"])
+
+    async def test_context_snapshot_sees_other_request_latest_terminal_state(self):
+        plugin = self.make_plugin()
+        plugin.config["decision"].update({
+            "enable_member_context": False,
+            "enable_impression_context": False,
+            "enable_user_profile": True,
+            "use_profile_plugin": False,
+        })
+        plugin.config["alt_detect"] = {"alt_account_detect": False}
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+
+        async def get_kv(key, default):
+            plugin.get_calls.append(key)
+            if key == "invite_records":
+                snapshot_started.set()
+                await release_snapshot.wait()
+            return copy.deepcopy(plugin._kv.get(key, default))
+
+        plugin.get_kv_data = get_kv
+        plugin._kv["invite_records"] = {
+            "30000": [{
+                "inviter": "20000",
+                "request_key": "current",
+                "execution_state": "REVIEWING",
+            }]
+        }
+        task = asyncio.create_task(plugin._build_invite_context(
+            "20000", "30000", None, request_key="current"
+        ))
+        await snapshot_started.wait()
+        plugin._kv["invite_records"]["30001"] = [{
+            "inviter": "20000",
+            "request_key": "other",
+            "decision": "reject",
+            "execution_state": "REJECTED",
+            "action": "自动拒绝",
+        }]
+        release_snapshot.set()
+        context, _, _ = await task
+        self.assertIn("历史邀请被拒绝 1 次", context)
+        self.assertIn("群：30001", context)
+        self.assertEqual(plugin.get_calls.count("invite_records"), 1)
+
+    async def test_context_gather_warns_for_noncritical_failure(self):
+        plugin = self.make_plugin()
+        plugin.config["decision"].update({
+            "enable_member_context": True,
+            "enable_impression_context": False,
+            "enable_user_profile": False,
+        })
+        plugin.config["alt_detect"] = {"alt_account_detect": False}
+        plugin._build_member_section = AsyncMock(
+            side_effect=RuntimeError("member context broke")
+        )
+        with patch("main.logger.warning") as warning:
+            context, alt_warning, snapshot = await plugin._build_invite_context(
+                "20000", "30000", None
+            )
+        self.assertEqual((context, alt_warning, snapshot), ("", "", {}))
+        self.assertTrue(any(
+            "member context failed" in str(call.args[0])
+            and "member context broke" in str(call.args[0])
+            for call in warning.call_args_list
+        ))
+
+    async def test_alt_detection_failure_warns_and_aborts_decision_context(self):
+        plugin = self.make_plugin()
+        plugin.config["decision"].update({
+            "enable_member_context": False,
+            "enable_impression_context": False,
+            "enable_user_profile": False,
+        })
+        plugin._detect_alt_account = AsyncMock(
+            side_effect=RuntimeError("alt detection broke")
+        )
+        with patch("main.logger.warning") as warning:
+            with self.assertRaisesRegex(RuntimeError, "alt detection broke"):
+                await plugin._build_invite_context("20000", "30000", None)
+        self.assertTrue(any(
+            "alt detection failed" in str(call.args[0])
+            for call in warning.call_args_list
+        ))
+
+    async def test_noop_invite_update_skips_write(self):
+        plugin = self.make_plugin()
+        plugin._kv["invite_records"] = {
+            "30000": [{"record_id": "same", "execution_state": "DECIDED"}]
+        }
+        saved = await plugin._update_invite_record(
+            "30000", "same", execution_state="DECIDED"
+        )
+        self.assertTrue(saved)
+        self.assertEqual(plugin.put_calls, [])
+
+    async def test_banned_inviter_index_is_cached_and_write_invalidates(self):
+        plugin = self.make_plugin()
+        plugin._find_ban_entry = Mock(return_value=None)
+        plugin._kv["invite_records"] = {
+            "30000": [{"record_id": "one", "inviter": "20000", "dealt": True}]
+        }
+        self.assertTrue((await plugin._is_user_banned("20000"))[0])
+        self.assertFalse((await plugin._is_user_banned("20001"))[0])
+        self.assertEqual(plugin.get_calls.count("invite_records"), 1)
+        await plugin._record_invite("30001", "20001", action="手动记录")
+        await plugin._is_user_banned("20001")
+        self.assertEqual(plugin.get_calls.count("invite_records"), 3)
+
+    async def test_banned_index_generation_blocks_stale_refill(self):
+        plugin = self.make_plugin()
+        plugin._find_ban_entry = Mock(return_value=None)
+        read_started = asyncio.Event()
+        release_read = asyncio.Event()
+        calls = 0
+
+        async def get_kv(key, default):
+            nonlocal calls
+            calls += 1
+            value = copy.deepcopy(plugin._kv.get(key, default))
+            if calls == 1:
+                read_started.set()
+                await release_read.wait()
+            return value
+
+        plugin.get_kv_data = get_kv
+        plugin._kv["invite_records"] = {}
+        stale_read = asyncio.create_task(plugin._is_user_banned("20000"))
+        await read_started.wait()
+        plugin._kv["invite_records"] = {
+            "30000": [{"inviter": "20000", "dealt": True}]
+        }
+        plugin._invalidate_derived_cache("banned_inviters")
+        release_read.set()
+        self.assertFalse((await stale_read)[0])
+        self.assertNotIn("banned_inviters", plugin._derived_cache)
+        self.assertTrue((await plugin._is_user_banned("20000"))[0])
+        self.assertEqual(calls, 2)
+
+    async def test_ban_context_generation_blocks_stale_refill(self):
+        plugin = self.make_plugin()
+        invite_started = asyncio.Event()
+        mute_started = asyncio.Event()
+        release_reads = asyncio.Event()
+        first_reads = {"invite_records": True, "mute_records": True}
+
+        async def get_kv(key, default):
+            value = copy.deepcopy(plugin._kv.get(key, default))
+            if first_reads.get(key):
+                first_reads[key] = False
+                (invite_started if key == "invite_records" else mute_started).set()
+                await release_reads.wait()
+            return value
+
+        plugin.get_kv_data = get_kv
+        plugin._kv = {"invite_records": {}, "mute_records": {}}
+        stale_read = asyncio.create_task(plugin._build_derived_ban_lines())
+        await asyncio.gather(invite_started.wait(), mute_started.wait())
+        plugin._kv = {
+            "invite_records": {"30000": [{"inviter": "20000"}]},
+            "mute_records": {"30000": 2},
+        }
+        plugin._invalidate_derived_cache("ban_context")
+        release_reads.set()
+        self.assertEqual(await stale_read, [])
+        self.assertNotIn("ban_context", plugin._derived_cache)
+        refreshed = await plugin._build_derived_ban_lines()
+        self.assertTrue(any("20000" in line for line in refreshed))
+        self.assertTrue(any("2 次" in line for line in refreshed))
+
+    async def test_persona_and_context_load_concurrently(self):
+        plugin = self.make_plugin()
+        persona_entered = asyncio.Event()
+        context_entered = asyncio.Event()
+
+        async def persona(*args):
+            persona_entered.set()
+            await context_entered.wait()
+            return "人格"
+
+        async def context(*args, **kwargs):
+            context_entered.set()
+            await persona_entered.wait()
+            return "背景", "", {}
+
+        plugin._resolve_persona_prompt = persona
+        plugin._build_invite_context = context
+        plugin._default_provider_id = lambda: "provider"
+        plugin.context = types.SimpleNamespace(
+            llm_generate=AsyncMock(
+                return_value=types.SimpleNamespace(
+                    completion_text='{"action":"approve","reason":"ok"}'
+                )
+            )
+        )
+        result = await plugin._ask_llm("20000", "30000", "hello")
+        self.assertEqual(result["action"], "approve")
+
+    async def test_same_impression_summary_is_singleflight(self):
+        plugin = self.make_plugin()
+        plugin._default_provider_id = lambda: "provider"
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def generate(**kwargs):
+            entered.set()
+            await release.wait()
+            return types.SimpleNamespace(completion_text="可靠用户")
+
+        plugin.context = types.SimpleNamespace(llm_generate=AsyncMock(side_effect=generate))
+        first = asyncio.create_task(plugin._summarize_impression("20000", ["你好"]))
+        await entered.wait()
+        second = asyncio.create_task(plugin._summarize_impression("20000", ["你好"]))
+        await asyncio.sleep(0)
+        release.set()
+        self.assertEqual(await asyncio.gather(first, second), ["可靠用户", "可靠用户"])
+        self.assertEqual(plugin.context.llm_generate.await_count, 1)
+
+    async def test_singleflight_cleans_after_all_waiters_cancel(self):
+        plugin = self.make_plugin()
+        loop = asyncio.get_running_loop()
+        unhandled = []
+        old_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+        try:
+            for should_fail in (False, True):
+                entered = asyncio.Event()
+                release = asyncio.Event()
+
+                async def factory(fail=should_fail):
+                    entered.set()
+                    await release.wait()
+                    if fail:
+                        raise RuntimeError("factory failed")
+                    return "ok"
+
+                first = asyncio.create_task(plugin._singleflight("cancelled", factory))
+                second = asyncio.create_task(plugin._singleflight("cancelled", factory))
+                await entered.wait()
+                first.cancel()
+                second.cancel()
+                await asyncio.gather(first, second, return_exceptions=True)
+                release.set()
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                    if not getattr(plugin, "_llm_flights", {}):
+                        break
+                self.assertEqual(getattr(plugin, "_llm_flights", {}), {})
+            await asyncio.sleep(0)
+            self.assertEqual(unhandled, [])
+        finally:
+            loop.set_exception_handler(old_handler)
+
+    async def test_inflight_is_released_when_early_finish_fails(self):
+        plugin = self.make_plugin()
+        plugin._finish_not_for_bot = AsyncMock(side_effect=RuntimeError("write failed"))
+        plugin._mark_processing_failure = AsyncMock()
+        event = FakeEvent(self.raw(invited_id=99999), FakeBot())
+        await plugin.on_group_invite(event)
+        self.assertEqual(getattr(plugin, "_invite_inflight", set()), set())
+        plugin._mark_processing_failure.assert_awaited_once()
+
+    async def test_image_profile_api_respects_concurrency_limit(self):
+        plugin = self.make_plugin()
+        plugin.config["display"] = {
+            "invite_records_show_profile": True,
+            "invite_records_show_group_profile": False,
+            "invite_records_hide_dealt": False,
+            "image_profile_concurrency": 2,
+        }
+        plugin._kv["invite_records"] = {
+            str(30000 + i): [{"inviter": str(20000 + i), "time": i}]
+            for i in range(6)
+        }
+        active = 0
+        peak = 0
+
+        async def nickname(bot, qq):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return qq
+
+        plugin._fetch_nickname = nickname
+        plugin.html_render = AsyncMock(return_value="limited.png")
+        self.assertEqual(await plugin._render_invite_records_image(FakeBot()), "limited.png")
+        self.assertEqual(peak, 2)
+
+    async def test_ban_context_caches_only_plugin_records(self):
+        plugin = self.make_plugin()
+        plugin._read_ban_entries = Mock(side_effect=[[("1", "a")], [("2", "b")]])
+        first = await plugin._build_ban_context_text()
+        second = await plugin._build_ban_context_text()
+        self.assertIn("QQ 1", first)
+        self.assertIn("QQ 2", second)
+        self.assertEqual(plugin.get_calls.count("invite_records"), 1)
+        self.assertEqual(plugin.get_calls.count("mute_records"), 1)
+
+    async def test_mute_kv_failure_rolls_back_fingerprint_and_stops_action(self):
+        plugin = self.make_plugin()
+        plugin.config["mute_revenge"] = {
+            "mute_retaliation_enable": True,
+            "mute_threshold": 1,
+            "mute_target": "operator",
+            "mute_ban_mode": "astrbot_ban",
+            "mute_notify": False,
+        }
+        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        original_put = plugin.put_kv_data
+        attempts = 0
+
+        async def put_kv(key, value):
+            nonlocal attempts
+            if key == "mute_records":
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("mute write failed")
+            await original_put(key, value)
+
+        plugin.put_kv_data = put_kv
+        bot = FakeBot()
+        raw = {
+            "group_id": 30000,
+            "user_id": 10000,
+            "operator_id": 20000,
+            "duration": 60,
+            "time": 100,
+            "sub_type": "ban",
+        }
+        await plugin.on_group_mute(FakeEvent(raw, bot))
+        self.assertNotIn("mute_records", plugin._kv)
+        self.assertEqual(bot.calls, [])
+        plugin._apply_mute_ban.assert_not_awaited()
+        self.assertNotIn(
+            plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
+        )
+
+        await plugin.on_group_mute(FakeEvent(dict(raw), bot))
+        self.assertEqual(plugin._kv["mute_records"], {})
+        self.assertEqual(
+            [name for name, _ in bot.calls if name == "set_group_leave"],
+            ["set_group_leave"],
+        )
+        plugin._apply_mute_ban.assert_awaited_once_with("20000", bot)
+
+    async def test_mute_kv_read_failure_rolls_back_without_overwrite_or_action(self):
+        plugin = self.make_plugin()
+        plugin.config["mute_revenge"] = {
+            "mute_retaliation_enable": True,
+            "mute_threshold": 3,
+            "mute_target": "operator",
+            "mute_ban_mode": "astrbot_ban",
+            "mute_notify": False,
+        }
+        plugin._kv["mute_records"] = {"40000": 2}
+        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        original_get = plugin.get_kv_data
+        attempts = 0
+
+        async def get_kv(key, default):
+            nonlocal attempts
+            if key == "mute_records":
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("mute read failed")
+            return await original_get(key, default)
+
+        plugin.get_kv_data = get_kv
+        bot = FakeBot()
+        raw = {
+            "group_id": 30000,
+            "user_id": 10000,
+            "operator_id": 20000,
+            "duration": 60,
+            "time": 100,
+            "sub_type": "ban",
+        }
+        await plugin.on_group_mute(FakeEvent(raw, bot))
+        self.assertEqual(plugin._kv["mute_records"], {"40000": 2})
+        self.assertEqual(plugin.put_calls, [])
+        self.assertEqual(bot.calls, [])
+        plugin._apply_mute_ban.assert_not_awaited()
+        self.assertNotIn(
+            plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
+        )
+
+        await plugin.on_group_mute(FakeEvent(dict(raw), bot))
+        self.assertEqual(
+            plugin._kv["mute_records"], {"40000": 2, "30000": 1}
+        )
+        self.assertEqual(bot.calls, [])
+
+    async def test_non_dict_mute_records_rolls_back_without_write(self):
+        plugin = self.make_plugin()
+        plugin.config["mute_revenge"] = {
+            "mute_retaliation_enable": True,
+            "mute_threshold": 1,
+            "mute_notify": False,
+        }
+        plugin._kv["mute_records"] = ["invalid"]
+        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        bot = FakeBot()
+        raw = {
+            "group_id": 30000,
+            "user_id": 10000,
+            "operator_id": 20000,
+            "duration": 60,
+            "time": 100,
+            "sub_type": "ban",
+        }
+        await plugin.on_group_mute(FakeEvent(raw, bot))
+        self.assertEqual(plugin._kv["mute_records"], ["invalid"])
+        self.assertEqual(plugin.put_calls, [])
+        self.assertEqual(bot.calls, [])
+        plugin._apply_mute_ban.assert_not_awaited()
+        self.assertNotIn(
+            plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
+        )
+
+    async def test_mute_preclear_failure_rolls_back_and_stops_action(self):
+        plugin = self.make_plugin()
+        plugin.config["mute_revenge"] = {
+            "mute_retaliation_enable": True,
+            "mute_threshold": 1,
+            "mute_target": "operator",
+            "mute_ban_mode": "astrbot_ban",
+            "mute_notify": False,
+        }
+        plugin._kv["mute_records"] = {"40000": 2}
+        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        original_put = plugin.put_kv_data
+        attempts = 0
+
+        async def put_kv(key, value):
+            nonlocal attempts
+            if key == "mute_records":
+                attempts += 1
+                if attempts == 2:
+                    raise RuntimeError("preclear failed")
+            await original_put(key, value)
+
+        plugin.put_kv_data = put_kv
+        bot = FakeBot()
+        raw = {
+            "group_id": 30000,
+            "user_id": 10000,
+            "operator_id": 20000,
+            "duration": 60,
+            "time": 100,
+            "sub_type": "ban",
+        }
+        await plugin.on_group_mute(FakeEvent(raw, bot))
+        self.assertEqual(
+            plugin._kv["mute_records"], {"40000": 2, "30000": 1}
+        )
+        self.assertEqual(bot.calls, [])
+        plugin._apply_mute_ban.assert_not_awaited()
+        self.assertNotIn(
+            plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
+        )
+
+    async def test_mute_preclear_read_failure_rolls_back_and_stops_action(self):
+        plugin = self.make_plugin()
+        plugin.config["mute_revenge"] = {
+            "mute_retaliation_enable": True,
+            "mute_threshold": 1,
+            "mute_target": "operator",
+            "mute_ban_mode": "astrbot_ban",
+            "mute_notify": False,
+        }
+        plugin._kv["mute_records"] = {"40000": 2}
+        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        original_get = plugin.get_kv_data
+        reads = 0
+
+        async def get_kv(key, default):
+            nonlocal reads
+            if key == "mute_records":
+                reads += 1
+                if reads == 2:
+                    raise RuntimeError("preclear read failed")
+            return await original_get(key, default)
+
+        plugin.get_kv_data = get_kv
+        bot = FakeBot()
+        raw = {
+            "group_id": 30000,
+            "user_id": 10000,
+            "operator_id": 20000,
+            "duration": 60,
+            "time": 100,
+            "sub_type": "ban",
+        }
+        await plugin.on_group_mute(FakeEvent(raw, bot))
+        self.assertEqual(
+            plugin._kv["mute_records"], {"40000": 2, "30000": 1}
+        )
+        self.assertEqual(bot.calls, [])
+        plugin._apply_mute_ban.assert_not_awaited()
+        self.assertNotIn(
+            plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
+        )
+
+    async def test_duplicate_mute_packet_does_not_count_or_survive_threshold_clear(self):
+        plugin = self.make_plugin()
+        plugin.config["mute_revenge"] = {
+            "mute_retaliation_enable": True,
+            "mute_threshold": 2,
+            "mute_target": "operator",
+            "mute_ban_mode": "astrbot_ban",
+            "mute_notify": False,
+        }
+        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        bot = FakeBot()
+
+        def raw(event_time):
+            return {
+                "group_id": 30000,
+                "user_id": 10000,
+                "operator_id": 20000,
+                "duration": 60,
+                "time": event_time,
+                "sub_type": "ban",
+            }
+
+        first = raw(100)
+        await asyncio.gather(
+            plugin.on_group_mute(FakeEvent(first, bot)),
+            plugin.on_group_mute(FakeEvent(dict(first), bot)),
+        )
+        self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+        second = raw(101)
+        await plugin.on_group_mute(FakeEvent(second, bot))
+        self.assertEqual(plugin._kv["mute_records"], {})
+        await plugin.on_group_mute(FakeEvent(dict(second), bot))
+        self.assertEqual(plugin._kv["mute_records"], {})
+        await plugin.on_group_mute(FakeEvent(raw(102), bot))
+        self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+        leaves = [name for name, _ in bot.calls if name == "set_group_leave"]
+        self.assertEqual(leaves, ["set_group_leave"])
+        plugin._apply_mute_ban.assert_awaited_once_with("20000", bot)
+
+    async def test_new_mute_event_after_failed_action_is_not_suppressed(self):
+        plugin = self.make_plugin()
+        plugin.config["mute_revenge"] = {
+            "mute_retaliation_enable": True,
+            "mute_threshold": 1,
+            "mute_target": "operator",
+            "mute_ban_mode": "astrbot_ban",
+            "mute_notify": False,
+        }
+        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        bot = FakeBot()
+        bot.fail_action = "set_group_leave"
+        base = {
+            "group_id": 30000,
+            "user_id": 10000,
+            "operator_id": 20000,
+            "duration": 60,
+            "sub_type": "ban",
+        }
+        await plugin.on_group_mute(FakeEvent({**base, "time": 100}, bot))
+        await plugin.on_group_mute(FakeEvent({**base, "time": 101}, bot))
+        leaves = [name for name, _ in bot.calls if name == "set_group_leave"]
+        self.assertEqual(leaves, ["set_group_leave", "set_group_leave"])
+        self.assertEqual(plugin._apply_mute_ban.await_count, 2)
+
+    async def test_cancelled_mute_action_keeps_precleared_count(self):
+        plugin = self.make_plugin()
+        plugin.config["mute_revenge"] = {
+            "mute_retaliation_enable": True,
+            "mute_threshold": 2,
+            "mute_target": "operator",
+            "mute_ban_mode": "astrbot_ban",
+            "mute_notify": False,
+        }
+        plugin._kv["mute_records"] = {"30000": 1, "40000": 2}
+        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        leave_entered = asyncio.Event()
+        block_leave = asyncio.Event()
+
+        class BlockingBot(FakeBot):
+            async def set_group_leave(self, **params):
+                self.calls.append(("set_group_leave", params))
+                leave_entered.set()
+                await block_leave.wait()
+
+        bot = BlockingBot()
+        base = {
+            "group_id": 30000,
+            "user_id": 10000,
+            "operator_id": 20000,
+            "duration": 60,
+            "sub_type": "ban",
+        }
+        task = asyncio.create_task(
+            plugin.on_group_mute(FakeEvent({**base, "time": 100}, bot))
+        )
+        await leave_entered.wait()
+        self.assertEqual(plugin._kv["mute_records"], {"40000": 2})
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        plugin._apply_mute_ban.assert_not_awaited()
+
+        await plugin.on_group_mute(FakeEvent({**base, "time": 101}, bot))
+        self.assertEqual(
+            plugin._kv["mute_records"], {"40000": 2, "30000": 1}
+        )
+        self.assertEqual(
+            [name for name, _ in bot.calls if name == "set_group_leave"],
+            ["set_group_leave"],
+        )
+
+    async def test_different_groups_do_not_block_on_slow_mute_action(self):
+        plugin = self.make_plugin()
+        plugin.config["mute_revenge"] = {
+            "mute_retaliation_enable": True,
+            "mute_threshold": 1,
+            "mute_target": "operator",
+            "mute_ban_mode": "astrbot_ban",
+            "mute_notify": False,
+        }
+        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        group_a_entered = asyncio.Event()
+        release_group_a = asyncio.Event()
+        group_b_done = asyncio.Event()
+
+        class SlowGroupBot(FakeBot):
+            async def set_group_leave(self, **params):
+                self.calls.append(("set_group_leave", params))
+                if params["group_id"] == 30000:
+                    group_a_entered.set()
+                    await release_group_a.wait()
+                else:
+                    group_b_done.set()
+
+        bot = SlowGroupBot()
+
+        def raw(group_id, event_time):
+            return {
+                "group_id": group_id,
+                "user_id": 10000,
+                "operator_id": 20000 + group_id,
+                "duration": 60,
+                "time": event_time,
+                "sub_type": "ban",
+            }
+
+        group_a = asyncio.create_task(
+            plugin.on_group_mute(FakeEvent(raw(30000, 100), bot))
+        )
+        await group_a_entered.wait()
+        group_b = asyncio.create_task(
+            plugin.on_group_mute(FakeEvent(raw(30001, 101), bot))
+        )
+        await asyncio.wait_for(group_b_done.wait(), timeout=1)
+        await asyncio.wait_for(group_b, timeout=1)
+        self.assertFalse(group_a.done())
+        release_group_a.set()
+        await group_a
+        self.assertEqual(
+            sorted(p["group_id"] for name, p in bot.calls if name == "set_group_leave"),
+            [30000, 30001],
+        )
+        self.assertEqual(plugin._mute_group_locks, {})
+
+    async def test_same_group_concurrent_threshold_triggers_once(self):
+        plugin = self.make_plugin()
+        plugin.config["mute_revenge"] = {
+            "mute_retaliation_enable": True,
+            "mute_threshold": 2,
+            "mute_target": "operator",
+            "mute_ban_mode": "astrbot_ban",
+            "mute_notify": False,
+        }
+        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        bot = FakeBot()
+        base = {
+            "group_id": 30000,
+            "user_id": 10000,
+            "operator_id": 20000,
+            "duration": 60,
+            "sub_type": "ban",
+        }
+        await asyncio.gather(
+            plugin.on_group_mute(FakeEvent({**base, "time": 100}, bot)),
+            plugin.on_group_mute(FakeEvent({**base, "time": 101}, bot)),
+        )
+        self.assertEqual(
+            [name for name, _ in bot.calls if name == "set_group_leave"],
+            ["set_group_leave"],
+        )
+        plugin._apply_mute_ban.assert_awaited_once_with("20000", bot)
+        self.assertEqual(plugin._mute_group_locks, {})
+
+    def test_mute_fingerprint_state_is_bounded(self):
+        plugin = self.make_plugin()
+        for event_time in range(300):
+            duplicate = plugin._is_duplicate_mute_event({
+                "group_id": 30000,
+                "user_id": 10000,
+                "operator_id": 20000,
+                "duration": 60,
+                "time": event_time,
+                "sub_type": "ban",
+            })
+            self.assertFalse(duplicate)
+        self.assertEqual(len(plugin._mute_event_fingerprints), 256)
+        self.assertFalse(hasattr(plugin, "_mute_locks"))
+        self.assertFalse(hasattr(plugin, "_mute_action_times"))
 
 
 if __name__ == "__main__":

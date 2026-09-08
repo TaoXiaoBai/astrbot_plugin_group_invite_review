@@ -170,6 +170,7 @@ _CONFIG_GROUPS = {
         "invite_records_show_group_profile": True,
         "invite_records_hide_dealt": True,
         "invite_records_show_decision_detail": True,
+        "image_profile_concurrency": 6,
     },
 }
 
@@ -426,7 +427,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.18.1",
+    "1.18.2",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -434,7 +435,18 @@ class GroupInviteGuardPlugin(Star):
         self.config = config or {}
         self._invite_kv_lock = asyncio.Lock()
         self._invite_state_lock = asyncio.Lock()
+        self._join_kv_lock = asyncio.Lock()
+        self._mute_kv_lock = asyncio.Lock()
+        self._mute_lock_registry_lock = asyncio.Lock()
+        self._mute_group_locks = {}
+        self._mute_event_fingerprints = {}
+        self._qq_tools_lock = asyncio.Lock()
+        self._llm_flights = {}
+        self._llm_flights_lock = asyncio.Lock()
+        self._cache_kv_locks = {}
         self._invite_inflight = set()
+        self._derived_cache = {}
+        self._derived_cache_versions = {}
         self._migrate_flat_config()
         if self._cfg("basic", "enable", True):
             self._migrate_ban_list_sync()
@@ -592,41 +604,38 @@ class GroupInviteGuardPlugin(Star):
             logger.info(f"group_invite_guard: duplicate invite ignored: {request_key}")
             return
 
-        if target_state == "NOT_FOR_BOT":
-            await self._finish_not_for_bot(group_id, record_id)
-            await self._release_invite_request(request_key)
-            return
+        try:
+            if target_state == "NOT_FOR_BOT":
+                await self._finish_not_for_bot(group_id, record_id)
+                return
 
-        if not self._cfg("basic", "enable", True):
-            await self._update_invite_record(
-                group_id, record_id,
-                action="仅记录（插件已禁用）",
-                review_state="DISABLED",
-                execution_state="DISABLED_RECORDED",
-                execution_result="插件已禁用，仅持久化记录",
+            if not self._cfg("basic", "enable", True):
+                await self._update_invite_record(
+                    group_id, record_id,
+                    action="仅记录（插件已禁用）",
+                    review_state="DISABLED",
+                    execution_state="DISABLED_RECORDED",
+                    execution_result="插件已禁用，仅持久化记录",
+                )
+                return
+
+            try:
+                event.stop_event()
+            except Exception:
+                pass
+
+            bot = self._find_onebot_client(event)
+            target_state, self_id, target_error = await self._resolve_invite_target(
+                bot, self_id, invited_id
             )
-            await self._release_invite_request(request_key)
-            return
+            await self._update_invite_record(
+                group_id, record_id, target_state=target_state, self_id=self_id,
+                target_error=target_error,
+            )
+            if target_state == "NOT_FOR_BOT":
+                await self._finish_not_for_bot(group_id, record_id, target_error)
+                return
 
-        try:
-            event.stop_event()
-        except Exception:
-            pass
-
-        bot = self._find_onebot_client(event)
-        target_state, self_id, target_error = await self._resolve_invite_target(
-            bot, self_id, invited_id
-        )
-        await self._update_invite_record(
-            group_id, record_id, target_state=target_state, self_id=self_id,
-            target_error=target_error,
-        )
-        if target_state == "NOT_FOR_BOT":
-            await self._finish_not_for_bot(group_id, record_id, target_error)
-            await self._release_invite_request(request_key)
-            return
-
-        try:
             if reconcile:
                 await self._reconcile_inflight_request(
                     bot, group_id, record_id, inviter_qq, comment, self_id
@@ -671,6 +680,69 @@ class GroupInviteGuardPlugin(Star):
             setattr(self, name, lock)
         return lock
 
+    def _keyed_lock(self, collection_name: str, key: str) -> asyncio.Lock:
+        locks = getattr(self, collection_name, None)
+        if locks is None:
+            locks = {}
+            setattr(self, collection_name, locks)
+        lock = locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[key] = lock
+        return lock
+
+    def _derived_cache_version(self, name: str) -> int:
+        versions = getattr(self, "_derived_cache_versions", None)
+        if versions is None:
+            versions = {}
+            self._derived_cache_versions = versions
+        return int(versions.get(name, 0))
+
+    def _invalidate_derived_cache(self, *names: str) -> None:
+        cache = getattr(self, "_derived_cache", None)
+        if cache is None:
+            cache = {}
+            self._derived_cache = cache
+        versions = getattr(self, "_derived_cache_versions", None)
+        if versions is None:
+            versions = {}
+            self._derived_cache_versions = versions
+        for name in names:
+            versions[name] = int(versions.get(name, 0)) + 1
+            cache.pop(name, None)
+
+    async def _run_singleflight(self, key: str, factory, flights: dict, lock):
+        try:
+            return await factory()
+        finally:
+            task = asyncio.current_task()
+            async with lock:
+                if flights.get(key) is task:
+                    flights.pop(key, None)
+
+    async def _singleflight(self, key: str, factory):
+        lock = self._invite_lock("_llm_flights_lock")
+        async with lock:
+            flights = getattr(self, "_llm_flights", None)
+            if flights is None:
+                flights = {}
+                self._llm_flights = flights
+            task = flights.get(key)
+            if task is None:
+                task = asyncio.create_task(
+                    self._run_singleflight(key, factory, flights, lock)
+                )
+                task.add_done_callback(self._consume_task_exception)
+                flights[key] = task
+        return await asyncio.shield(task)
+
+    @staticmethod
+    def _consume_task_exception(task: asyncio.Task) -> None:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
     async def _begin_invite_request(
         self, group_id: str, inviter_qq: str, comment: str, request_key: str,
         target_state: str, platform_id: str, self_id: str, invited_id: str,
@@ -688,7 +760,9 @@ class GroupInviteGuardPlugin(Star):
             except Exception as exc:
                 logger.warning(f"group_invite_guard: load invite_records for dedupe failed: {exc}")
                 records = {}
-            for recs in self._normalize_invite_records(records).values():
+            normalized = self._normalize_invite_records(records)
+
+            for recs in normalized.values():
                 for rec in recs:
                     if str(rec.get("request_key") or "") != request_key:
                         continue
@@ -1647,6 +1721,12 @@ class GroupInviteGuardPlugin(Star):
     async def _record_join(
         self, group_id: str, operator_id: str, request_key: str = "", inviter: str = ""
     ) -> None:
+        async with self._invite_lock("_join_kv_lock"):
+            await self._record_join_unlocked(group_id, operator_id, request_key, inviter)
+
+    async def _record_join_unlocked(
+        self, group_id: str, operator_id: str, request_key: str = "", inviter: str = ""
+    ) -> None:
         """记录机器人进群及其关联邀请。"""
         group_id = str(group_id or "").strip()
         if not group_id:
@@ -1721,25 +1801,111 @@ class GroupInviteGuardPlugin(Star):
         operator_id = str(_get_value(raw, "operator_id") or "")
         if not group_id:
             return
+        lock = await self._acquire_mute_group_lock(group_id)
+        try:
+            await self._handle_group_mute(event, raw, group_id, operator_id)
+        finally:
+            await self._release_mute_group_lock(group_id, lock)
 
+    async def _acquire_mute_group_lock(self, group_id: str) -> asyncio.Lock:
+        registry_lock = self._invite_lock("_mute_lock_registry_lock")
+        async with registry_lock:
+            entries = getattr(self, "_mute_group_locks", None)
+            if entries is None:
+                entries = {}
+                self._mute_group_locks = entries
+            entry = entries.get(group_id)
+            if entry is None:
+                entry = [asyncio.Lock(), 0]
+                entries[group_id] = entry
+            entry[1] += 1
+            lock = entry[0]
         try:
-            records = await self.get_kv_data("mute_records", {})
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: load mute_records failed: {exc}")
-            records = {}
-        if not isinstance(records, dict):
-            records = {}
+            await lock.acquire()
+        except BaseException:
+            async with registry_lock:
+                entry = entries.get(group_id)
+                if entry is not None and entry[0] is lock:
+                    entry[1] -= 1
+                    if entry[1] == 0:
+                        entries.pop(group_id, None)
+            raise
+        return lock
 
-        try:
-            count = int(records.get(group_id, 0) or 0) + 1
-        except (TypeError, ValueError):
-            logger.warning(f"group_invite_guard: mute_records[{group_id}] 非数字，按 1 计")
-            count = 1
-        records[group_id] = count
-        try:
-            await self.put_kv_data("mute_records", records)
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: save mute_records failed: {exc}")
+    async def _release_mute_group_lock(
+        self, group_id: str, lock: asyncio.Lock,
+    ) -> None:
+        lock.release()
+        registry_lock = self._invite_lock("_mute_lock_registry_lock")
+        async with registry_lock:
+            entries = getattr(self, "_mute_group_locks", {})
+            entry = entries.get(group_id)
+            if entry is not None and entry[0] is lock:
+                entry[1] -= 1
+                if entry[1] == 0:
+                    entries.pop(group_id, None)
+
+    @staticmethod
+    def _mute_event_fingerprint(raw: Any) -> tuple[str, ...]:
+        return tuple(
+            str(_get_value(raw, key) or "").strip()
+            for key in (
+                "group_id", "user_id", "operator_id", "duration", "time", "sub_type"
+            )
+        )
+
+    def _claim_mute_event(self, raw: Any) -> tuple[bool, tuple[str, ...]]:
+        fingerprints = getattr(self, "_mute_event_fingerprints", None)
+        if fingerprints is None:
+            fingerprints = {}
+            self._mute_event_fingerprints = fingerprints
+        now = time.monotonic()
+        for fingerprint, seen_at in list(fingerprints.items()):
+            if now - seen_at >= 10.0:
+                fingerprints.pop(fingerprint, None)
+        fingerprint = self._mute_event_fingerprint(raw)
+        if fingerprint in fingerprints:
+            return False, fingerprint
+        if len(fingerprints) >= 256:
+            fingerprints.pop(next(iter(fingerprints)))
+        fingerprints[fingerprint] = now
+        return True, fingerprint
+
+    def _is_duplicate_mute_event(self, raw: Any) -> bool:
+        claimed, _ = self._claim_mute_event(raw)
+        return not claimed
+
+    async def _handle_group_mute(
+        self, event: AstrMessageEvent, raw: Any, group_id: str, operator_id: str,
+    ) -> None:
+        async with self._invite_lock("_mute_kv_lock"):
+            claimed, fingerprint = self._claim_mute_event(raw)
+            if not claimed:
+                return
+            try:
+                records = await self.get_kv_data("mute_records", {})
+            except Exception as exc:
+                getattr(self, "_mute_event_fingerprints", {}).pop(fingerprint, None)
+                logger.warning(f"group_invite_guard: load mute_records failed: {exc}")
+                return
+            if not isinstance(records, dict):
+                getattr(self, "_mute_event_fingerprints", {}).pop(fingerprint, None)
+                logger.warning("group_invite_guard: mute_records is not a dict")
+                return
+
+            try:
+                count = int(records.get(group_id, 0) or 0) + 1
+            except (TypeError, ValueError):
+                logger.warning(f"group_invite_guard: mute_records[{group_id}] 非数字，按 1 计")
+                count = 1
+            records[group_id] = count
+            try:
+                await self.put_kv_data("mute_records", records)
+                self._invalidate_derived_cache("ban_context")
+            except Exception as exc:
+                getattr(self, "_mute_event_fingerprints", {}).pop(fingerprint, None)
+                logger.warning(f"group_invite_guard: save mute_records failed: {exc}")
+                return
 
         try:
             threshold = int(self._cfg("mute_revenge", "mute_threshold", 3) or 3)
@@ -1761,6 +1927,32 @@ class GroupInviteGuardPlugin(Star):
                 )
                 await self._notify(bot, note)
             return
+
+        async with self._invite_lock("_mute_kv_lock"):
+            try:
+                latest_records = await self.get_kv_data("mute_records", {})
+            except Exception as exc:
+                getattr(self, "_mute_event_fingerprints", {}).pop(fingerprint, None)
+                logger.warning(
+                    f"group_invite_guard: reload mute_records before action failed: {exc}"
+                )
+                return
+            if not isinstance(latest_records, dict):
+                getattr(self, "_mute_event_fingerprints", {}).pop(fingerprint, None)
+                logger.warning(
+                    "group_invite_guard: mute_records before action is not a dict"
+                )
+                return
+            latest_records.pop(group_id, None)
+            try:
+                await self.put_kv_data("mute_records", latest_records)
+                self._invalidate_derived_cache("ban_context")
+            except Exception as exc:
+                getattr(self, "_mute_event_fingerprints", {}).pop(fingerprint, None)
+                logger.warning(
+                    f"group_invite_guard: clear mute_records before action failed: {exc}"
+                )
+                return
 
         # 达到阈值：退群
         try:
@@ -1807,13 +1999,6 @@ class GroupInviteGuardPlugin(Star):
                     ban_results.append(notice)
             ban_results.append(await self._apply_mute_ban(qq, bot))
 
-        # 清空该群的禁言记录
-        try:
-            records.pop(group_id, None)
-            await self.put_kv_data("mute_records", records)
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: clear mute_records failed: {exc}")
-
         if self._cfg("mute_revenge", "mute_notify", True):
             note = self._compose_mute_revenge_note(group_id, count, leave_result, ban_results)
             if cross_line:
@@ -1837,12 +2022,14 @@ class GroupInviteGuardPlugin(Star):
             raise RuntimeError("no llm provider id configured")
 
         decision_persona = str(self._cfg("decision", "decision_persona") or "").strip()
-        persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
-        system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
-
-        context, alt_warning, profile_snapshot = await self._build_invite_context(
-            inviter_qq, group_id, bot, comment, request_key=request_key
+        persona_prompt, context_result = await asyncio.gather(
+            self._resolve_persona_prompt(decision_persona, platform_id),
+            self._build_invite_context(
+                inviter_qq, group_id, bot, comment, request_key=request_key
+            ),
         )
+        system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
+        context, alt_warning, profile_snapshot = context_result
         prompt = (
             f"收到一个加群邀请：\n"
             f"邀请人 QQ：{inviter_qq}\n"
@@ -1900,6 +2087,13 @@ class GroupInviteGuardPlugin(Star):
         request_key: str = "",
     ):
         """收集决策背景，返回 (文本, 小号提示, 结构化画像快照)。"""
+        try:
+            latest_invites = await self.get_kv_data("invite_records", {})
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: load invite context snapshot failed: {exc}")
+            latest_invites = {}
+        invite_snapshot = self._normalize_invite_records(latest_invites)
+
         async def _member():
             if self._cfg("decision", "enable_member_context", True):
                 return await self._build_member_section(group_id, bot)
@@ -1910,27 +2104,46 @@ class GroupInviteGuardPlugin(Star):
                 return await self._build_impression_section(inviter_qq, group_id)
             return ("", 0)
 
-        fetched = await asyncio.gather(_member(), _impression(), return_exceptions=True)
+        async def _external_profile():
+            if (
+                self._cfg("decision", "enable_user_profile", True)
+                and self._cfg("decision", "use_profile_plugin", True)
+            ):
+                return await self._fetch_external_decision_profile(
+                    inviter_qq, exclude_request_key=request_key
+                )
+            return "", {}
+
+        fetched = await asyncio.gather(
+            _member(),
+            _impression(),
+            _external_profile(),
+            self._detect_alt_account(
+                inviter_qq, comment, bot, exclude_request_key=request_key,
+                invite_records=invite_snapshot,
+            ),
+            return_exceptions=True,
+        )
+        labels = ("member context", "impression context", "external profile", "alt detection")
+        for label, result in zip(labels, fetched):
+            if isinstance(result, BaseException):
+                logger.warning(f"group_invite_guard: {label} failed: {result}")
+        if isinstance(fetched[3], BaseException):
+            raise fetched[3]
+
         member_section = fetched[0] if isinstance(fetched[0], str) else ""
         impression = fetched[1] if isinstance(fetched[1], tuple) else ("", 0)
         impression_section, speaker_count = impression
+        external = fetched[2] if isinstance(fetched[2], tuple) else ("", {})
+        external_section, profile_snapshot = external
+        alt_warning = fetched[3] if isinstance(fetched[3], str) else ""
 
-        profile_snapshot = {}
-        external_section = ""
         internal_section = ""
         if self._cfg("decision", "enable_user_profile", True):
-            if self._cfg("decision", "use_profile_plugin", True):
-                external_section, profile_snapshot = await self._fetch_external_decision_profile(
-                    inviter_qq, exclude_request_key=request_key
-                )
-            # 守卫前科始终独立补充，不能因外部画像有内容而丢失。
             internal_section = await self._build_profile_section(
-                inviter_qq, speaker_count, exclude_request_key=request_key
+                inviter_qq, speaker_count, exclude_request_key=request_key,
+                invite_records=invite_snapshot,
             )
-
-        alt_warning = await self._detect_alt_account(
-            inviter_qq, comment, bot, exclude_request_key=request_key
-        )
 
         marker = str(self._cfg("decision", "truncate_marker", "…") or "…")
 
@@ -1952,7 +2165,9 @@ class GroupInviteGuardPlugin(Star):
             context = context[:4000] + marker
         return context, alt_warning, profile_snapshot
 
-    async def _collect_profile_data(self, qq: str, exclude_request_key: str = "") -> dict:
+    async def _collect_profile_data(
+        self, qq: str, exclude_request_key: str = "", invite_records=None,
+    ) -> dict:
         """汇总某 QQ 的本地画像数据，可排除正在审核的邀请。"""
         qq = str(qq or "").strip()
         data = {
@@ -1972,9 +2187,13 @@ class GroupInviteGuardPlugin(Star):
             except Exception:
                 return {}
 
-        invite_records, join_records, mute_records = await asyncio.gather(
-            _load("invite_records"), _load("join_records"), _load("mute_records")
-        )
+        loads = [_load("join_records"), _load("mute_records")]
+        if invite_records is None:
+            loads.insert(0, _load("invite_records"))
+            loaded_invite, join_records, mute_records = await asyncio.gather(*loads)
+            invite_records = loaded_invite
+        else:
+            join_records, mute_records = await asyncio.gather(*loads)
         invite_records = invite_records if isinstance(invite_records, dict) else {}
         join_records = join_records if isinstance(join_records, dict) else {}
         mute_records = mute_records if isinstance(mute_records, dict) else {}
@@ -2054,16 +2273,31 @@ class GroupInviteGuardPlugin(Star):
             reason = str(entry.get("reason") or "未注明").strip()
             return True, f"在黑名单中（{reason}）"
 
-        try:
-            records = await self.get_kv_data("invite_records", {})
-        except Exception:
-            records = {}
-        if isinstance(records, dict):
-            normalized = self._normalize_invite_records(records)
-            for recs in normalized.values():
-                for rec in recs:
-                    if self._record_inviter(rec) == qq and _as_bool(rec.get("dealt")):
-                        return True, "邀请记录已标记拉黑"
+        cache = getattr(self, "_derived_cache", None)
+        if cache is None:
+            cache = {}
+            self._derived_cache = cache
+        now = time.monotonic()
+        cached = cache.get("banned_inviters")
+        if not cached or now - cached[0] >= 2.0:
+            version = self._derived_cache_version("banned_inviters")
+            try:
+                records = await self.get_kv_data("invite_records", {})
+            except Exception:
+                records = None
+                cached = None
+            if records is not None:
+                banned = {
+                    self._record_inviter(rec)
+                    for recs in self._normalize_invite_records(records).values()
+                    for rec in recs
+                    if self._record_inviter(rec) and _as_bool(rec.get("dealt"))
+                }
+                cached = (now, banned)
+                if self._derived_cache_version("banned_inviters") == version:
+                    cache["banned_inviters"] = cached
+        if cached and qq in cached[1]:
+            return True, "邀请记录已标记拉黑"
 
         return False, ""
 
@@ -2322,7 +2556,8 @@ class GroupInviteGuardPlugin(Star):
         return await self._build_full_profile(qq, bot)
 
     async def _build_profile_section(
-        self, inviter_qq: str, speaker_count: int, exclude_request_key: str = ""
+        self, inviter_qq: str, speaker_count: int, exclude_request_key: str = "",
+        invite_records=None,
     ) -> str:
         """邀请人画像（决策用精简版）；全空返回空。"""
         if not self._cfg("decision", "enable_user_profile", True):
@@ -2331,7 +2566,9 @@ class GroupInviteGuardPlugin(Star):
         if not qq:
             return ""
 
-        data = await self._collect_profile_data(qq, exclude_request_key)
+        data = await self._collect_profile_data(
+            qq, exclude_request_key, invite_records=invite_records
+        )
         invited = [gid for gid, _ in data["invited"]]
 
         lines = []
@@ -2452,7 +2689,8 @@ class GroupInviteGuardPlugin(Star):
         return max(0, min(100, threshold))
 
     async def _alt_similarity_candidates(
-        self, inviter_qq: str, comment: str, bot, exclude_request_key: str = ""
+        self, inviter_qq: str, comment: str, bot, exclude_request_key: str = "",
+        invite_records=None,
     ) -> list:
         """计算邀请人与黑名单用户的附言/昵称相似度。"""
         config, _ = self._get_ban_config()
@@ -2484,11 +2722,12 @@ class GroupInviteGuardPlugin(Star):
         # 附言维度：黑名单用户历史邀请时的附言（本地 kv）
         past_comments = {}
         if comment:
-            try:
-                records = await self.get_kv_data("invite_records", {})
-            except Exception:
-                records = {}
-            normalized = self._normalize_invite_records(records)
+            if invite_records is None:
+                try:
+                    invite_records = await self.get_kv_data("invite_records", {})
+                except Exception:
+                    invite_records = {}
+            normalized = self._normalize_invite_records(invite_records)
             for recs in normalized.values():
                 for rec in recs:
                     if str(rec.get("request_key") or "") == exclude_request_key:
@@ -2531,13 +2770,15 @@ class GroupInviteGuardPlugin(Star):
         return max(0, min(100, low))
 
     async def _detect_alt_account(
-        self, inviter_qq: str, comment: str, bot, exclude_request_key: str = ""
+        self, inviter_qq: str, comment: str, bot, exclude_request_key: str = "",
+        invite_records=None,
     ) -> str:
         """识别邀请人是否疑似黑名单用户的小号。"""
         if not _as_bool(self._cfg("alt_detect", "alt_account_detect", True)):
             return ""
         candidates = await self._alt_similarity_candidates(
-            inviter_qq, comment, bot, exclude_request_key
+            inviter_qq, comment, bot, exclude_request_key,
+            invite_records=invite_records,
         )
         if not candidates:
             return ""
@@ -2550,18 +2791,22 @@ class GroupInviteGuardPlugin(Star):
             return ""
         if best_sim < self._alt_gray_low():
             return ""
-        return await self._llm_review_alt(inviter_qq, comment, best_uid, best_sim, best_dim)
+        return await self._llm_review_alt(
+            inviter_qq, comment, best_uid, best_sim, best_dim,
+            invite_records=invite_records,
+        )
 
-    async def _past_comment_of(self, qq: str) -> str:
+    async def _past_comment_of(self, qq: str, invite_records=None) -> str:
         """从邀请记录里取某 QQ 历史邀请时的附言（本地 kv，与 _alt_similarity_candidates 的附言维度同源）；找不到返回空。"""
         qq = str(qq or "").strip()
         if not qq:
             return ""
-        try:
-            records = await self.get_kv_data("invite_records", {})
-        except Exception:
-            return ""
-        normalized = self._normalize_invite_records(records)
+        if invite_records is None:
+            try:
+                invite_records = await self.get_kv_data("invite_records", {})
+            except Exception:
+                return ""
+        normalized = self._normalize_invite_records(invite_records)
         for recs in normalized.values():
             for rec in recs:
                 if self._record_inviter(rec) == qq:
@@ -2570,13 +2815,28 @@ class GroupInviteGuardPlugin(Star):
                         return comment
         return ""
 
-    async def _llm_review_alt(self, inviter_qq: str, comment: str, old_uid: str, sim: float, dim: str) -> str:
-        """灰色区间小号复判：一次轻量 LLM 调用判断是否同一人，判定缓存 kv（alt_verdict_cache）7 天；失败按未复判处理返回空。"""
+    async def _llm_review_alt(
+        self, inviter_qq: str, comment: str, old_uid: str, sim: float, dim: str,
+        invite_records=None,
+    ) -> str:
         inviter_qq = str(inviter_qq or "").strip()
         old_uid = str(old_uid or "").strip()
         if not inviter_qq or not old_uid:
             return ""
+        key = f"alt:{inviter_qq}|{old_uid}"
+        return await self._singleflight(
+            key,
+            lambda: self._llm_review_alt_once(
+                inviter_qq, comment, old_uid, sim, dim,
+                invite_records=invite_records,
+            ),
+        )
 
+    async def _llm_review_alt_once(
+        self, inviter_qq: str, comment: str, old_uid: str, sim: float, dim: str,
+        invite_records=None,
+    ) -> str:
+        """灰色区间小号复判：一次轻量 LLM 调用判断是否同一人，判定缓存 kv（alt_verdict_cache）7 天；失败按未复判处理返回空。"""
         cache_key = f"{inviter_qq}|{old_uid}"
         now = int(time.time())
         try:
@@ -2597,7 +2857,9 @@ class GroupInviteGuardPlugin(Star):
 
         # 双方可对比材料：新邀请人附言/近期发言 vs 黑名单用户旧附言/旧发言
         comment = str(comment or "").strip()
-        old_comment = await self._past_comment_of(old_uid)
+        old_comment = await self._past_comment_of(
+            old_uid, invite_records=invite_records
+        )
         fetched = await asyncio.gather(
             self._extract_speaker_quotes(inviter_qq),
             self._extract_speaker_quotes(old_uid),
@@ -2650,11 +2912,17 @@ class GroupInviteGuardPlugin(Star):
             "reason": str(result.get("reason") or "").strip()[:200],
             "updated": now,
         }
-        cache[cache_key] = verdict
-        try:
-            await self.put_kv_data("alt_verdict_cache", cache)
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: save alt_verdict_cache failed: {exc}")
+        async with self._keyed_lock("_cache_kv_locks", "alt_verdict_cache"):
+            try:
+                latest = await self.get_kv_data("alt_verdict_cache", {})
+            except Exception:
+                latest = cache
+            cache = latest if isinstance(latest, dict) else {}
+            cache[cache_key] = verdict
+            try:
+                await self.put_kv_data("alt_verdict_cache", cache)
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: save alt_verdict_cache failed: {exc}")
         return self._alt_verdict_line(verdict, old_uid, sim, dim)
 
     @staticmethod
@@ -2705,18 +2973,70 @@ class GroupInviteGuardPlugin(Star):
             return fallback
         return header + "\n" + "\n".join(lines)
 
+    async def _search_inviter_history(self, inviter_qq: str) -> tuple[list, list]:
+        qq = str(inviter_qq or "").strip()
+        if not qq:
+            return [], []
+        try:
+            conversations, _ = await self.context.conversation_manager.get_filtered_conversations(
+                page=1, page_size=10, search_query=qq, include_history=True
+            )
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: search inviter history '{qq}' failed: {exc}")
+            return [], []
+
+        conversations = list(conversations or [])[:10]
+        impression_lines = []
+        for conv in conversations[:5]:
+            history = getattr(conv, "history", None)
+            if history and len(impression_lines) < 30:
+                impression_lines.extend(self._extract_history_lines(history))
+
+        speaker_lines = []
+        pattern = re.compile(r"ID:\s*" + re.escape(qq))
+        for conv in conversations:
+            history = getattr(conv, "history", None)
+            if not history:
+                continue
+            try:
+                items = json.loads(history)
+            except Exception:
+                continue
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").strip().lower()
+                if role not in ("user", "assistant"):
+                    continue
+                text = self._content_to_text(item.get("content"))
+                for raw_line in text.splitlines():
+                    if not pattern.search(raw_line):
+                        continue
+                    line = re.sub(r"^\s*\[[^\]]*\]\s*", "", raw_line)
+                    line = re.sub(r"^\s*\S+\s*\(ID:[^)]*\)\s*[:：]\s*", "", line)
+                    line = re.sub(r"^\s*\[At:[^\]]*\]\s*", "", line).strip()
+                    if not line or len(line) < 2:
+                        continue
+                    if len(line) > 300:
+                        line = line[:300] + self._cfg("decision", "truncate_marker", "…")
+                    if line not in speaker_lines:
+                        speaker_lines.append(line)
+                    if len(speaker_lines) >= 20:
+                        return impression_lines[:30], speaker_lines
+        return impression_lines[:30], speaker_lines
+
     async def _build_impression_section(self, inviter_qq: str, group_id: str):
         """返回 (印象小节文本, 邀请人发言条数)；发言条数供画像复用，避免重复搜索。"""
-        # 三次历史搜索并发执行，单个失败按空列表处理，不影响其它
         searched = await asyncio.gather(
-            self._search_impression_lines(inviter_qq),
-            self._extract_speaker_quotes(inviter_qq),
+            self._search_inviter_history(inviter_qq),
             self._search_impression_lines(group_id),
             return_exceptions=True,
         )
-        inviter_lines, speaker_lines, group_lines = [
-            item if isinstance(item, list) else [] for item in searched
-        ]
+        inviter_history = searched[0] if isinstance(searched[0], tuple) else ([], [])
+        inviter_lines, speaker_lines = inviter_history
+        group_lines = searched[1] if isinstance(searched[1], list) else []
 
         parts = []
         if speaker_lines:
@@ -2737,6 +3057,14 @@ class GroupInviteGuardPlugin(Star):
         return "\n\n".join(parts), len(speaker_lines)
 
     async def _summarize_impression(self, inviter_qq: str, quotes: list) -> str:
+        qq = str(inviter_qq or "").strip()
+        normalized_quotes = [q for q in (quotes or []) if str(q or "").strip()]
+        key = f"impression:{qq}:{len(normalized_quotes)}"
+        return await self._singleflight(
+            key, lambda: self._summarize_impression_once(qq, normalized_quotes)
+        )
+
+    async def _summarize_impression_once(self, inviter_qq: str, quotes: list) -> str:
         """把邀请人的历史发言原话浓缩成 100 字内的印象小结（一次轻量 LLM 调用）。
 
         带 kv 缓存（impression_cache）：发言条数比缓存时变多才重新生成，否则直接用缓存；
@@ -2785,15 +3113,21 @@ class GroupInviteGuardPlugin(Star):
         if not summary:
             return ""
 
-        cache[qq] = {
-            "summary": summary,
-            "quote_count": len(quotes),
-            "updated": int(time.time()),
-        }
-        try:
-            await self.put_kv_data("impression_cache", cache)
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: save impression_cache failed: {exc}")
+        async with self._keyed_lock("_cache_kv_locks", "impression_cache"):
+            try:
+                latest = await self.get_kv_data("impression_cache", {})
+            except Exception:
+                latest = cache
+            cache = latest if isinstance(latest, dict) else {}
+            cache[qq] = {
+                "summary": summary,
+                "quote_count": len(quotes),
+                "updated": int(time.time()),
+            }
+            try:
+                await self.put_kv_data("impression_cache", cache)
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: save impression_cache failed: {exc}")
         return summary
 
     async def _search_impression_lines(self, query: str) -> list:
@@ -3224,10 +3558,14 @@ class GroupInviteGuardPlugin(Star):
                 logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
                 records = {}
             records = self._normalize_invite_records(records)
-            if not mutate(records):
+            changed = mutate(records)
+            if changed is None:
                 return False
+            if changed is False:
+                return True
             try:
                 await self.put_kv_data("invite_records", records)
+                self._invalidate_derived_cache("banned_inviters", "ban_context")
                 return True
             except Exception as exc:
                 logger.warning(f"group_invite_guard: save invite_records failed: {exc}")
@@ -3281,9 +3619,11 @@ class GroupInviteGuardPlugin(Star):
         def mutate(records):
             for rec in records.get(storage_group, []):
                 if str(rec.get("record_id") or "") == record_id:
-                    rec.update(fields)
-                    return True
-            return False
+                    changed = any(rec.get(key) != value for key, value in fields.items())
+                    if changed:
+                        rec.update(fields)
+                    return changed
+            return None
 
         return await self._mutate_invite_records(mutate)
 
@@ -3295,19 +3635,22 @@ class GroupInviteGuardPlugin(Star):
 
         def mutate(records):
             changed = False
+            found = False
             now = int(time.time())
             for recs in records.values():
                 for rec in recs:
                     if self._record_inviter(rec) != inviter_qq:
                         continue
-                    if dealt:
+                    found = True
+                    if dealt and not _as_bool(rec.get("dealt")):
                         rec["dealt"] = True
                         rec["dealt_time"] = int(rec.get("dealt_time") or now)
-                    else:
+                        changed = True
+                    elif not dealt and ("dealt" in rec or "dealt_time" in rec):
                         rec.pop("dealt", None)
                         rec.pop("dealt_time", None)
-                    changed = True
-            return changed
+                        changed = True
+            return changed if found else None
 
         await self._mutate_invite_records(mutate)
 
@@ -3346,27 +3689,28 @@ class GroupInviteGuardPlugin(Star):
 
     async def _ban_inviter(self, inviter_qq: str, reason: str = "拉黑") -> str:
         """把邀请人加入 AstrBot 黑名单（qq_tools 插件），不可用时降级并注明。"""
-        config, err = self._get_ban_config()
-        if config is None:
-            return err
-        try:
-            ban_list = self._filter_ban_list(config.get("ban_list"), inviter_qq)
-            ban_list.append(
-                {
-                    "user_id": str(inviter_qq),
-                    "ban_time": int(time.time()),
-                    "duration": -1,
-                    "reason": reason,
-                }
-            )
-            config["ban_list"] = ban_list
-            persisted = await self._save_ban_config(config)
-            msg = f"已加入 AstrBot 黑名单：{inviter_qq}"
-            if not persisted:
-                msg += "（未能持久化）"
-            return msg
-        except Exception as exc:
-            return f"加入黑名单失败：{exc}"
+        async with self._invite_lock("_qq_tools_lock"):
+            config, err = self._get_ban_config()
+            if config is None:
+                return err
+            try:
+                ban_list = self._filter_ban_list(config.get("ban_list"), inviter_qq)
+                ban_list.append(
+                    {
+                        "user_id": str(inviter_qq),
+                        "ban_time": int(time.time()),
+                        "duration": -1,
+                        "reason": reason,
+                    }
+                )
+                config["ban_list"] = ban_list
+                persisted = await self._save_ban_config(config)
+                msg = f"已加入 AstrBot 黑名单：{inviter_qq}"
+                if not persisted:
+                    msg += "（未能持久化）"
+                return msg
+            except Exception as exc:
+                return f"加入黑名单失败：{exc}"
 
     def _compose_revenge_note(self, group_id, inviter_qq, result) -> str:
         lines = [
@@ -3700,8 +4044,20 @@ class GroupInviteGuardPlugin(Star):
             {it["inviter"] for it in items if it["inviter"] not in ("", "(未知)")}
         ) if show_profile else []
         gids = sorted({it["group"] for it in items if it["group"]}) if show_group_profile else []
-        calls = [self._fetch_nickname(bot, qq) for qq in qqs]
-        calls.extend(self._fetch_group_name(bot, gid) for gid in gids)
+        try:
+            concurrency = int(
+                self._cfg("display", "image_profile_concurrency", 6) or 6
+            )
+        except (TypeError, ValueError):
+            concurrency = 6
+        semaphore = asyncio.Semaphore(max(1, min(20, concurrency)))
+
+        async def _limited(factory, *args):
+            async with semaphore:
+                return await factory(*args)
+
+        calls = [_limited(self._fetch_nickname, bot, qq) for qq in qqs]
+        calls.extend(_limited(self._fetch_group_name, bot, gid) for gid in gids)
         fetched = await asyncio.gather(*calls, return_exceptions=True) if calls else []
         nicknames = {
             qq: (value if isinstance(value, str) else "")
@@ -3779,24 +4135,25 @@ class GroupInviteGuardPlugin(Star):
         return "\n".join(lines) if lines else "黑名单为空"
 
     async def _unban_text(self, qq: str) -> str:
-        config, err = self._get_ban_config()
-        if config is None:
-            return err
-        try:
-            ban_list = config.get("ban_list")
-            normalized = ban_list if isinstance(ban_list, list) else []
-            new_list = self._filter_ban_list(normalized, qq)
-            if len(new_list) == len(normalized):
-                return f"{qq} 不在黑名单中"
-            config["ban_list"] = new_list
-            persisted = await self._save_ban_config(config)
-            msg = f"已解封 {qq}"
-            if not persisted:
-                msg += "（未能持久化）"
-            await self._mark_inviter_dealt(qq, dealt=False)
-            return msg
-        except Exception as exc:
-            return f"解封失败：{exc}"
+        async with self._invite_lock("_qq_tools_lock"):
+            config, err = self._get_ban_config()
+            if config is None:
+                return err
+            try:
+                ban_list = config.get("ban_list")
+                normalized = ban_list if isinstance(ban_list, list) else []
+                new_list = self._filter_ban_list(normalized, qq)
+                if len(new_list) == len(normalized):
+                    return f"{qq} 不在黑名单中"
+                config["ban_list"] = new_list
+                persisted = await self._save_ban_config(config)
+                msg = f"已解封 {qq}"
+                if not persisted:
+                    msg += "（未能持久化）"
+            except Exception as exc:
+                return f"解封失败：{exc}"
+        await self._mark_inviter_dealt(qq, dealt=False)
+        return msg
 
     async def _manual_blacklist(self, target_qq: str, bot) -> str:
         """手动拉黑某人：发自定义通知 + 删除并拉黑好友 + 加入 AstrBot 黑名单。"""
@@ -3988,6 +4345,49 @@ class GroupInviteGuardPlugin(Star):
             entries.append((user_id, reason))
         return entries
 
+    async def _build_derived_ban_lines(self) -> list[str]:
+        cache = getattr(self, "_derived_cache", None)
+        if cache is None:
+            cache = {}
+            self._derived_cache = cache
+        now = time.monotonic()
+        cached = cache.get("ban_context")
+        if cached and now - cached[0] < 2.0:
+            return list(cached[1])
+
+        version = self._derived_cache_version("ban_context")
+
+        async def _load_kv(key):
+            try:
+                return await self.get_kv_data(key, {})
+            except Exception:
+                return {}
+
+        invite, mute = await asyncio.gather(
+            _load_kv("invite_records"), _load_kv("mute_records")
+        )
+        lines = []
+        normalized = self._normalize_invite_records(invite)
+        if normalized:
+            lines.append("被邀请进群记录（群号 -> 邀请人）：")
+            shown = 0
+            for gid, recs in normalized.items():
+                for rec in recs:
+                    if shown >= 20:
+                        break
+                    inviter = self._record_inviter(rec)
+                    lines.append(f"- 群 {gid} 由 {inviter or '(未知)'} 邀请")
+                    shown += 1
+                if shown >= 20:
+                    break
+        if isinstance(mute, dict) and mute:
+            lines.append("被禁言记录（群号：次数）：")
+            for gid, cnt in list(mute.items())[:20]:
+                lines.append(f"- 群 {gid}：{cnt} 次")
+        if self._derived_cache_version("ban_context") == version:
+            cache["ban_context"] = (now, tuple(lines))
+        return lines
+
     async def _build_ban_context_text(self) -> str:
         """把黑名单/邀请记录/禁言记录拼成一段给 LLM 的上下文；全空返回空字符串。"""
         lines = []
@@ -3997,34 +4397,7 @@ class GroupInviteGuardPlugin(Star):
             for user_id, reason in entries[:20]:
                 lines.append(f"- QQ {user_id}（{reason}）")
 
-        async def _load_kv(key):
-            try:
-                return await self.get_kv_data(key, {})
-            except Exception:
-                return {}
-
-        # 两个 kv 并发读取，失败按空 dict 处理
-        invite, mute = await asyncio.gather(
-            _load_kv("invite_records"), _load_kv("mute_records")
-        )
-        normalized = self._normalize_invite_records(invite)
-        if normalized:
-            lines.append("被邀请进群记录（群号 -> 邀请人）：")
-            shown = 0
-            for gid, recs in normalized.items():
-                if shown >= 20:
-                    break
-                for rec in recs:
-                    if shown >= 20:
-                        break
-                    inviter = self._record_inviter(rec)
-                    lines.append(f"- 群 {gid} 由 {inviter or '(未知)'} 邀请")
-                    shown += 1
-
-        if isinstance(mute, dict) and mute:
-            lines.append("被禁言记录（群号：次数）：")
-            for gid, cnt in list(mute.items())[:20]:
-                lines.append(f"- 群 {gid}：{cnt} 次")
+        lines.extend(await self._build_derived_ban_lines())
 
         if not lines:
             return ""

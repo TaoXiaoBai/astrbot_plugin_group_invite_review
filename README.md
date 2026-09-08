@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.18.1-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.18.2-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -26,6 +26,7 @@
 - 安装用户画像插件时优先读取结构化风险分、标签、活跃度和社交来源，并把决策时快照写入邀请记录；旧版画像插件自动降级兼容
 - 抓到邀请人历史发言原话时，由 LLM 浓缩成一段 100 字内的印象小结（按发言条数缓存，陌生人零开销）
 - 小号识别：被拉黑的人换号再来？附言/昵称相似度命中即在决策上下文和通知里提示"疑似小号"；相似度处于灰色区间时再交 LLM 复判一次（结论缓存 7 天）
+- 单次审核复用邀请记录与历史会话快照，人格和背景并发加载；同键 LLM 小结/复判合并为一次调用，不改变审核提示词与状态机
 - 私聊里问"能不能加群"、直接甩邀请链接，也能识别并回复/通知
 
 **记仇与报复**
@@ -103,6 +104,7 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `enable_impression_context` | `true` | 参考历史印象 |
 | `impression_llm_summary` | `true` | 抓到发言原话时生成 LLM 印象小结（按发言条数缓存） |
 | `enable_user_profile` | `true` | 决策时附邀请人画像（本地记录，不额外调 LLM） |
+| `use_profile_plugin` | `true` | 安装用户画像插件时优先接入其结构化画像，失败自动降级 |
 | `truncate_marker` | `…` | 截断占位符 |
 
 **异常提前入群 `unexpected_join`**
@@ -128,6 +130,15 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `enable_private_intent` | `true` | 检测私聊加群意图 |
 | `private_intent_reply` | `true` | 检测到意图时回复对方 |
 | `private_intent_notify` | `true` | 检测到意图时通知管理员 |
+| `enable_blacklist_inquiry` | `true` | 识别私聊询问拉黑、拒绝、被踢或解封原因 |
+| `blacklist_inquiry_reply` | `true` | 识别后自动回复 |
+| `blacklist_inquiry_notify` | `true` | 识别后通知管理员 |
+| `blacklist_inquiry_keywords` | 内置关键词 | 逗号分隔的粗筛关键词；未命中不调用 LLM |
+| `blacklist_inquiry_tone` | `persona` | 回复语气：`persona` / `serious` / `polite` / `cold` |
+| `blacklist_inquiry_show_reason` | `true` | 回复中是否简要说明原因 |
+| `blacklist_inquiry_max_length` | `120` | 自动回复最大字数 |
+| `blacklist_inquiry_system_prompt` | `""` | 自定义系统提示词；支持 schema 所列变量 |
+| `blacklist_inquiry_user_prompt` | `""` | 自定义用户提示词；支持 schema 所列变量 |
 
 **被踢报复 `kick_revenge`**
 
@@ -139,6 +150,7 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `record_group_join` | `true` | 记录每次进群的时间/操作人 |
 | `cross_group_retaliation` | `false` | 被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群并拉黑 TA |
 | `ban_notice_message` | `""` | 拉黑前私聊发给对方的话，手动拉黑也会发送（留空不发） |
+| `intercept_banned_messages` | `true` | 兜底拦截已拉黑用户的群聊/私聊消息 |
 
 **禁言报复 `mute_revenge`**
 
@@ -166,8 +178,11 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `invite_records_show_group_profile` | `true` | 邀请记录图显示群头像群名 |
 | `invite_records_hide_dealt` | `true` | 隐藏邀请人已拉黑的记录 |
 | `invite_records_show_decision_detail` | `true` | 文字/图片记录显示 LLM 建议、理由、画像风险分、主要标签和精简社交来源 |
+| `image_profile_concurrency` | `6` | 图片生成时昵称/群名 API 最大并发数（运行时限制 1-20） |
 
 图片版使用纵向卡片：顶栏展示时间与决策状态，邀请人和目标群分栏展示，执行/成员状态使用短标签；邀请附言、LLM 理由、画像标签和社交来源各自占用独立内容块，避免大量文字挤在同一个表格单元格。过长附言和理由会自动截断，画像标签以可换行 chips 展示。
+
+普通消息拦截会短时复用插件邀请记录派生索引，插件写入时立即失效；`qq_tools` 黑名单每次实时读取，不会被长期缓存。LLM 封禁上下文同样只短时缓存插件自身的邀请/禁言派生部分。动作前后的成员状态仍通过 OneBot 实时查询。
 
 </details>
 
