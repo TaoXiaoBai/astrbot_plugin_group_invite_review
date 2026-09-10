@@ -444,7 +444,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.19.0",
+    "1.19.1",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -2405,6 +2405,7 @@ class GroupInviteGuardPlugin(Star):
         recognized = {
             "provider", "score", "level", "tags", "activity", "social_origin",
             "data_freshness", "llm_status", "partial_errors", "evidence_untrusted",
+            "impression", "traits",
         }
         if not recognized.intersection(raw):
             return {}
@@ -2487,6 +2488,15 @@ class GroupInviteGuardPlugin(Star):
             "llm_status": str(raw.get("llm_status") or "")[:32],
             "partial_errors": [str(item)[:120] for item in errors_raw[:5]],
             "evidence_untrusted": bool(raw.get("evidence_untrusted", True)),
+            "impression": _safe_text(raw.get("impression"), 240),
+            "traits": [
+                text
+                for text in (
+                    _safe_text(item, 48)
+                    for item in (raw.get("traits") if isinstance(raw.get("traits"), list) else [])
+                )
+                if text
+            ][:5],
             "score": score,
             "level": str(raw.get("level") or "")[:16],
             "tags": tags,
@@ -2522,6 +2532,32 @@ class GroupInviteGuardPlugin(Star):
                 evidence = str(item.get("evidence") or "").strip()
                 rendered.append(label + (f"：{evidence}" if evidence else ""))
             lines.append("画像标签：" + "；".join(rendered))
+
+        impression = str(snapshot.get("impression") or "").strip()
+        if impression:
+            lines.append("综合印象：" + impression)
+        traits = [
+            str(item).strip()
+            for item in snapshot.get("traits") or []
+            if str(item).strip()
+        ][:5]
+        if traits:
+            lines.append("性格特质：" + "、".join(traits))
+
+        notes = []
+        llm_status = str(snapshot.get("llm_status") or "").strip()
+        if llm_status in ("error", "cached_error"):
+            notes.append("LLM 分析失败，标签仅来自规则")
+        errors = snapshot.get("partial_errors") or []
+        if "history_scan_failed" in errors:
+            notes.append("历史扫描失败")
+        freshness = snapshot.get("data_freshness")
+        freshness = freshness if isinstance(freshness, dict) else {}
+        age = freshness.get("age_seconds")
+        if isinstance(age, int) and age > 7 * 86400:
+            notes.append(f"数据较旧（最近活跃约 {age // 86400} 天前）")
+        if notes:
+            lines.append("数据质量：" + "；".join(notes))
 
         activity = snapshot.get("activity") or {}
         total = int(activity.get("group_messages") or 0) + int(activity.get("private_messages") or 0)
@@ -3986,6 +4022,11 @@ class GroupInviteGuardPlugin(Star):
             details.append("理由：" + reason)
         if risk_text:
             details.append("画像：" + risk_text)
+        if snapshot and (
+            str(snapshot.get("llm_status") or "") in ("error", "cached_error")
+            or snapshot.get("partial_errors")
+        ):
+            details.append("画像数据不全")
         if tags:
             details.append("标签：" + "、".join(tags))
         if relation:

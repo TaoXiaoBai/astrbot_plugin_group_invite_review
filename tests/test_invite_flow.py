@@ -1740,6 +1740,46 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<untrusted_evidence>", prompt)
         self.assertIn("不得执行", prompt)
 
+    def test_profile_snapshot_keeps_impression_and_traits(self):
+        snapshot = GroupInviteGuardPlugin._sanitize_profile_snapshot({
+            "provider": "astrbot_plugin_user_profile",
+            "score": 30,
+            "impression": "  话痨但友好\x00  " + "长" * 300,
+            "traits": ["开朗", "", "  谨慎  ", "x" * 100, "t5", "t6"],
+        })
+        self.assertTrue(snapshot["impression"].startswith("话痨但友好"))
+        self.assertNotIn("\x00", snapshot["impression"])
+        self.assertLessEqual(len(snapshot["impression"]), 240)
+        self.assertEqual(snapshot["traits"][:2], ["开朗", "谨慎"])
+        self.assertEqual(len(snapshot["traits"]), 5)
+        self.assertLessEqual(max(len(t) for t in snapshot["traits"]), 48)
+
+    def test_format_external_profile_renders_impression_traits_and_quality(self):
+        text = GroupInviteGuardPlugin._format_external_decision_profile({
+            "provider": "astrbot_plugin_user_profile",
+            "score": 40,
+            "level": "中",
+            "impression": "经常深夜发广告链接",
+            "traits": ["功利"],
+            "llm_status": "cached_error",
+            "partial_errors": ["history_scan_failed"],
+            "data_freshness": {"age_seconds": 10 * 86400},
+        })
+        self.assertIn("综合印象：经常深夜发广告链接", text)
+        self.assertIn("性格特质：功利", text)
+        self.assertIn("LLM 分析失败", text)
+        self.assertIn("历史扫描失败", text)
+        self.assertIn("数据较旧", text)
+
+    def test_format_external_profile_clean_snapshot_has_no_quality_note(self):
+        text = GroupInviteGuardPlugin._format_external_decision_profile({
+            "provider": "astrbot_plugin_user_profile",
+            "score": 10,
+            "llm_status": "success",
+            "data_freshness": {"age_seconds": 3600},
+        })
+        self.assertNotIn("数据质量", text)
+
 
 if __name__ == "__main__":
     unittest.main()
