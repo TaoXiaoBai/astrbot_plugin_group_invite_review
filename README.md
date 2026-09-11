@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.19.1-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.19.2-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -100,6 +100,7 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `auto_approve` | `false` | 判断要加时自动同意进群 |
 | `auto_reject` | `false` | 判断不要加时自动拒绝 |
 | `reply_inviter_on_decision` | `true` | 审批/退群结果确定且成功后私聊邀请人 |
+| `custom_reject_reply` | `""` | 固定拒绝文案（留空由 LLM 按人格和上下文写；`{reason}` 替换为拒绝原因） |
 | `llm_provider_id` | `""` | 判断用的模型（留空用默认） |
 | `decision_persona` | `""` | 决策用人格（留空用默认人格） |
 | `enable_member_context` | `true` | 参考目标群成员 |

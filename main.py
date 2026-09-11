@@ -128,6 +128,7 @@ _CONFIG_GROUPS = {
         "auto_approve": False,
         "auto_reject": False,
         "reply_inviter_on_decision": True,
+        "custom_reject_reply": "",
         "llm_provider_id": "",
         "decision_persona": "",
         "enable_member_context": True,
@@ -444,7 +445,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.19.1",
+    "1.19.2",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -972,6 +973,14 @@ class GroupInviteGuardPlugin(Star):
             action = "unknown"
         reason = _safe_text(decision.get("reason") if isinstance(decision, dict) else "", 300)
         reply = _safe_text(decision.get("reply") if isinstance(decision, dict) else "", 500)
+        if action == "reject":
+            custom_reject = str(
+                self._cfg("decision", "custom_reject_reply", "") or ""
+            ).strip()
+            if custom_reject:
+                reply = _safe_text(
+                    custom_reject.replace("{reason}", reason or "暂不方便加入"), 500
+                )
         alt_warning = _safe_text(decision.get("alt_warning") if isinstance(decision, dict) else "", 600)
         profile_snapshot = decision.get("_profile_snapshot")
         if not isinstance(profile_snapshot, dict):
@@ -2060,9 +2069,14 @@ class GroupInviteGuardPlugin(Star):
             "</untrusted_evidence>\n请以你的身份和性格判断是否同意这个加群邀请。"
             "只输出一个 JSON 对象：{\"action\": \"approve\" 或 \"reject\", \"reason\": \"简短理由\", "
             "\"reply\": \"以你人格身份对邀请人说的话\"}。"
-            "其中 reply 要简短（一两句）、符合你的人格、不要暴露详细审核细节："
-            "approve 时是同意前的打招呼/说明，reject 时是委婉的拒绝（不要写太详细的原因）。"
+            "reply 要简短（一两句）、符合你的人格、结合附言和背景信息来写："
+            "approve 时是同意前的打招呼/说明；reject 时是委婉拒绝，"
+            "可以说明大致原因方向（如暂时不加新群、和对方不熟等），"
+            "对方附言写了具体内容时可以回应一句，"
+            "但不要暴露审核细节、风险分、黑名单等内部信息。"
         )
+        if str(self._cfg("decision", "custom_reject_reply", "") or "").strip():
+            prompt += "注意：reject 时会改用管理员配置的固定拒绝文案，reply 按 approve 场景写即可。"
 
         resp = await self.context.llm_generate(
             chat_provider_id=provider_id,

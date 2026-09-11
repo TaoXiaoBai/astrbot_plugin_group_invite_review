@@ -57,6 +57,12 @@
         "default": true,
         "hint": "审批或补偿动作成功后再私聊，失败时不承诺结果"
       },
+      "custom_reject_reply": {
+        "description": "固定拒绝文案",
+        "type": "string",
+        "default": "",
+        "hint": "留空则由 LLM 按人格和上下文写；填写后拒绝时固定发送这句，{reason} 会替换为拒绝原因"
+      },
       "llm_provider_id": {
         "description": "决策模型",
         "type": "string",

@@ -1780,6 +1780,43 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertNotIn("数据质量", text)
 
+    async def test_custom_reject_reply_overrides_llm_reply(self):
+        plugin = self.make_plugin(decision="reject")
+        plugin.config["decision"]["custom_reject_reply"] = "抱歉，暂不加群：{reason}"
+        bot, _, record = await self.run_invite(plugin)
+        sent = [
+            params["message"] for name, params in bot.calls
+            if name == "send_private_msg"
+        ]
+        self.assertEqual(sent, ["抱歉，暂不加群：test reason"])
+        self.assertEqual(record["reply"], "抱歉，暂不加群：test reason")
+
+    async def test_custom_reject_reply_only_applies_to_reject(self):
+        plugin = self.make_plugin(decision="approve")
+        plugin.config["decision"]["custom_reject_reply"] = "抱歉，暂不加群"
+        bot, _, record = await self.run_invite(plugin)
+        sent = [
+            params["message"] for name, params in bot.calls
+            if name == "send_private_msg"
+        ]
+        self.assertEqual(sent, ["test reply"])
+
+    async def test_decision_prompt_mentions_fixed_reject_reply(self):
+        plugin = self.make_plugin()
+        plugin.config["decision"]["custom_reject_reply"] = "暂不加群"
+        plugin._default_provider_id = lambda: "provider"
+        plugin._resolve_persona_prompt = AsyncMock(return_value="")
+        plugin._build_invite_context = AsyncMock(return_value=("", "", {}))
+        plugin.context = types.SimpleNamespace(
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(
+                completion_text='{"action":"reject","reason":"ok","reply":"hi"}'
+            ))
+        )
+        await GroupInviteGuardPlugin._ask_llm(plugin, "20000", "30000", "hello")
+        prompt = plugin.context.llm_generate.await_args.kwargs["prompt"]
+        self.assertIn("固定拒绝文案", prompt)
+        self.assertIn("回应一句", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
