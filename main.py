@@ -445,7 +445,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.19.2",
+    "1.19.3",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -612,6 +612,7 @@ class GroupInviteGuardPlugin(Star):
             platform_id = str(event.get_platform_id() or "")
         except Exception:
             pass
+        history_umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
 
         request_key = self._make_request_key(raw, flag)
         record_id, duplicate, reconcile = await self._begin_invite_request(
@@ -668,6 +669,7 @@ class GroupInviteGuardPlugin(Star):
                     sub_type=sub_type,
                     self_id=self_id,
                     platform_id=platform_id,
+                    history_umo=history_umo,
                     request_key=request_key,
                     record_id=record_id,
                     target_state=target_state,
@@ -949,8 +951,8 @@ class GroupInviteGuardPlugin(Star):
 
     async def _review_invite_request(
         self, *, bot, group_id: str, inviter_qq: str, comment: str, flag: str,
-        sub_type: str, self_id: str, platform_id: str, request_key: str,
-        record_id: str, target_state: str, target_error: str,
+        sub_type: str, self_id: str, platform_id: str, history_umo: str,
+        request_key: str, record_id: str, target_state: str, target_error: str,
     ) -> None:
         membership_before = await self._membership_state(bot, group_id, self_id)
         await self._update_invite_record(
@@ -962,7 +964,8 @@ class GroupInviteGuardPlugin(Star):
         )
         try:
             decision = await self._ask_llm(
-                inviter_qq, group_id, comment, bot, platform_id, request_key=request_key
+                inviter_qq, group_id, comment, bot, platform_id,
+                history_umo=history_umo, request_key=request_key,
             )
         except Exception as exc:
             logger.error(f"group_invite_guard: LLM decision failed: {exc}")
@@ -1296,8 +1299,9 @@ class GroupInviteGuardPlugin(Star):
         except Exception:
             pass
 
+        history_umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
         try:
-            decision = await self._ask_private_intent(text, platform_id)
+            decision = await self._ask_private_intent(text, platform_id, history_umo)
         except Exception as exc:
             logger.error(f"group_invite_guard: private intent LLM failed: {exc}")
             return
@@ -1349,10 +1353,15 @@ class GroupInviteGuardPlugin(Star):
             "cold": "冷漠、简短，不解释太多，只陈述结果",
         }.get(str(tone or "").strip().lower(), "使用你当前人格设定的语气和风格")
 
-    async def _build_blacklist_inquiry_variables(self, sender_id: str, text: str, platform_id: str = None) -> dict:
+    async def _build_blacklist_inquiry_variables(
+        self, sender_id: str, text: str, platform_id: str = None,
+        history_umo: str = "",
+    ) -> dict:
         """拼装黑名单询问提示词可用的所有变量。"""
         decision_persona = str(self._cfg("decision", "decision_persona") or "").strip()
-        persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
+        persona_prompt = await self._resolve_persona_prompt(
+            decision_persona, platform_id, history_umo
+        )
 
         ban_entry = self._find_ban_entry(sender_id)
         ban_reason = ""
@@ -1409,13 +1418,21 @@ class GroupInviteGuardPlugin(Star):
             result = result.replace("{" + key + "}", str(val))
         return result
 
-    async def _ask_blacklist_inquiry(self, sender_id: str, text: str, platform_id: str = None) -> dict:
+    async def _ask_blacklist_inquiry(
+        self, sender_id: str, text: str, platform_id: str = None,
+        history_umo: str = "",
+    ) -> dict:
         """让 LLM 判断对方是否在询问拉黑/拒绝/踢人原因，并生成人格化回复。"""
-        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
+        provider_id = (
+            self._cfg("decision", "llm_provider_id")
+            or self._default_provider_id(history_umo)
+        )
         if not provider_id:
             raise RuntimeError("no llm provider id configured")
 
-        variables = await self._build_blacklist_inquiry_variables(sender_id, text, platform_id)
+        variables = await self._build_blacklist_inquiry_variables(
+            sender_id, text, platform_id, history_umo
+        )
 
         custom_system = str(self._cfg("private_intent", "blacklist_inquiry_system_prompt") or "").strip()
         if custom_system:
@@ -1501,8 +1518,11 @@ class GroupInviteGuardPlugin(Star):
             pass
 
         sender_id = event.get_sender_id() or ""
+        history_umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
         try:
-            decision = await self._ask_blacklist_inquiry(sender_id, text, platform_id)
+            decision = await self._ask_blacklist_inquiry(
+                sender_id, text, platform_id, history_umo
+            )
         except Exception as exc:
             logger.error(f"group_invite_guard: blacklist inquiry LLM failed: {exc}")
             return
@@ -2041,17 +2061,21 @@ class GroupInviteGuardPlugin(Star):
 
     async def _ask_llm(
         self, inviter_qq: str, group_id: str, comment: str, bot=None,
-        platform_id: str = None, request_key: str = "",
+        platform_id: str = None, history_umo: str = "", request_key: str = "",
     ) -> dict:
-        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
+        provider_id = (
+            self._cfg("decision", "llm_provider_id")
+            or self._default_provider_id(history_umo)
+        )
         if not provider_id:
             raise RuntimeError("no llm provider id configured")
 
         decision_persona = str(self._cfg("decision", "decision_persona") or "").strip()
         persona_prompt, context_result = await asyncio.gather(
-            self._resolve_persona_prompt(decision_persona, platform_id),
+            self._resolve_persona_prompt(decision_persona, platform_id, history_umo),
             self._build_invite_context(
-                inviter_qq, group_id, bot, comment, request_key=request_key
+                inviter_qq, group_id, bot, comment, platform_id=platform_id,
+                history_umo=history_umo, request_key=request_key,
             ),
         )
         system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
@@ -2091,32 +2115,67 @@ class GroupInviteGuardPlugin(Star):
             decision["_profile_snapshot"] = profile_snapshot
         return decision
 
-    async def _resolve_persona_prompt(self, persona_id: str, platform_id: str = None) -> str:
-        """加载人格设定的完整 system_prompt，用于给决策 LLM 充当性格；失败返回空。"""
+    async def _resolve_persona_prompt(
+        self, persona_id: str, platform_id: str = None, history_umo: str = ""
+    ) -> str:
+        """加载人格设定提示词；兼容 AstrBot 新旧人格 API，失败返回空。"""
         pm = getattr(self.context, "persona_manager", None)
         if pm is None:
             return ""
-        if not persona_id:
-            # 未显式指定人格时，自动用当前账号的默认人格
+        resolved_id = str(persona_id or "").strip()
+        default_prompt = ""
+        if not resolved_id:
             try:
-                umo = f"{platform_id}:GroupMessage:0" if platform_id else None
-                persona = await pm.get_default_persona_v3(umo=umo)
-                persona_id = persona["name"] if persona else None
+                umo = (
+                    str(history_umo or "").strip()
+                    or (f"{platform_id}:GroupMessage:0" if platform_id else None)
+                )
+                persona = pm.get_default_persona_v3(umo=umo)
+                if inspect.isawaitable(persona):
+                    persona = await persona
+                if isinstance(persona, dict):
+                    default_prompt = str(persona.get("prompt") or "").strip()
+                    resolved_id = str(persona.get("name") or "").strip()
             except Exception as exc:
                 logger.warning(f"group_invite_guard: resolve default persona failed: {exc}")
-                persona_id = None
-        if not persona_id or persona_id == "default":
+                return ""
+        if not resolved_id:
+            return default_prompt
+
+        get_v3 = getattr(pm, "get_persona_v3_by_id", None)
+        if callable(get_v3):
+            try:
+                persona = get_v3(resolved_id)
+                if inspect.isawaitable(persona):
+                    persona = await persona
+                if isinstance(persona, dict):
+                    prompt = str(persona.get("prompt") or "").strip()
+                    if prompt:
+                        return prompt
+            except Exception as exc:
+                logger.warning(
+                    f"group_invite_guard: load v3 persona '{resolved_id}' failed: {exc}"
+                )
+        if default_prompt:
+            return default_prompt
+
+        get_legacy = getattr(pm, "get_persona", None)
+        if not callable(get_legacy):
             return ""
         try:
-            persona = await pm.get_persona(persona_id)
+            persona = get_legacy(resolved_id)
+            if inspect.isawaitable(persona):
+                persona = await persona
         except Exception as exc:
-            logger.warning(f"group_invite_guard: load persona '{persona_id}' failed: {exc}")
+            logger.warning(f"group_invite_guard: load persona '{resolved_id}' failed: {exc}")
             return ""
+        if isinstance(persona, dict):
+            return str(persona.get("system_prompt") or "").strip()
         return str(getattr(persona, "system_prompt", "") or "").strip()
 
     async def _build_invite_context(
         self, inviter_qq: str, group_id: str, bot, comment: str = "",
-        request_key: str = "",
+        platform_id: str = None, history_umo: str = "", request_key: str = "",
     ):
         """收集决策背景，返回 (文本, 小号提示, 结构化画像快照)。"""
         try:
@@ -2133,7 +2192,9 @@ class GroupInviteGuardPlugin(Star):
 
         async def _impression():
             if self._cfg("decision", "enable_impression_context", True):
-                return await self._build_impression_section(inviter_qq, group_id)
+                return await self._build_impression_section(
+                    inviter_qq, group_id, platform_id, history_umo
+                )
             return ("", 0)
 
         async def _external_profile():
@@ -2152,7 +2213,7 @@ class GroupInviteGuardPlugin(Star):
             _external_profile(),
             self._detect_alt_account(
                 inviter_qq, comment, bot, exclude_request_key=request_key,
-                invite_records=invite_snapshot,
+                invite_records=invite_snapshot, history_umo=history_umo,
             ),
             return_exceptions=True,
         )
@@ -2926,7 +2987,7 @@ class GroupInviteGuardPlugin(Star):
 
     async def _detect_alt_account(
         self, inviter_qq: str, comment: str, bot, exclude_request_key: str = "",
-        invite_records=None,
+        invite_records=None, history_umo: str = "",
     ) -> str:
         """识别邀请人是否疑似黑名单用户的小号。"""
         if not _as_bool(self._cfg("alt_detect", "alt_account_detect", True)):
@@ -2948,7 +3009,7 @@ class GroupInviteGuardPlugin(Star):
             return ""
         return await self._llm_review_alt(
             inviter_qq, comment, best_uid, best_sim, best_dim,
-            invite_records=invite_records,
+            invite_records=invite_records, history_umo=history_umo,
         )
 
     async def _past_comment_of(self, qq: str, invite_records=None) -> str:
@@ -2972,7 +3033,7 @@ class GroupInviteGuardPlugin(Star):
 
     async def _llm_review_alt(
         self, inviter_qq: str, comment: str, old_uid: str, sim: float, dim: str,
-        invite_records=None,
+        invite_records=None, history_umo: str = "",
     ) -> str:
         inviter_qq = str(inviter_qq or "").strip()
         old_uid = str(old_uid or "").strip()
@@ -2983,13 +3044,13 @@ class GroupInviteGuardPlugin(Star):
             key,
             lambda: self._llm_review_alt_once(
                 inviter_qq, comment, old_uid, sim, dim,
-                invite_records=invite_records,
+                invite_records=invite_records, history_umo=history_umo,
             ),
         )
 
     async def _llm_review_alt_once(
         self, inviter_qq: str, comment: str, old_uid: str, sim: float, dim: str,
-        invite_records=None,
+        invite_records=None, history_umo: str = "",
     ) -> str:
         """灰色区间小号复判：一次轻量 LLM 调用判断是否同一人，判定缓存 kv（alt_verdict_cache）7 天；失败按未复判处理返回空。"""
         cache_key = f"{inviter_qq}|{old_uid}"
@@ -3025,7 +3086,10 @@ class GroupInviteGuardPlugin(Star):
         if not comment and not old_comment and not new_quotes and not old_quotes:
             return ""  # 双方都没附言没发言，无可对比数据，零 LLM 开销
 
-        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
+        provider_id = (
+            self._cfg("decision", "llm_provider_id")
+            or self._default_provider_id(history_umo)
+        )
         if not provider_id:
             return ""
 
@@ -3128,16 +3192,101 @@ class GroupInviteGuardPlugin(Star):
             return fallback
         return header + "\n" + "\n".join(lines)
 
-    async def _search_inviter_history(self, inviter_qq: str) -> tuple[list, list]:
-        qq = str(inviter_qq or "").strip()
-        if not qq:
+    @staticmethod
+    def _history_record_order(record: Any, sequence: int) -> tuple:
+        created_at = GroupInviteGuardPlugin._nested(record, "created_at")
+        if isinstance(created_at, datetime):
+            return 2, created_at.timestamp(), sequence
+        try:
+            if created_at not in (None, ""):
+                return 2, float(created_at), sequence
+        except (TypeError, ValueError, OverflowError):
+            pass
+        record_id = GroupInviteGuardPlugin._nested(record, "id")
+        try:
+            if record_id not in (None, ""):
+                return 1, float(record_id), sequence
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return 0, sequence, sequence
+
+    async def _search_persisted_inviter_history(
+        self, inviter_qq: str, platform_id: str, group_id: str, history_umo: str
+    ) -> list:
+        manager = getattr(self.context, "message_history_manager", None)
+        getter = getattr(manager, "get", None)
+        if not callable(getter) or not platform_id:
+            return []
+
+        scopes = []
+        group_scope = str(history_umo or "").strip()
+        if not group_scope and group_id:
+            group_scope = f"{platform_id}:GroupMessage:{group_id}"
+        if group_scope:
+            scopes.append(group_scope)
+        if inviter_qq:
+            scopes.append(f"{platform_id}:FriendMessage:{inviter_qq}")
+        scopes = list(dict.fromkeys(scopes))
+        loaded = await asyncio.gather(*(
+            getter(platform_id=platform_id, user_id=scope, page_size=200)
+            for scope in scopes
+        ), return_exceptions=True)
+
+        candidates = []
+        sequence = 0
+        for scope, records in zip(scopes, loaded):
+            if isinstance(records, BaseException):
+                logger.warning(
+                    f"group_invite_guard: search persisted history scope "
+                    f"'{scope}' failed: {records}"
+                )
+                continue
+            for record in records if isinstance(records, list) else []:
+                sequence += 1
+                sender_id = str(self._nested(record, "sender_id") or "").strip()
+                if sender_id != inviter_qq:
+                    continue
+                content = self._nested(record, "content")
+                if not isinstance(content, dict):
+                    continue
+                if str(content.get("type") or "").strip().lower() != "user":
+                    continue
+                order = self._history_record_order(record, sequence)
+                text = self._content_to_text(content.get("message"))
+                for line_index, raw_line in enumerate(text.splitlines()):
+                    line = raw_line.strip()
+                    if not line or len(line) < 2:
+                        continue
+                    if len(line) > 300:
+                        line = line[:300] + self._cfg("decision", "truncate_marker", "…")
+                    candidates.append((order, line_index, line))
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        seen = set()
+        recent = []
+        for _, _, line in reversed(candidates):
+            if line in seen:
+                continue
+            seen.add(line)
+            recent.append(line)
+            if len(recent) >= 20:
+                break
+        return list(reversed(recent))
+
+    async def _search_legacy_inviter_history(self, inviter_qq: str) -> tuple[list, list]:
+        manager = getattr(self.context, "conversation_manager", None)
+        getter = getattr(manager, "get_filtered_conversations", None)
+        if not callable(getter):
             return [], []
         try:
-            conversations, _ = await self.context.conversation_manager.get_filtered_conversations(
-                page=1, page_size=10, search_query=qq, include_history=True
+            conversations, _ = await getter(
+                page=1, page_size=10, search_query=inviter_qq, include_history=True
             )
         except Exception as exc:
-            logger.warning(f"group_invite_guard: search inviter history '{qq}' failed: {exc}")
+            logger.warning(
+                f"group_invite_guard: search legacy inviter history "
+                f"'{inviter_qq}' failed: {exc}"
+            )
             return [], []
 
         conversations = list(conversations or [])[:10]
@@ -3148,7 +3297,7 @@ class GroupInviteGuardPlugin(Star):
                 impression_lines.extend(self._extract_history_lines(history))
 
         speaker_lines = []
-        pattern = re.compile(r"ID:\s*" + re.escape(qq))
+        pattern = re.compile(r"ID:\s*" + re.escape(inviter_qq))
         for conv in conversations:
             history = getattr(conv, "history", None)
             if not history:
@@ -3182,10 +3331,42 @@ class GroupInviteGuardPlugin(Star):
                         return impression_lines[:30], speaker_lines
         return impression_lines[:30], speaker_lines
 
-    async def _build_impression_section(self, inviter_qq: str, group_id: str):
+    async def _search_inviter_history(
+        self, inviter_qq: str, platform_id: str = None, group_id: str = "",
+        history_umo: str = "",
+    ) -> tuple[list, list]:
+        qq = str(inviter_qq or "").strip()
+        if not qq:
+            return [], []
+        persisted, legacy = await asyncio.gather(
+            self._search_persisted_inviter_history(
+                qq, str(platform_id or "").strip(), str(group_id or "").strip(),
+                history_umo,
+            ),
+            self._search_legacy_inviter_history(qq),
+            return_exceptions=True,
+        )
+        if isinstance(persisted, BaseException):
+            logger.warning(f"group_invite_guard: persisted inviter history failed: {persisted}")
+            persisted = []
+        if isinstance(legacy, BaseException):
+            logger.warning(f"group_invite_guard: legacy inviter history failed: {legacy}")
+            legacy = ([], [])
+        impression_lines, legacy_quotes = legacy
+        combined = list(legacy_quotes) + list(persisted)
+        speaker_lines = list(dict.fromkeys(reversed(combined)))[:20]
+        speaker_lines.reverse()
+        return impression_lines[:30], speaker_lines
+
+    async def _build_impression_section(
+        self, inviter_qq: str, group_id: str, platform_id: str = None,
+        history_umo: str = "",
+    ):
         """返回 (印象小节文本, 邀请人发言条数)；发言条数供画像复用，避免重复搜索。"""
         searched = await asyncio.gather(
-            self._search_inviter_history(inviter_qq),
+            self._search_inviter_history(
+                inviter_qq, platform_id, group_id, history_umo
+            ),
             self._search_impression_lines(group_id),
             return_exceptions=True,
         )
@@ -3197,7 +3378,9 @@ class GroupInviteGuardPlugin(Star):
         if speaker_lines:
             summary = ""
             if _as_bool(self._cfg("decision", "impression_llm_summary", True)):
-                summary = await self._summarize_impression(inviter_qq, speaker_lines)
+                summary = await self._summarize_impression(
+                    inviter_qq, speaker_lines, history_umo
+                )
             if summary:
                 # 有小结时原话只留 5 条节选，避免上下文膨胀
                 parts.append(f"对邀请人（QQ {inviter_qq}）的印象小结：{summary}")
@@ -3211,15 +3394,22 @@ class GroupInviteGuardPlugin(Star):
             parts.append("对该群的既有印象：\n" + "\n".join(group_lines))
         return "\n\n".join(parts), len(speaker_lines)
 
-    async def _summarize_impression(self, inviter_qq: str, quotes: list) -> str:
+    async def _summarize_impression(
+        self, inviter_qq: str, quotes: list, history_umo: str = ""
+    ) -> str:
         qq = str(inviter_qq or "").strip()
         normalized_quotes = [q for q in (quotes or []) if str(q or "").strip()]
         key = f"impression:{qq}:{len(normalized_quotes)}"
         return await self._singleflight(
-            key, lambda: self._summarize_impression_once(qq, normalized_quotes)
+            key,
+            lambda: self._summarize_impression_once(
+                qq, normalized_quotes, history_umo
+            ),
         )
 
-    async def _summarize_impression_once(self, inviter_qq: str, quotes: list) -> str:
+    async def _summarize_impression_once(
+        self, inviter_qq: str, quotes: list, history_umo: str = ""
+    ) -> str:
         """把邀请人的历史发言原话浓缩成 100 字内的印象小结（一次轻量 LLM 调用）。
 
         带 kv 缓存（impression_cache）：发言条数比缓存时变多才重新生成，否则直接用缓存；
@@ -3247,7 +3437,10 @@ class GroupInviteGuardPlugin(Star):
             if cached_summary and len(quotes) <= cached_count:
                 return cached_summary
 
-        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
+        provider_id = (
+            self._cfg("decision", "llm_provider_id")
+            or self._default_provider_id(history_umo)
+        )
         if not provider_id:
             return ""
         prompt = (
@@ -3404,13 +3597,20 @@ class GroupInviteGuardPlugin(Star):
         mapping = {"owner": "群主", "admin": "管理员", "member": "成员"}
         return mapping.get(str(role or "").strip().lower(), str(role or "成员"))
 
-    async def _ask_private_intent(self, text: str, platform_id: str = None) -> dict:
-        provider_id = self._cfg("decision", "llm_provider_id") or self._default_provider_id()
+    async def _ask_private_intent(
+        self, text: str, platform_id: str = None, history_umo: str = ""
+    ) -> dict:
+        provider_id = (
+            self._cfg("decision", "llm_provider_id")
+            or self._default_provider_id(history_umo)
+        )
         if not provider_id:
             raise RuntimeError("no llm provider id configured")
 
         decision_persona = str(self._cfg("decision", "decision_persona") or "").strip()
-        persona_prompt = await self._resolve_persona_prompt(decision_persona, platform_id)
+        persona_prompt = await self._resolve_persona_prompt(
+            decision_persona, platform_id, history_umo
+        )
         system_prompt = persona_prompt or "你是一个 QQ 机器人助手。"
 
         prompt = (
@@ -3430,15 +3630,30 @@ class GroupInviteGuardPlugin(Star):
         result_text = (getattr(resp, "completion_text", "") or "").strip()
         return _parse_json(result_text)
 
-    def _default_provider_id(self) -> str:
-        provider_settings = self._nested(self._global_config(), "provider_settings")
-        if isinstance(provider_settings, dict):
-            return str(provider_settings.get("default_provider_id") or "")
-        return str(self._nested(provider_settings, "default_provider_id") or "")
+    def _default_provider_id(self, history_umo: str = "") -> str:
+        config = self._global_config(history_umo)
+        legacy_id = self._nested(config, "provider_settings", "default_provider_id")
+        if legacy_id:
+            return str(legacy_id)
+        current_id = self._nested(
+            config, "agent_runner", "config", "model", "provider_id"
+        )
+        return str(current_id or "")
 
-    def _global_config(self) -> Any:
+    def _global_config(self, history_umo: str = "") -> Any:
+        getter = getattr(self.context, "get_config", None)
+        if not callable(getter):
+            return None
+        umo = str(history_umo or "").strip()
+        if umo:
+            try:
+                return getter(umo=umo)
+            except TypeError:
+                pass
+            except Exception:
+                return None
         try:
-            return self.context.get_config()
+            return getter()
         except Exception:
             return None
 
