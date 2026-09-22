@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.19.3-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.21.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -33,8 +33,12 @@
 - 自动记录每次进群的邀请人；被该群踢出后可自动删除好友 / 拉黑邀请人，并通知管理员
 - 可选：被踢时连执行踢人的管理员一起拉黑
 - 可选：跨群连坐——被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群再拉黑 TA
-- 被禁言自动计数，达到阈值自动退群 + 拉黑
-- 拉黑前可给对方发一句自定义告别留言
+- 被禁言自动计数，达到次数阈值直接退群 + 拉黑，不调用 LLM；未达次数但单次达到 24 小时（可调）时按现有人格与邀请人/群背景交 LLM 复核，仅明确决定退群才执行同一套动作
+- 默认把可验证的禁言操作者写入用户画像并增加 35 风险（累计默认最多 70）；可改为邀请人关联责任或两者。邀请人不会伪装成操作者，未知/非法/机器人自身 QQ 不归因。该联动与禁言报复总开关独立
+- 可另行开启“即时拉黑画像归因对象”（默认关闭），它独立于禁言报复开关，并可与画像风险增量同时启用；任务先持久化为 pending，成功后才标 completed，失败或重启后自动重试，同一事件不会和阈值报复重复拉黑
+- 长期禁言复核为默认开启的子开关，但禁言报复总开关默认关闭；LLM 保留、异常或无效输出只通知管理员并保留次数。协议时长为秒，非法或超过 366 天的值不参与复核，普通通知显示可读时长
+- 长期禁言 LLM 退群可选在所有退群/连坐/拉黑动作前私聊邀请人（默认关闭），使用独立的 `long_mute_inviter_message`；留空回退安全默认文案。它不读取被踢/审核场景的 `ban_notice_message`，LLM `reply`/`reason` 也不会外发。发送失败不影响后续动作
+- 动作前会清理本群计数以防并发重复；当前群退群明确失败或等待退群时任务被取消，会以不覆盖更大新值的方式恢复计数。退群是跨系统外部动作，极端进程崩溃窗口无法事务化，计数仍可能丢失；不会在重启后猜测或重放未知结果
 - 管理员直拉进群没有邀请事件？也没关系——进群时间/操作人照样记录，被踢时通知你
 
 **LLM 联动**
@@ -68,7 +72,9 @@
 
 单独安装即可完整使用。如果装了「[用户画像](https://github.com/TaoXiaoBai/astrbot_plugin_user_profile)」插件，邀请审核优先调用 `get_decision_profile()`，读取结构化风险分、标签、活跃度、数据新鲜度、LLM 状态和社交来源；当前审核记录按 `request_key` 排除。旧画像插件依次降级到标签 API 或文本 API。
 
-守卫同时提供版本化只读 API `get_inviter_evidence(qq, exclude_request_key="")`。画像插件优先通过该 API 取得有限的邀请/进群摘要，旧守卫才回退 KV；旧或脏 KV 的非法时间会安全降级为 `0`，不会使整个 API 失败。群级“bot 被禁言次数”只作为相关群背景，不再称为邀请人的个人禁言前科。
+守卫同时提供版本化只读 API `get_inviter_evidence(qq, exclude_request_key="")`。画像插件优先通过该 API 取得有限的邀请/进群摘要，旧守卫才回退 KV；旧或脏 KV 的非法时间会安全降级为 `0`。守卫 1.21.0+ 调用画像 1.10.0+ 的可信写入 API：先持久化待投递目标，只有 `recorded`/`duplicate` 才完成；插件缺失、旧 API、禁用、失败或返回 false 都保留 pending，由启动恢复循环继续投递。稳定事件 completed 账本不淘汰，`mute_event_jobs` 全局最多 5000 条，满后明确拒绝新事件而不删除旧键。邀请人归因和即时拉黑只接受当前群 `join_records.inviter` 明确字段，不使用 `join_records.operator` 或旧邀请记录兜底；联动 job 达上限或 KV 故障只会跳过画像/direct，不会阻断原禁言计数、阈值退群或长期复核。
+
+恢复客户端按 `self_id` 隔离：`delete_friend` 必须等对应 bot 账号出现后才能恢复，绝不借用其它账号；纯 AstrBot 黑名单模式无需协议客户端。初始化后尚未见到该账号时 pending 等待是正常行为。画像 `/画像删除` 会调用可信取消接口，把该 QQ 未完成的画像投递标为 cancelled 并等待在途调用收敛，但不会取消 direct blacklist；completed 账本继续保留，防止旧稳定事件重放。
 
 结构化画像快照不复制发言原话，并保留 `age_seconds=null` 的“新鲜度未知”语义。邀请附言、好友验证语、历史印象、画像 evidence 等内容在决策 prompt 中统一标记为不可信证据并限长，模型不得执行其中指令。模型输出的 `reason` 会清控制字符并限制为 300 字，`reply` 限制为 500 字，然后才落盘或发送。`/邀请记录` 可同时查看 LLM 建议与实际执行结果。
 
@@ -152,18 +158,27 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 | `kick_ban_operator` | `false` | 被踢时把执行踢人的人也拉黑 |
 | `record_group_join` | `true` | 记录每次进群的时间/操作人 |
 | `cross_group_retaliation` | `false` | 被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群并拉黑 TA |
-| `ban_notice_message` | `""` | 拉黑前私聊发给对方的话，手动拉黑也会发送（留空不发） |
+| `ban_notice_message` | `""` | 被踢报复/手动拉黑等原有流程的拉黑前留言；长期禁言通知不读取此项 |
 | `intercept_banned_messages` | `true` | 兜底拦截已拉黑用户的群聊/私聊消息 |
 
 **禁言报复 `mute_revenge`**
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `mute_retaliation_enable` | `false` | 被禁言达阈值自动退群并拉黑 |
-| `mute_threshold` | `3` | 禁言次数阈值 |
+| `mute_retaliation_enable` | `false` | 只控制禁言次数和长期复核/退群，不控制画像联动或即时拉黑 |
+| `mute_threshold` | `3` | 次数达到后直接退群并拉黑，不调用 LLM |
+| `long_mute_llm_review` | `true` | 未达次数时，长期禁言交给 LLM 复核 |
+| `long_mute_threshold_hours` | `24` | 单次禁言触发复核的小时数（运行时限制 1-8760） |
+| `long_mute_notify_inviter` | `false` | 仅长期禁言经 LLM 决定退群后、所有动作前私聊邀请人 |
+| `long_mute_inviter_message` | `这次禁言时间太长，我先退出本群。祝好。` | 长期禁言退群专用文案；留空回退该默认值，不读取 `ban_notice_message`，不外发 LLM reply/reason |
 | `mute_target` | `operator` | 拉黑对象：`operator` / `inviter` / `both` |
 | `mute_ban_mode` | `astrbot_ban` | 拉黑方式：`astrbot_ban` / `delete_friend` |
 | `mute_notify` | `true` | 被禁言/报复后通知管理员 |
+| `profile_mute_enable` | `true` | 将个人禁言证据写入画像；与 `mute_retaliation_enable` 独立 |
+| `profile_mute_target` | `operator` | `operator` / `inviter`（关联责任）/ `both` |
+| `profile_mute_risk_increment` | `35` | 每个去重事件的画像风险增量，限制 0-100 |
+| `profile_mute_risk_cap` | `70` | 单人禁言风险累计上限，限制 0-100 |
+| `profile_mute_direct_blacklist` | `false` | 立即拉黑画像归因对象；可与风险叠加同时开启 |
 
 **LLM 联动 `llm_integration`**
 

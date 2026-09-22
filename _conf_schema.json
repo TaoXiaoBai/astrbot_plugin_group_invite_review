@@ -7,7 +7,7 @@
         "description": "启用插件",
         "type": "bool",
         "default": true,
-        "hint": "关闭后只记录邀请，不接管事件"
+        "hint": "关闭后停止自动邀请审核、禁言画像联动、即时拉黑及禁言报复等自动动作；管理员显式命令仍可用。"
       },
       "notify_private": {
         "description": "私聊通知管理员",
@@ -285,7 +285,7 @@
         "description": "拉黑前留言",
         "type": "string",
         "default": "",
-        "hint": "拉黑前私聊发给对方的话，手动拉黑也会发送；留空则不发"
+        "hint": "被踢报复、手动拉黑等原有流程使用；长期禁言通知不读取此项，留空则不发"
       },
       "intercept_banned_messages": {
         "description": "拉黑后拦截消息",
@@ -303,13 +303,37 @@
         "description": "禁言自动报复",
         "type": "bool",
         "default": false,
-        "hint": "被禁言达到次数后自动退群并拉黑"
+        "hint": "只控制禁言次数累计、长期 LLM 复核及触发后的退群/报复；不控制画像写入和下方即时拉黑。"
       },
       "mute_threshold": {
         "description": "禁言次数阈值",
         "type": "int",
         "default": 3,
-        "hint": "同一个群里被禁言几次后触发"
+        "hint": "同一个群里被禁言几次后直接退群，不经过 LLM"
+      },
+      "long_mute_llm_review": {
+        "description": "长期禁言交给 LLM 复核",
+        "type": "bool",
+        "default": true,
+        "hint": "次数未达阈值但单次禁言很久时，由邀请决策模型判断是否退群；总开关关闭时不生效"
+      },
+      "long_mute_threshold_hours": {
+        "description": "长期禁言时长（小时）",
+        "type": "int",
+        "default": 24,
+        "hint": "单次禁言达到该时长才复核；运行时限制为 1-8760 小时"
+      },
+      "long_mute_notify_inviter": {
+        "description": "LLM 退群时通知邀请人",
+        "type": "bool",
+        "default": false,
+        "hint": "仅长期禁言经 LLM 决定退群后、所有动作前私聊一次；使用下方独立文案"
+      },
+      "long_mute_inviter_message": {
+        "description": "长期禁言退群通知文案",
+        "type": "string",
+        "default": "这次禁言时间太长，我先退出本群。祝好。",
+        "hint": "仅在长期禁言经 LLM 决定退群且开启通知邀请人时使用；留空会使用默认安全文案"
       },
       "mute_target": {
         "description": "禁言拉黑对象",
@@ -332,6 +356,38 @@
         "type": "bool",
         "default": true,
         "hint": "每次被禁言、触发报复时通知你"
+      },
+      "profile_mute_enable": {
+        "description": "禁言事件写入用户画像",
+        "type": "bool",
+        "default": true,
+        "hint": "默认开启。将协议可验证的 bot 被禁言事件写入用户画像插件；即使关闭禁言自动报复也生效。画像插件缺失或版本过旧时安全跳过。"
+      },
+      "profile_mute_target": {
+        "description": "画像归因对象",
+        "type": "string",
+        "default": "operator",
+        "options": ["operator", "inviter", "both"],
+        "labels": ["禁言操作者", "入群邀请人（关联责任）", "两者"],
+        "hint": "邀请人只标为关联责任，不会被记录为亲自禁言；未知、非法或机器人自身 QQ 不归因。"
+      },
+      "profile_mute_risk_increment": {
+        "description": "每次画像风险增量",
+        "type": "int",
+        "default": 35,
+        "hint": "每个去重禁言事件增加的风险分，运行时严格限制为 0-100。"
+      },
+      "profile_mute_risk_cap": {
+        "description": "单人禁言风险累计上限",
+        "type": "int",
+        "default": 70,
+        "hint": "个人禁言事件最多叠加的风险分，查询时生效并严格限制为 0-100；最终综合风险仍不超过 100。"
+      },
+      "profile_mute_direct_blacklist": {
+        "description": "即时拉黑画像归因对象",
+        "type": "bool",
+        "default": false,
+        "hint": "注意：独立于禁言报复总开关！默认关闭；开启后按经验证归因对象执行持久化待恢复的即时拉黑，可与画像积分同时启用。"
       }
     }
   },
