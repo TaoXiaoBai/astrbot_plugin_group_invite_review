@@ -454,7 +454,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.21.0",
+    "1.22.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -3229,6 +3229,30 @@ class GroupInviteGuardPlugin(Star):
             return None
         return getattr(md, "star_cls", None) if md else None
 
+    async def _record_profile_management(
+        self, qq: str, event_type: str, *, event_key: str,
+        reason: str = "", group_id: str = "", event_time: int | None = None,
+    ) -> None:
+        try:
+            instance = self._get_profile_plugin_instance()
+            recorder = getattr(instance, "record_management_event", None) if instance else None
+            if not callable(recorder):
+                return
+            timestamp = int(event_time or time.time())
+            result = recorder(
+                str(qq), event_key=_safe_text(event_key, 160),
+                event_type=event_type, source="astrbot_plugin_group_invite_guard",
+                event_time=timestamp, group_id=_safe_text(group_id, 32),
+                reason=_safe_text(reason, 200), result="success",
+                event_created_at_ms=int(time.time() * 1000),
+            )
+            if inspect.isawaitable(result):
+                await asyncio.wait_for(result, timeout=3)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: profile management linkage failed: {exc}")
+
     @staticmethod
     def _sanitize_profile_snapshot(raw: Any) -> dict:
         """限制外部画像快照字段和体积，避免复制原话或不可序列化对象。"""
@@ -3237,7 +3261,7 @@ class GroupInviteGuardPlugin(Star):
         recognized = {
             "provider", "score", "level", "tags", "activity", "social_origin",
             "data_freshness", "llm_status", "partial_errors", "evidence_untrusted",
-            "impression", "traits",
+            "impression", "traits", "management",
         }
         if not recognized.intersection(raw):
             return {}
@@ -3304,6 +3328,24 @@ class GroupInviteGuardPlugin(Star):
             score = 0
         freshness_raw = raw.get("data_freshness") if isinstance(raw.get("data_freshness"), dict) else {}
         errors_raw = raw.get("partial_errors") if isinstance(raw.get("partial_errors"), list) else []
+        management_raw = raw.get("management") if isinstance(raw.get("management"), dict) else {}
+        management_counts_raw = management_raw.get("counts") if isinstance(management_raw.get("counts"), dict) else {}
+        allowed_management = (
+            "astrbot_banned", "astrbot_unbanned", "bot_deleted_friend",
+            "friend_relation_missing", "friend_relation_restored",
+        )
+        management_recent = []
+        for item in management_raw.get("recent") if isinstance(management_raw.get("recent"), list) else []:
+            if not isinstance(item, dict) or str(item.get("type") or "") not in allowed_management:
+                continue
+            management_recent.append({
+                "type": str(item.get("type")),
+                "time": _safe_int(item.get("time")),
+                "group_id": _safe_text(item.get("group_id"), 32),
+                "reason": _safe_text(item.get("reason"), 200),
+            })
+            if len(management_recent) >= 10:
+                break
         return {
             "schema_version": _safe_int(raw.get("schema_version"), 1),
             "provider": str(raw.get("provider") or "astrbot_plugin_user_profile")[:64],
@@ -3339,7 +3381,19 @@ class GroupInviteGuardPlugin(Star):
                 "friend_request_comment": str(
                     social_raw.get("friend_request_comment") or ""
                 )[:200],
+                "friend_relation": _safe_text(social_raw.get("friend_relation"), 24),
+                "friend_last_confirmed": _safe_int(social_raw.get("friend_last_confirmed")),
+                "friend_last_missing": _safe_int(social_raw.get("friend_last_missing")),
+                "friend_last_restored": _safe_int(social_raw.get("friend_last_restored")),
                 "join_sources": joins,
+            },
+            "management": {
+                "counts": {
+                    kind: max(0, _safe_int(management_counts_raw.get(kind)))
+                    for kind in allowed_management
+                    if _safe_int(management_counts_raw.get(kind)) > 0
+                },
+                "recent": management_recent,
             },
         }
 
@@ -3407,6 +3461,13 @@ class GroupInviteGuardPlugin(Star):
         social = snapshot.get("social_origin") or {}
         if int(social.get("friend_add_time") or 0):
             lines.append("社交来源：已记录添加 bot 好友")
+        relation = str(social.get("friend_relation") or "")
+        if relation == "friend":
+            lines.append("好友关系：当前确认是好友")
+        elif relation == "missing":
+            lines.append("好友关系：已消失（原因未知）")
+        elif relation == "bot_deleted":
+            lines.append("好友关系：bot/守卫主动删除该好友")
         comment = str(social.get("friend_request_comment") or "").strip()
         if comment:
             lines.append(f"好友申请验证语：{comment}")
@@ -3419,6 +3480,23 @@ class GroupInviteGuardPlugin(Star):
                     f" / 操作者 {item.get('operator') or '未知'}"
                 )
             lines.append("进群关系：" + "；".join(rendered))
+        management = snapshot.get("management") or {}
+        management_counts = management.get("counts") if isinstance(management, dict) else {}
+        management_counts = management_counts if isinstance(management_counts, dict) else {}
+        management_labels = {
+            "astrbot_banned": "守卫成功拉黑",
+            "astrbot_unbanned": "守卫成功解封",
+            "bot_deleted_friend": "bot/守卫主动删除好友",
+            "friend_relation_missing": "好友关系消失（原因未知）",
+            "friend_relation_restored": "好友关系恢复",
+        }
+        rendered_management = [
+            f"{label} {int(management_counts.get(kind) or 0)} 次"
+            for kind, label in management_labels.items()
+            if int(management_counts.get(kind) or 0) > 0
+        ]
+        if rendered_management:
+            lines.append("管理历史：" + "；".join(rendered_management))
         return "\n".join(lines)
 
     async def _fetch_external_decision_profile(
@@ -4609,7 +4687,13 @@ class GroupInviteGuardPlugin(Star):
             parts.append(notice)
         try:
             await self._call_action(bot, "delete_friend", user_id=int(inviter_qq), block=True)
+            deleted_at = int(time.time())
             parts.append(f"已删除并拉黑好友 {inviter_qq}")
+            await self._record_profile_management(
+                inviter_qq, "bot_deleted_friend",
+                event_key=f"guard:kick-delete:{inviter_qq}:{deleted_at}",
+                reason="被踢后报复", event_time=deleted_at,
+            )
         except Exception as exc:
             parts.append(f"删除好友失败：{exc}")
 
@@ -4821,11 +4905,12 @@ class GroupInviteGuardPlugin(Star):
             if config is None:
                 return err
             try:
+                ban_time = int(time.time())
                 ban_list = self._filter_ban_list(config.get("ban_list"), inviter_qq)
                 ban_list.append(
                     {
                         "user_id": str(inviter_qq),
-                        "ban_time": int(time.time()),
+                        "ban_time": ban_time,
                         "duration": -1,
                         "reason": reason,
                     }
@@ -4835,6 +4920,12 @@ class GroupInviteGuardPlugin(Star):
                 msg = f"已加入 AstrBot 黑名单：{inviter_qq}"
                 if not persisted:
                     msg += "（未能持久化）"
+                else:
+                    await self._record_profile_management(
+                        inviter_qq, "astrbot_banned",
+                        event_key=f"guard:ban:{inviter_qq}:{ban_time}",
+                        reason=reason, event_time=ban_time,
+                    )
                 return msg
             except Exception as exc:
                 return f"加入黑名单失败：{exc}"
@@ -4856,6 +4947,12 @@ class GroupInviteGuardPlugin(Star):
         if mode == "delete_friend":
             try:
                 await self._call_action(bot, "delete_friend", user_id=int(qq), block=True)
+                deleted_at = int(time.time())
+                await self._record_profile_management(
+                    qq, "bot_deleted_friend",
+                    event_key=f"guard:mute-delete:{qq}:{deleted_at}",
+                    reason="被禁言后报复", event_time=deleted_at,
+                )
                 return f"已删除并拉黑好友 {qq}"
             except Exception as exc:
                 return f"删除好友失败：{exc}"
@@ -5285,11 +5382,18 @@ class GroupInviteGuardPlugin(Star):
                     return f"{qq} 不在黑名单中"
                 config["ban_list"] = new_list
                 persisted = await self._save_ban_config(config)
+                unban_time = int(time.time())
                 msg = f"已解封 {qq}"
                 if not persisted:
                     msg += "（未能持久化）"
             except Exception as exc:
                 return f"解封失败：{exc}"
+        if persisted:
+            await self._record_profile_management(
+                qq, "astrbot_unbanned",
+                event_key=f"guard:unban:{qq}:{unban_time}",
+                reason="管理员或工具解封", event_time=unban_time,
+            )
         await self._mark_inviter_dealt(qq, dealt=False)
         return msg
 
@@ -5301,7 +5405,13 @@ class GroupInviteGuardPlugin(Star):
             parts.append(notice)
         try:
             await self._call_action(bot, "delete_friend", user_id=int(target_qq), block=True)
+            deleted_at = int(time.time())
             parts.append(f"已删除并拉黑好友 {target_qq}")
+            await self._record_profile_management(
+                target_qq, "bot_deleted_friend",
+                event_key=f"guard:manual-delete:{target_qq}:{deleted_at}",
+                reason="手动拉黑", event_time=deleted_at,
+            )
         except Exception as exc:
             parts.append(f"删除好友失败：{exc}")
         parts.append(await self._ban_inviter(target_qq, "手动拉黑"))

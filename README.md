@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.21.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.22.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -72,7 +72,9 @@
 
 单独安装即可完整使用。如果装了「[用户画像](https://github.com/TaoXiaoBai/astrbot_plugin_user_profile)」插件，邀请审核优先调用 `get_decision_profile()`，读取结构化风险分、标签、活跃度、数据新鲜度、LLM 状态和社交来源；当前审核记录按 `request_key` 排除。旧画像插件依次降级到标签 API 或文本 API。
 
-守卫同时提供版本化只读 API `get_inviter_evidence(qq, exclude_request_key="")`。画像插件优先通过该 API 取得有限的邀请/进群摘要，旧守卫才回退 KV；旧或脏 KV 的非法时间会安全降级为 `0`。守卫 1.21.0+ 调用画像 1.10.0+ 的可信写入 API：先持久化待投递目标，只有 `recorded`/`duplicate` 才完成；插件缺失、旧 API、禁用、失败或返回 false 都保留 pending，由启动恢复循环继续投递。稳定事件 completed 账本不淘汰，`mute_event_jobs` 全局最多 5000 条，满后明确拒绝新事件而不删除旧键。邀请人归因和即时拉黑只接受当前群 `join_records.inviter` 明确字段，不使用 `join_records.operator` 或旧邀请记录兜底；联动 job 达上限或 KV 故障只会跳过画像/direct，不会阻断原禁言计数、阈值退群或长期复核。
+守卫同时提供版本化只读 API `get_inviter_evidence(qq, exclude_request_key="")`。画像插件优先通过该 API 取得有限的邀请/进群摘要，旧守卫才回退 KV；旧或脏 KV 的非法时间会安全降级为 `0`。守卫 1.21.0+ 调用画像 1.10.0+ 的禁言写入 API：先持久化待投递目标，只有 `recorded`/`duplicate` 才完成；插件缺失、旧 API、禁用、失败或返回 false 都保留 pending，由启动恢复循环继续投递。稳定事件 completed 账本不淘汰，`mute_event_jobs` 全局最多 5000 条，满后明确拒绝新事件而不删除旧键。邀请人归因和即时拉黑只接受当前群 `join_records.inviter` 明确字段，不使用 `join_records.operator` 或旧邀请记录兜底；联动 job 达上限或 KV 故障只会跳过画像/direct，不会阻断原禁言计数、阈值退群或长期复核。
+
+守卫 1.22.0 配合画像 1.11.0+ 时，还会在动作**真正成功**后 fail-open 写入通用管理账本：qq_tools 黑名单成功持久化记 `astrbot_banned`，解封成功持久化记 `astrbot_unbanned`，被踢报复、禁言报复或手动拉黑中的 `delete_friend` 成功记 `bot_deleted_friend`。画像插件缺失、版本过旧、超时或抛错不会反转已经成功的守卫动作，也不会阻断原流程；失败动作绝不写成成功历史。
 
 恢复客户端按 `self_id` 隔离：`delete_friend` 必须等对应 bot 账号出现后才能恢复，绝不借用其它账号；纯 AstrBot 黑名单模式无需协议客户端。初始化后尚未见到该账号时 pending 等待是正常行为。画像 `/画像删除` 会调用可信取消接口，把该 QQ 未完成的画像投递标为 cancelled 并等待在途调用收敛，但不会取消 direct blacklist；completed 账本继续保留，防止旧稳定事件重放。
 

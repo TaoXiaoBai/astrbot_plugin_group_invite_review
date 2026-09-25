@@ -2410,6 +2410,57 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         ))
 
 
+class ManagementLinkTests(unittest.IsolatedAsyncioTestCase):
+    make_plugin = InviteFlowTests.make_plugin
+
+    async def test_successful_ban_and_unban_record_management_once(self):
+        plugin = self.make_plugin()
+        config = {"ban_list": [], "save_config": None}
+        class Config(dict):
+            def save_config(self):
+                return None
+        config = Config(config)
+        plugin._get_ban_config = lambda: (config, "")
+        recorder = AsyncMock(return_value={"status": "recorded"})
+        plugin._get_profile_plugin_instance = lambda: types.SimpleNamespace(
+            record_management_event=recorder
+        )
+        self.assertIn("已加入", await plugin._ban_inviter("20000", "测试"))
+        self.assertEqual(recorder.await_args.kwargs["event_type"], "astrbot_banned")
+        self.assertIn("已解封", await plugin._unban_text("20000"))
+        self.assertEqual(recorder.await_args.kwargs["event_type"], "astrbot_unbanned")
+        self.assertEqual(recorder.await_count, 2)
+
+    async def test_failed_save_or_delete_does_not_record(self):
+        plugin = self.make_plugin()
+        class Config(dict):
+            def save_config(self):
+                raise RuntimeError("save failed")
+        plugin._get_ban_config = lambda: (Config(ban_list=[]), "")
+        recorder = AsyncMock(return_value={"status": "recorded"})
+        plugin._get_profile_plugin_instance = lambda: types.SimpleNamespace(
+            record_management_event=recorder
+        )
+        self.assertIn("失败", await plugin._ban_inviter("20000", "测试"))
+        bot = types.SimpleNamespace(delete_friend=AsyncMock(side_effect=RuntimeError("delete failed")))
+        plugin.config["kick_revenge"] = {"revenge_mode": "delete_friend", "ban_notice_message": ""}
+        self.assertIn("删除好友失败", await plugin._take_revenge("20000", bot))
+        recorder.assert_not_awaited()
+
+    async def test_profile_linkage_failure_is_fail_open_after_successful_action(self):
+        plugin = self.make_plugin()
+        recorder = AsyncMock(side_effect=RuntimeError("profile down"))
+        plugin._get_profile_plugin_instance = lambda: types.SimpleNamespace(
+            record_management_event=recorder
+        )
+        bot = types.SimpleNamespace(delete_friend=AsyncMock(return_value=None))
+        plugin.config["kick_revenge"] = {"revenge_mode": "delete_friend", "ban_notice_message": ""}
+        result = await plugin._take_revenge("20000", bot)
+        self.assertIn("已删除并拉黑好友", result)
+        bot.delete_friend.assert_awaited_once()
+        recorder.assert_awaited_once()
+
+
 class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
     make_plugin = InviteFlowTests.make_plugin
     make_mute_plugin = InviteFlowTests.make_mute_plugin
