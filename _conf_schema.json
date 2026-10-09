@@ -1,4 +1,28 @@
 {
+  "protection": {
+    "description": "白名单保护",
+    "type": "object",
+    "items": {
+      "protect_astrbot_admins": {
+        "description": "保护全部 AstrBot 管理员",
+        "type": "bool",
+        "default": true,
+        "hint": "实时读取全局 admins_id；读取异常时暂停危险动作。管理员执行禁言/踢人时跳过整个处罚链，手动及 LLM 工具也不能处罚保护目标。"
+      },
+      "qq_whitelist": {
+        "description": "QQ 白名单",
+        "type": "string",
+        "default": "",
+        "hint": "逗号或空白分隔，精确匹配；不删好友、不拉黑、不写禁言画像和管理记录。保护邀请人不影响普通操作者处理。"
+      },
+      "group_whitelist": {
+        "description": "群白名单",
+        "type": "string",
+        "default": "",
+        "hint": "逗号或空白分隔，精确匹配；跳过群内处罚链、跨群退出及异常入群补偿退群。旧 pending 按当前保护名单取消，不自动恢复历史关系。"
+      }
+    }
+  },
   "basic": {
     "description": "基础",
     "type": "object",

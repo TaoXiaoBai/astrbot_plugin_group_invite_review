@@ -157,6 +157,7 @@ class FakeEvent:
 class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
     def make_plugin(self, decision="approve", mode="notify_only", membership=None):
         plugin = GroupInviteGuardPlugin.__new__(GroupInviteGuardPlugin)
+        plugin.context = types.SimpleNamespace(get_config=lambda: {"admins_id": []})
         plugin.config = {
             "basic": {"enable": True},
             "decision": {
@@ -2849,6 +2850,267 @@ class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
             first, _ = plugin._personal_mute_event_key(event, raw)
             second, _ = plugin._personal_mute_event_key(event, raw)
         self.assertNotEqual(first, second)
+
+
+class ProtectionTests(unittest.IsolatedAsyncioTestCase):
+    make_plugin = InviteFlowTests.make_plugin
+    make_mute_plugin = InviteFlowTests.make_mute_plugin
+    verified_raw = staticmethod(PersonalMuteLinkTests.verified_raw)
+    raw = staticmethod(InviteFlowTests.raw)
+    record = staticmethod(InviteFlowTests.record)
+
+    def test_malformed_protection_is_not_erased_by_migration(self):
+        for section in (None, [], {"qq_whitelist": "invalid"},
+                        {"protect_astrbot_admins": "false"}):
+            plugin = self.make_plugin()
+            plugin.config["protection"] = section
+            plugin._migrate_flat_config()
+            self.assertEqual(plugin.config["protection"], section)
+            self.assertIn("配置读取异常", plugin._protection_reason("20000"))
+
+    def test_admin_switch_off_still_keeps_explicit_whitelist(self):
+        plugin = self.make_plugin()
+        plugin.context.get_config = Mock(side_effect=AssertionError("not requested"))
+        plugin.config["protection"] = {"protect_astrbot_admins": False, "qq_whitelist": "20000"}
+        self.assertTrue(plugin._protection_reason("20000"))
+        self.assertEqual(plugin._protection_reason("20001"), "")
+        plugin.context.get_config.assert_not_called()
+
+    async def test_protected_events_have_no_side_effects(self):
+        for settings, admins in (
+            ({}, ["20000", "21000"]),
+            ({"qq_whitelist": "29999, 20000\n21000"}, []),
+            ({"group_whitelist": "30000, 30001"}, []),
+        ):
+            plugin = self.make_mute_plugin("leave", mute_threshold=1,
+                profile_mute_direct_blacklist=True)
+            plugin.config["protection"] = settings
+            plugin.context.get_config = lambda: {"admins_id": admins}
+            plugin.config["kick_revenge"].update(revenge_mode="delete_and_ban",
+                kick_ban_operator=True, cross_group_retaliation=True)
+            plugin._kv["invite_records"] = {"30000": [{"inviter": "21000"}]}
+            recorder = AsyncMock(return_value=True)
+            plugin._get_profile_plugin_instance = lambda: types.SimpleNamespace(
+                record_bot_mute_event=recorder, record_management_event=recorder)
+            original = copy.deepcopy(plugin._kv)
+            bot = FakeBot()
+            await plugin.on_group_mute(FakeEvent(self.verified_raw(duration=86400), bot))
+            await plugin.on_group_kick(FakeEvent(self.verified_raw(), bot))
+            self.assertEqual(plugin._kv, original)
+            self.assertEqual(bot.calls, [])
+            plugin._ask_long_mute_review.assert_not_awaited()
+            plugin._apply_mute_ban.assert_not_awaited()
+            recorder.assert_not_awaited()
+
+    async def test_protected_inviter_does_not_hide_normal_operator(self):
+        plugin = self.make_mute_plugin(mute_retaliation_enable=False,
+            profile_mute_target="both", profile_mute_direct_blacklist=True)
+        plugin.config["protection"] = {"qq_whitelist": "21000"}
+        plugin._kv["join_records"] = {"30000": {"inviter": "21000"}}
+        recorder = AsyncMock(return_value=True)
+        plugin._get_profile_plugin_instance = lambda: types.SimpleNamespace(record_bot_mute_event=recorder)
+        await plugin.on_group_mute(FakeEvent(self.verified_raw(), FakeBot()))
+        recorder.assert_awaited_once()
+        self.assertEqual(recorder.await_args.args, ("20000",))
+        plugin._apply_mute_ban.assert_awaited_once()
+        self.assertEqual(plugin._apply_mute_ban.await_args.args[0], "20000")
+
+    async def test_all_action_entrypoints_refuse_protected_qq(self):
+        plugin = self.make_plugin()
+        plugin.config["protection"] = {"qq_whitelist": "20000"}
+        plugin.config["kick_revenge"] = {"revenge_mode": "delete_and_ban", "kick_ban_operator": True}
+        plugin.config["mute_revenge"] = {"mute_ban_mode": "delete_friend"}
+        bot = ApiOnly()
+        get_ban = Mock(side_effect=AssertionError("must not read ban config"))
+        plugin._get_ban_config = get_ban
+        for result in (
+            await plugin._take_revenge("20000", bot),
+            await plugin._ban_kick_operator("20000", bot, set()),
+            await plugin._apply_mute_ban("20000", bot),
+            await plugin._ban_inviter("20000"),
+            await plugin._manual_blacklist("20000", bot),
+            await plugin._manual_ban_text(FakeEvent({}, bot), ["20000", "30000"]),
+            await plugin.llm_ban_user(FakeEvent({}, bot), "20000"),
+        ):
+            self.assertIn("白名单保护", result)
+            self.assertFalse(plugin._ban_result_ok(result))
+        self.assertEqual(bot.calls, [])
+        get_ban.assert_not_called()
+        recorder = AsyncMock()
+        plugin._get_profile_plugin_instance = lambda: types.SimpleNamespace(record_management_event=recorder)
+        await plugin._record_profile_management("20000", "astrbot_banned", event_key="fixture")
+        recorder.assert_not_awaited()
+        plugin._kv["invite_records"] = {"30000": [{"inviter": "20000"}]}
+        await plugin._mark_inviter_dealt("20000")
+        self.assertNotIn("dealt", plugin._kv["invite_records"]["30000"][0])
+        self.assertIn("白名单保护", await plugin._manual_ban_text(FakeEvent({}, bot), ["30000"]))
+        self.assertEqual(bot.calls, [])
+
+    async def test_config_failure_fails_closed_and_recovers(self):
+        plugin = self.make_mute_plugin(mute_threshold=1)
+        bot = FakeBot()
+        for value in (None, {}, {"admins_id": None}, {"admins_id": ["bad"]}):
+            plugin.context.get_config = lambda: value
+            await plugin.on_group_mute(FakeEvent(self.verified_raw(), bot))
+            self.assertNotIn("mute_records", plugin._kv)
+            self.assertIn("配置读取异常", await plugin._ban_inviter("20000"))
+        plugin.context.get_config = Mock(side_effect=RuntimeError("unavailable"))
+        await plugin.on_group_mute(FakeEvent(self.verified_raw(), bot))
+        self.assertEqual(bot.calls, [])
+        plugin.context.get_config = lambda: {"admins_id": []}
+        await plugin.on_group_mute(FakeEvent(self.verified_raw(), bot))
+        self.assertTrue(any(name == "set_group_leave" for name, _ in bot.calls))
+
+    async def test_pending_recovery_cancels_latest_protection_keeps_completed(self):
+        for settings, admins in (
+            ({"qq_whitelist": "20000"}, []),
+            ({}, ["20000"]),
+            ({"qq_whitelist": "21000"}, []),
+            ({"group_whitelist": "30000"}, []),
+        ):
+            plugin = self.make_mute_plugin(mute_retaliation_enable=False, profile_mute_target="both")
+            plugin._kv["join_records"] = {"30000": {"inviter": "21000"}}
+            raw = self.verified_raw()
+            key, _ = await plugin._prepare_personal_mute_job(FakeEvent(raw, FakeBot()), raw,
+                "30000", "20000", True, True)
+            completed = {"qq": "29999", "state": "completed"}
+            plugin._kv["mute_event_jobs"][key]["direct_targets"].append(completed)
+            plugin.config["protection"] = settings
+            plugin.context.get_config = lambda: {"admins_id": admins}
+            recorder = AsyncMock(return_value=True)
+            plugin._get_profile_plugin_instance = lambda: types.SimpleNamespace(record_bot_mute_event=recorder)
+            await plugin._recover_mute_jobs()
+            job = plugin._kv["mute_event_jobs"][key]
+            self.assertEqual(job["direct_targets"][-1], completed)
+            for name in ("profile_targets", "direct_targets"):
+                protected = [item for item in job[name] if item["qq"] != "29999" and
+                    (item["qq"] == "21000" or not settings.get("qq_whitelist") == "21000")]
+                self.assertTrue(all(item["state"] == "cancelled" for item in protected))
+            plugin.config["protection"] = {}
+            plugin.context.get_config = lambda: {"admins_id": []}
+            calls = plugin._apply_mute_ban.await_count
+            await plugin._recover_mute_jobs()
+            self.assertEqual(plugin._apply_mute_ban.await_count, calls)
+
+    async def test_cross_group_protection_and_exact_matching(self):
+        plugin = self.make_plugin()
+        plugin.config["kick_revenge"] = {"cross_group_retaliation": True}
+        plugin.config["protection"] = {"qq_whitelist": "200001", "group_whitelist": "30001"}
+        records = {gid: [{"inviter": "20000"}] for gid in ("30000", "30001", "30002")}
+        bot = FakeBot()
+        result = await plugin._cross_group_leave("20000", "30000", records, bot)
+        self.assertIn("白名单保护", result)
+        self.assertEqual([p["group_id"] for name, p in bot.calls], [30002])
+        plugin.config["protection"]["qq_whitelist"] = "20000"
+        bot.calls.clear()
+        await plugin._cross_group_leave("20000", "30000", records, bot)
+        self.assertEqual(bot.calls, [])
+
+    async def test_unexpected_join_protected_group_is_not_success(self):
+        plugin = self.make_plugin("reject", "leave", ["IN", "IN"])
+        plugin.config["protection"] = {"group_whitelist": "30000"}
+        bot, _, rec = await InviteFlowTests.run_invite(self, plugin)
+        self.assertEqual(rec["execution_state"], "PROTECTED_SKIPPED")
+        self.assertFalse(rec["action_succeeded"])
+        self.assertFalse(rec["action_attempted"])
+        self.assertFalse(any(name == "set_group_leave" for name, _ in bot.calls))
+
+    async def test_whitelist_changes_while_llm_waits(self):
+        plugin = self.make_mute_plugin("leave")
+        async def decision(*args, **kwargs):
+            plugin.config["protection"] = {"qq_whitelist": "20000"}
+            return {"action": "leave", "reason": "fixture", "reply": ""}
+        plugin._ask_long_mute_review = AsyncMock(side_effect=decision)
+        bot = FakeBot()
+        await plugin.on_group_mute(FakeEvent(InviteFlowTests.mute_raw(duration=86400), bot))
+        self.assertEqual(bot.calls, [])
+        plugin._apply_mute_ban.assert_not_awaited()
+        self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+
+    async def test_whitelist_changes_while_notice_waits(self):
+        plugin = self.make_plugin()
+        plugin.config["kick_revenge"] = {"revenge_mode": "delete_and_ban", "ban_notice_message": "fixture"}
+        class Bot(ApiOnly):
+            async def call_action(inner, action, **params):
+                if action == "send_private_msg":
+                    plugin.config["protection"] = {"qq_whitelist": "20000"}
+                return await super().call_action(action, **params)
+        bot = Bot()
+        result = await plugin._take_revenge("20000", bot)
+        self.assertIn("白名单保护", result)
+        self.assertFalse(any(name == "delete_friend" for name, _ in bot.calls))
+        plugin._kv["invite_records"] = {"30000": [{"inviter": "20000"}]}
+        await plugin._mark_inviter_dealt("20000")
+        self.assertNotIn("dealt", plugin._kv["invite_records"]["30000"][0])
+
+    async def test_direct_notice_wait_cancels_on_operator_protection(self):
+        plugin = self.make_mute_plugin(mute_retaliation_enable=False,
+            profile_mute_enable=False, profile_mute_target="inviter", profile_mute_direct_blacklist=True)
+        plugin._kv["join_records"] = {"30000": {"inviter": "21000"}}
+        plugin.config["kick_revenge"]["ban_notice_message"] = "fixture"
+        class Bot(FakeBot):
+            async def send_private_msg(inner, **params):
+                plugin.context.get_config = lambda: {"admins_id": ["20000"]}
+                await super().send_private_msg(**params)
+        await plugin.on_group_mute(FakeEvent(self.verified_raw(), Bot()))
+        plugin._apply_mute_ban.assert_not_awaited()
+        job = next(iter(plugin._kv["mute_event_jobs"].values()))
+        self.assertEqual(job["direct_targets"][0]["state"], "cancelled")
+
+    async def test_manual_group_becomes_protected_during_notice(self):
+        plugin = self.make_plugin()
+        plugin.config["kick_revenge"] = {"ban_notice_message": "fixture"}
+        plugin._kv["invite_records"] = {"30000": [{"inviter": "20000"}]}
+        class Bot(ApiOnly):
+            async def call_action(inner, action, **params):
+                if action == "send_private_msg":
+                    plugin.config["protection"] = {"group_whitelist": "30000"}
+                return await super().call_action(action, **params)
+        bot = Bot()
+        result = await plugin._manual_ban_text(FakeEvent({}, bot), ["30000"])
+        self.assertIn("白名单保护", result)
+        self.assertFalse(any(name == "delete_friend" for name, _ in bot.calls))
+        self.assertNotIn("dealt", plugin._kv["invite_records"]["30000"][0])
+
+    async def test_profile_second_target_protected_while_first_delivery_waits(self):
+        plugin = self.make_mute_plugin(mute_retaliation_enable=False,
+            profile_mute_target="both", profile_mute_direct_blacklist=True)
+        plugin._kv["join_records"] = {"30000": {"inviter": "21000"}}
+        calls = []
+        async def recorder(qq, **kwargs):
+            calls.append(qq)
+            plugin.config["protection"] = {"qq_whitelist": "21000"}
+            return True
+        plugin._get_profile_plugin_instance = lambda: types.SimpleNamespace(record_bot_mute_event=recorder)
+        await plugin.on_group_mute(FakeEvent(self.verified_raw(), FakeBot()))
+        self.assertEqual(calls, ["20000"])
+        job = next(iter(plugin._kv["mute_event_jobs"].values()))
+        self.assertEqual(job["profile_targets"][1]["state"], "cancelled")
+        self.assertEqual(job["direct_targets"][1]["state"], "cancelled")
+        self.assertEqual(plugin._apply_mute_ban.await_args.args[0], "20000")
+
+    async def test_protection_checked_after_blacklist_lock_wait(self):
+        plugin = self.make_plugin()
+        lock = plugin._invite_lock("_qq_tools_lock")
+        await lock.acquire()
+        task = asyncio.create_task(plugin._ban_inviter("20000"))
+        await asyncio.sleep(0)
+        plugin.context.get_config = lambda: {"admins_id": ["20000"]}
+        lock.release()
+        self.assertIn("白名单保护", await task)
+
+    async def test_protected_kick_inviter_not_dealt_but_operator_processed(self):
+        plugin = self.make_plugin()
+        plugin.config["protection"] = {"qq_whitelist": "21000"}
+        plugin.config["kick_revenge"] = {"revenge_mode": "delete_and_ban",
+            "kick_ban_operator": True, "cross_group_retaliation": True}
+        plugin._kv["invite_records"] = {"30000": [{"inviter": "21000"}]}
+        plugin._manual_blacklist = AsyncMock(return_value="已拉黑")
+        bot = ApiOnly()
+        await plugin.on_group_kick(FakeEvent(self.verified_raw(), bot))
+        plugin._manual_blacklist.assert_awaited_once_with("20000", bot)
+        self.assertNotIn("dealt", plugin._kv["invite_records"]["30000"][0])
+        self.assertEqual(bot.calls, [])
 
 
 if __name__ == "__main__":

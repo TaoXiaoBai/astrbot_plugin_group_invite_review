@@ -6,13 +6,38 @@ import json
 import re
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime
+from functools import wraps
 from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Plain, Image
 from astrbot.api.star import Context, Star, register
+
+
+_PROTECTION_EVENT = ContextVar("group_invite_guard_protection_event", default=None)
+
+
+def _protected_notice(handler):
+    @wraps(handler)
+    async def guarded(self, event):
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is None:
+            return
+        operator = str(_get_value(raw, "operator_id") or "")
+        group = str(_get_value(raw, "group_id") or "")
+        reason = self._protection_reason(operator, group)
+        if reason:
+            logger.info(f"group_invite_guard: {reason}")
+            return
+        token = _PROTECTION_EVENT.set((self, operator, group))
+        try:
+            return await handler(self, event)
+        finally:
+            _PROTECTION_EVENT.reset(token)
+    return guarded
 
 
 try:
@@ -117,6 +142,11 @@ _BLACKLIST_INQUIRY_KEYWORDS = (
 # 配置分组：group -> {key: 默认值}。嵌套读取与旧平铺配置迁移都以它为准，
 # 新增配置项时同步修改这里和 _conf_schema.json。
 _CONFIG_GROUPS = {
+    "protection": {
+        "protect_astrbot_admins": True,
+        "qq_whitelist": "",
+        "group_whitelist": "",
+    },
     "basic": {
         "enable": True,
         "notify_private": True,
@@ -454,7 +484,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.22.0",
+    "1.23.0",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -537,6 +567,80 @@ class GroupInviteGuardPlugin(Star):
             pass
         return default
 
+    @staticmethod
+    def _protection_ids(value: Any) -> set[str]:
+        if isinstance(value, str):
+            values = re.split(r"[,，\s]+", value.strip())
+        elif isinstance(value, (list, tuple, set)):
+            values = value
+        else:
+            raise ValueError("invalid protection list")
+        result = set()
+        for item in values:
+            text = str(item).strip()
+            if not text:
+                continue
+            if isinstance(item, bool) or not re.fullmatch(r"\d+", text):
+                raise ValueError("invalid protection id")
+            result.add(text)
+        return result
+
+    def _protection_reason(self, qq: str = "", group_id: str = "") -> str:
+        try:
+            section = self.config.get("protection", {})
+            if not isinstance(section, dict):
+                raise ValueError("invalid protection section")
+            protect_admins = section.get("protect_astrbot_admins", True)
+            if not isinstance(protect_admins, bool):
+                raise ValueError("invalid administrator protection switch")
+            qqs = self._protection_ids(section.get("qq_whitelist", ""))
+            groups = self._protection_ids(section.get("group_whitelist", ""))
+            if protect_admins:
+                config = self.context.get_config()
+                admins = config.get("admins_id")
+                if not isinstance(admins, (list, tuple, set, str)):
+                    raise ValueError("administrator configuration unavailable")
+                qqs.update(self._protection_ids(admins))
+            if str(group_id or "").strip() in groups:
+                return "白名单保护：群受保护，已跳过"
+            if str(qq or "").strip() in qqs:
+                return "白名单保护：QQ/管理员受保护，已跳过"
+            return ""
+        except Exception:
+            logger.warning("group_invite_guard: protection configuration unavailable; actions paused")
+            return "白名单保护：配置读取异常，已暂停危险动作"
+
+    def _action_protection(self, qq: str = "", group_id: str = "") -> str:
+        scope = _PROTECTION_EVENT.get()
+        if scope is not None and scope[0] is self:
+            reason = self._protection_reason(scope[1], scope[2])
+            if reason:
+                return reason
+        return self._protection_reason(qq, group_id)
+
+    def _mute_target_protection(self, payload: dict, qq: str) -> str:
+        return self._protection_reason(
+            payload.get("operator_id", ""), payload.get("group_id", "")
+        ) or self._protection_reason(qq)
+
+    async def _cancel_protected_mute_targets(self, event_key: str) -> None:
+        async with self._invite_lock("_mute_delivery_lock"):
+            jobs = await self._load_mute_jobs()
+            job = jobs.get(event_key)
+            if not isinstance(job, dict):
+                return
+            changed = False
+            payload = job.get("payload") or {}
+            for name in ("profile_targets", "direct_targets"):
+                for target in job.get(name) or []:
+                    if target.get("state") not in ("completed", "cancelled"):
+                        reason = self._mute_target_protection(payload, target.get("qq", ""))
+                        if reason:
+                            target.update(state="cancelled", cancel_reason=reason)
+                            changed = True
+            if changed:
+                await self._save_mute_jobs(jobs)
+
     def _migrate_flat_config(self) -> None:
         """旧版平铺配置 → 嵌套分组的一次性迁移。
 
@@ -553,6 +657,8 @@ class GroupInviteGuardPlugin(Star):
                 return
             moved = []
             for group, keys in _CONFIG_GROUPS.items():
+                if group == "protection":
+                    continue
                 section = cfg.get(group)
                 if not isinstance(section, dict):
                     section = {}
@@ -1228,6 +1334,13 @@ class GroupInviteGuardPlugin(Star):
         self, bot, group_id: str, self_id: str, record_id: str,
         action: str, reason: str,
     ) -> dict:
+        protected = self._action_protection(group_id=group_id)
+        if protected:
+            return {
+                "attempted": False, "succeeded": False, "decision_succeeded": False,
+                "refresh_membership": False, "state": "PROTECTED_SKIPPED",
+                "result": protected, "protocol_error": "",
+            }
         mode = str(
             self._cfg("unexpected_join", "mode", "notify_only") or "notify_only"
         ).strip().lower()
@@ -1637,6 +1750,7 @@ class GroupInviteGuardPlugin(Star):
             )
 
     @filter.custom_filter(GroupKickFilter)
+    @_protected_notice
     async def on_group_kick(self, event: AstrMessageEvent):
         if not self._cfg("basic", "enable", True):
             return
@@ -1681,8 +1795,9 @@ class GroupInviteGuardPlugin(Star):
             # 跨群连坐：先退出该邀请人邀请过的其它群，再报复（消息仍只发一次）
             cross_line = await self._cross_group_leave(inviter_qq, group_id, records, bot)
             result = await self._take_revenge(inviter_qq, bot)
-            await self._mark_inviter_dealt(inviter_qq)
-            banned.add(inviter_qq)
+            if "白名单保护" not in result:
+                await self._mark_inviter_dealt(inviter_qq)
+                banned.add(inviter_qq)
             logger.info(
                 f"group_invite_guard: revenge on {inviter_qq} for group {group_id}: {result}"
             )
@@ -1735,6 +1850,10 @@ class GroupInviteGuardPlugin(Star):
             return ""
         parts = []
         for gid in groups:
+            protected = self._action_protection(inviter_qq, gid)
+            if protected:
+                parts.append(f"群 {gid}：{protected}")
+                continue
             try:
                 await self._call_action(bot, "set_group_leave", group_id=int(gid), is_dismiss=False)
                 parts.append(f"已连带退出群 {gid}")
@@ -1756,8 +1875,13 @@ class GroupInviteGuardPlugin(Star):
             return f"踢人者 {operator_id} 与邀请人为同一人，已在报复中拉黑"
         if bot is None:
             return ""
+        protected = self._action_protection(operator_id)
+        if protected:
+            return protected
         result = await self._manual_blacklist(operator_id, bot)
-        logger.info(f"group_invite_guard: banned kick operator {operator_id}: {result}")
+        logger.info(f"group_invite_guard: kick operator {operator_id}: {result}")
+        if "白名单保护" in result:
+            return result
         return f"已按设置拉黑踢人者 {operator_id}：{result}"
 
     async def _find_admission_for_join(self, group_id: str, self_id: str) -> dict | None:
@@ -1882,6 +2006,7 @@ class GroupInviteGuardPlugin(Star):
         return "\n".join(lines)
 
     @filter.custom_filter(GroupMuteFilter)
+    @_protected_notice
     async def on_group_mute(self, event: AstrMessageEvent):
         if not self._cfg("basic", "enable", True):
             return
@@ -2194,7 +2319,14 @@ class GroupInviteGuardPlugin(Star):
             targets.append((operator_id, "operator"))
         if target_mode in ("inviter", "both") and inviter_id:
             targets.append((inviter_id, "associated_inviter"))
-        targets = list(dict.fromkeys(targets))
+        if self._action_protection(operator_id, group_id):
+            return "", {}
+        targets = [
+            item for item in dict.fromkeys(targets)
+            if not self._action_protection(item[0], group_id)
+        ]
+        if not targets:
+            return "", {}
         event_key, event_time = self._personal_mute_event_key(event, raw)
         payload = {
             "event_key": event_key, "group_id": str(group_id),
@@ -2214,6 +2346,11 @@ class GroupInviteGuardPlugin(Star):
             jobs = await self._load_mute_jobs()
             job = jobs.get(event_key)
             if not isinstance(job, dict):
+                if self._action_protection(operator_id, group_id):
+                    return "", {}
+                targets = [item for item in targets if not self._action_protection(item[0])]
+                if not targets:
+                    return "", {}
                 job = {
                     "payload": payload, "created_at": int(time.time()),
                     "profile_targets": [
@@ -2238,6 +2375,7 @@ class GroupInviteGuardPlugin(Star):
         return "failure"
 
     async def _deliver_profile_job(self, event_key: str) -> None:
+        await self._cancel_protected_mute_targets(event_key)
         async with self._invite_lock("_mute_delivery_lock"):
             jobs = await self._load_mute_jobs()
             job = jobs.get(event_key)
@@ -2275,6 +2413,9 @@ class GroupInviteGuardPlugin(Star):
                     continue
                 inflight[marker] = task
             try:
+                if self._mute_target_protection(payload, target.get("qq", "")):
+                    await self._cancel_protected_mute_targets(event_key)
+                    continue
                 result = recorder(
                     target.get("qq"), event_key=payload.get("event_key", event_key),
                     group_id=payload.get("group_id", ""), event_time=payload.get("event_time", 0),
@@ -2351,6 +2492,7 @@ class GroupInviteGuardPlugin(Star):
     async def _run_direct_job_locked(
         self, event_key: str, skip: set[str] | None = None,
     ) -> set[str]:
+        await self._cancel_protected_mute_targets(event_key)
         completed = set(skip or set())
         async with self._invite_lock("_mute_delivery_lock"):
             jobs = await self._load_mute_jobs()
@@ -2370,6 +2512,9 @@ class GroupInviteGuardPlugin(Star):
             if target.get("state") in ("completed", "cancelled"):
                 if target.get("state") == "completed":
                     completed.add(qq)
+                continue
+            if self._mute_target_protection(payload, qq):
+                await self._cancel_protected_mute_targets(event_key)
                 continue
             if qq in completed:
                 success = True
@@ -2399,7 +2544,18 @@ class GroupInviteGuardPlugin(Star):
                 if mode == "delete_friend" and bot is None:
                     continue
                 try:
-                    result = await self._apply_mute_ban(qq, bot)
+                    if self._mute_target_protection(payload, qq):
+                        await self._cancel_protected_mute_targets(event_key)
+                        continue
+                    token = _PROTECTION_EVENT.set((
+                        self, payload.get("operator_id", ""), payload.get("group_id", "")
+                    ))
+                    try:
+                        result = await self._apply_mute_ban(qq, bot)
+                    finally:
+                        _PROTECTION_EVENT.reset(token)
+                    if "白名单保护" in str(result):
+                        await self._cancel_protected_mute_targets(event_key)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -2476,6 +2632,8 @@ class GroupInviteGuardPlugin(Star):
         self, event: AstrMessageEvent, raw: Any, group_id: str, operator_id: str,
     ) -> dict:
         outcome = {"banned": set(), "left": False}
+        if self._action_protection(operator_id, group_id):
+            return outcome
         duration = self._parse_mute_duration(_get_value(raw, "duration"))
         async with self._invite_lock("_mute_kv_lock"):
             claimed, fingerprint = self._claim_mute_event(raw)
@@ -2492,6 +2650,8 @@ class GroupInviteGuardPlugin(Star):
                 logger.warning("group_invite_guard: mute_records is not a dict")
                 return outcome
 
+            if self._action_protection(operator_id, group_id):
+                return outcome
             try:
                 count = int(records.get(group_id, 0) or 0) + 1
             except (TypeError, ValueError):
@@ -2695,6 +2855,9 @@ class GroupInviteGuardPlugin(Star):
         }
 
     async def _send_mute_inviter_notice(self, bot, inviter_qq: str) -> str:
+        protected = self._action_protection(inviter_qq)
+        if protected:
+            return protected
         if not inviter_qq:
             return ""
         message = str(
@@ -2720,6 +2883,9 @@ class GroupInviteGuardPlugin(Star):
             "actually_banned_targets": actually_banned,
             "left": False,
         }
+        if self._action_protection(operator_id, group_id):
+            await self._restore_mute_count(group_id, count)
+            return outcome
         target = str(
             self._cfg("mute_revenge", "mute_target", "operator") or "operator"
         ).strip().lower()
@@ -2759,6 +2925,9 @@ class GroupInviteGuardPlugin(Star):
             await self._restore_mute_count(group_id, count)
             raise
 
+        if self._action_protection(operator_id, group_id):
+            await self._restore_mute_count(group_id, count)
+            return outcome
         try:
             await self._call_action(
                 bot, "set_group_leave", group_id=int(group_id), is_dismiss=False
@@ -2790,6 +2959,10 @@ class GroupInviteGuardPlugin(Star):
             if not qq or qq in seen:
                 continue
             seen.add(qq)
+            protected = self._action_protection(qq, group_id)
+            if protected:
+                ban_results.append(protected)
+                continue
             if qq in (already_banned or set()):
                 ban_results.append(f"{qq} 已由本次禁言即时拉黑")
                 continue
@@ -3233,6 +3406,8 @@ class GroupInviteGuardPlugin(Star):
         self, qq: str, event_type: str, *, event_key: str,
         reason: str = "", group_id: str = "", event_time: int | None = None,
     ) -> None:
+        if self._action_protection(qq, group_id):
+            return
         try:
             instance = self._get_profile_plugin_instance()
             recorder = getattr(instance, "record_management_event", None) if instance else None
@@ -4598,6 +4773,12 @@ class GroupInviteGuardPlugin(Star):
         return self._unwrap_onebot_response(result)
 
     async def _call_action(self, bot: Any, action: str, **params: Any) -> Any:
+        if action in ("delete_friend", "set_group_leave"):
+            reason = self._action_protection(
+                params.get("user_id", ""), params.get("group_id", "")
+            )
+            if reason:
+                raise RuntimeError(reason)
         unsupported_error = None
         method = getattr(bot, action, None)
         if callable(method):
@@ -4666,6 +4847,9 @@ class GroupInviteGuardPlugin(Star):
 
     async def _send_ban_notice(self, bot, qq: str) -> str:
         """拉黑前给邀请人发一条自定义私聊消息；未配置则跳过。"""
+        protected = self._action_protection(qq)
+        if protected:
+            return protected
         msg = str(self._cfg("kick_revenge", "ban_notice_message") or "").strip()
         if not msg:
             return ""
@@ -4677,6 +4861,9 @@ class GroupInviteGuardPlugin(Star):
 
     async def _take_revenge(self, inviter_qq: str, bot) -> str:
         """按 revenge_mode 对邀请人执行报复，返回人类可读结果；单个动作失败不抛出，写入结果字符串。"""
+        protected = self._action_protection(inviter_qq)
+        if protected:
+            return protected
         mode = str(self._cfg("kick_revenge", "revenge_mode", "off") or "off").strip().lower()
         if mode not in ("delete_friend", "delete_and_ban"):
             return "未启用报复"
@@ -4840,11 +5027,15 @@ class GroupInviteGuardPlugin(Star):
 
     async def _mark_inviter_dealt(self, inviter_qq: str, dealt: bool = True) -> None:
         """给该邀请人的所有邀请记录打上或清除已拉黑标记。"""
+        if dealt and self._action_protection(inviter_qq):
+            return
         inviter_qq = str(inviter_qq or "").strip()
         if not inviter_qq:
             return
 
         def mutate(records):
+            if dealt and self._action_protection(inviter_qq):
+                return False
             changed = False
             found = False
             now = int(time.time())
@@ -4901,6 +5092,9 @@ class GroupInviteGuardPlugin(Star):
     async def _ban_inviter(self, inviter_qq: str, reason: str = "拉黑") -> str:
         """把邀请人加入 AstrBot 黑名单（qq_tools 插件），不可用时降级并注明。"""
         async with self._invite_lock("_qq_tools_lock"):
+            protected = self._action_protection(inviter_qq)
+            if protected:
+                return protected
             config, err = self._get_ban_config()
             if config is None:
                 return err
@@ -4941,6 +5135,9 @@ class GroupInviteGuardPlugin(Star):
 
     async def _apply_mute_ban(self, qq: str, bot) -> str:
         """按 mute_ban_mode 对目标执行拉黑，返回人类可读结果；单个动作失败不抛出，写入结果字符串。"""
+        protected = self._action_protection(qq)
+        if protected:
+            return protected
         mode = str(self._cfg("mute_revenge", "mute_ban_mode", "astrbot_ban") or "astrbot_ban").strip().lower()
         if mode == "astrbot_ban":
             return await self._ban_inviter(qq, "被禁言后报复")
@@ -5397,8 +5594,25 @@ class GroupInviteGuardPlugin(Star):
         await self._mark_inviter_dealt(qq, dealt=False)
         return msg
 
-    async def _manual_blacklist(self, target_qq: str, bot) -> str:
+    async def _manual_blacklist(self, target_qq: str, bot, group_id: str = "") -> str:
+        protected = self._action_protection(target_qq, group_id)
+        if protected:
+            return protected
+        scope = _PROTECTION_EVENT.get()
+        token = None
+        if scope is None or scope[0] is not self:
+            token = _PROTECTION_EVENT.set((self, target_qq, group_id))
+        try:
+            return await self._manual_blacklist_scoped(target_qq, bot)
+        finally:
+            if token is not None:
+                _PROTECTION_EVENT.reset(token)
+
+    async def _manual_blacklist_scoped(self, target_qq: str, bot) -> str:
         """手动拉黑某人：发自定义通知 + 删除并拉黑好友 + 加入 AstrBot 黑名单。"""
+        protected = self._action_protection(target_qq)
+        if protected:
+            return protected
         parts = []
         notice = await self._send_ban_notice(bot, target_qq)
         if notice:
@@ -5418,7 +5632,7 @@ class GroupInviteGuardPlugin(Star):
         return "；".join(parts)
 
     async def _manual_ban_text(self, event: AstrMessageEvent, args) -> str:
-        """手动拉黑：/手动拉黑 <QQ或群号>，单参数时按邀请记录反查目标并退出相关群；旧用法 /手动拉黑 <QQ> <群号> 行为不变。"""
+        """手动拉黑：反查目标并退出相关群；兼容旧两参数用法，保护目标始终拒绝。"""
         usage = "用法：/手动拉黑 <QQ或群号>（旧用法：/手动拉黑 <QQ> <群号>）"
         if not args:
             return usage
@@ -5430,9 +5644,11 @@ class GroupInviteGuardPlugin(Star):
         if bot is None:
             return "手动拉黑失败：未找到 OneBot 客户端"
 
-        # 旧两参数用法：给了群号就退群，再拉黑该 QQ，行为与旧版一致
         if len(args) > 1:
             group_id = str(args[1] or "").strip()
+            protected = self._action_protection(target, group_id)
+            if protected:
+                return protected
             parts = []
             if group_id:
                 try:
@@ -5441,11 +5657,12 @@ class GroupInviteGuardPlugin(Star):
                 except Exception as exc:
                     parts.append(f"退群失败：{exc}")
             try:
-                result = await self._manual_blacklist(target, bot)
+                result = await self._manual_blacklist(target, bot, group_id=group_id)
             except Exception as exc:
                 result = f"拉黑失败：{exc}"
             parts.append(f"拉黑 {target}：{result}")
-            await self._mark_inviter_dealt(target)
+            if "白名单保护" not in result:
+                await self._mark_inviter_dealt(target)
             return "；".join(parts)
 
         # 单参数：先查邀请记录
@@ -5480,8 +5697,15 @@ class GroupInviteGuardPlugin(Star):
             target_qq = target
             parts.append(f"未找到 {target} 的相关邀请记录，按 QQ 直接拉黑")
 
+        protected = self._action_protection(target_qq, target if target in normalized else "")
+        if protected:
+            return protected
         # 先退群（单个失败不影响后面），再统一拉黑一次（消息只发一次）
         for gid in groups:
+            protected = self._action_protection(target_qq, gid)
+            if protected:
+                parts.append(f"群 {gid}：{protected}")
+                continue
             try:
                 await self._call_action(bot, "set_group_leave", group_id=int(gid), is_dismiss=False)
                 parts.append(f"已退出群 {gid}")
@@ -5489,11 +5713,14 @@ class GroupInviteGuardPlugin(Star):
                 parts.append(f"退群 {gid} 失败：{exc}")
 
         try:
-            result = await self._manual_blacklist(target_qq, bot)
+            result = await self._manual_blacklist(
+                target_qq, bot, group_id=target if target in normalized else ""
+            )
         except Exception as exc:
             result = f"拉黑失败：{exc}"
         parts.append(f"拉黑 {target_qq}：{result}")
-        await self._mark_inviter_dealt(target_qq)
+        if "白名单保护" not in result:
+            await self._mark_inviter_dealt(target_qq)
 
         return "；".join(parts)
 

@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.22.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.23.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -90,6 +90,18 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 <summary>点我展开完整配置表（所有配置都在 WebUI 插件页改，按分组展示）</summary>
 
 > 1.14.0 起配置改为分组结构；旧版平铺配置会在启动时自动迁移到对应分组，值不变，无需手动处理。
+
+**白名单保护 `protection`（1.23.0）**
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
+| `protect_astrbot_admins` | `true` | 实时保护全局 `admins_id` 中全部管理员，不只是通知接收人 |
+| `qq_whitelist` | `""` | QQ 名单，逗号或空白分隔，精确匹配 |
+| `group_whitelist` | `""` | 群名单，逗号或空白分隔，精确匹配 |
+
+保护操作者禁言/踢 bot，或事件发生在保护群时，整个处罚链跳过：不累计次数、不复核、不退群、不删好友、不拉黑、不增加禁言画像。普通操作者涉及保护邀请人时，只跳过邀请人的归因、处罚与跨群退出。动作前再次检查最新名单，手动命令和 LLM 工具也不能绕过；跨群逐群跳过保护群，异常提前入群补偿也不退出保护群。配置读取异常（含管理员字段缺失/非法）时暂停危险动作。
+
+恢复旧画像/direct pending 时，保护目标标为 `cancelled`，不是处罚成功；已 completed 去重账本保留。保护 QQ 不新增守卫画像事件或管理记录。不会自动回滚旧风险/黑名单、加回 QQ 好友或重新进群；旧黑名单可单独 `/解封`，好友/群关系需人工恢复。名单在外部 API/画像 API 已提交后才变化时，不能撤回在途动作。
 
 **基础 `basic`**
 
