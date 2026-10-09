@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.23.0-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.23.1-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -12,14 +12,16 @@
 
 ## 这是什么
 
-一个 AstrBot 插件。有人拉你的 bot 进群时，不靠死板的关键词/等级规则，而是交给 LLM 根据你设定的**人格**，结合目标群的成员和历史聊天印象，自己判断「进还是不进」。进了被踢、被禁言，还能记仇报复。
+一个 AstrBot 插件。有人拉你的 bot 进群时，管理员及 QQ 白名单的已核验真实邀请默认免审核；其他邀请交给 LLM 根据你设定的**人格**，结合目标群的成员和历史聊天印象，判断「进还是不进」。进了被踢、被禁言，还能记仇报复。
 
 ## 功能一览
 
 **进群决策**
-- 收到针对 bot 的邀请后立即持久化，再收集上下文、调用 LLM、执行前复核成员状态，最后同意或拒绝
+- 收到针对 bot 的真实邀请后立即持久化；默认对最新 AstrBot `admins_id` 或 `protection.qq_whitelist` 精准匹配且目标 VERIFIED 的邀请免审核，规则直接建议同意，不调用 LLM、画像或群成员背景
+- 免审核与处罚保护开关独立，群白名单不赋予邀请人信任；仍受插件启用、`auto_approve`、成员状态、flag 和动作前持久化约束。配置读取异常记录 unknown/失败并通知，不交给 LLM 拒绝，也不默认信任
+- 普通邀请或关闭免审核开关时，收集上下文、调用 LLM、执行前复核成员状态，最后同意或拒绝；记录和通知通过 `decision_source` 区分规则与 LLM
 - 外部动作前持久化执行中状态；重启遇到未确认动作只对账和通知，不自动重放
-- bot 已提前入群或审核期间入群也不会跳过 LLM；LLM 拒绝时可仅通知、直接退群或发自定义消息后退群
+- 非免审核邀请即使 bot 已提前入群或审核期间入群也不会跳过 LLM；LLM 拒绝时可仅通知、直接退群或发自定义消息后退群
 - 三种处理模式：自动同意 / 自动拒绝 / 仅通知管理员（默认）
 - 审批或补偿结果确定后才按人格私聊邀请人；动作失败时不会发送承诺成功的话术
 - 决策附邀请人画像：历史邀请次数、黑名单前科、活跃度，并排除当前审核记录（纯本地数据，不额外调 LLM）
@@ -117,7 +119,8 @@ OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / L
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `auto_approve` | `false` | 判断要加时自动同意进群 |
+| `trusted_inviter_bypass_review` | `true` | 已核验管理员/QQ 白名单真实邀请由规则建议同意，免 LLM 审核；读取异常暂停处理，与处罚保护独立 |
+| `auto_approve` | `false` | LLM 或可信规则判断要加时自动同意进群；关闭时只记录建议并通知 |
 | `auto_reject` | `false` | 判断不要加时自动拒绝 |
 | `reply_inviter_on_decision` | `true` | 审批/退群结果确定且成功后私聊邀请人 |
 | `custom_reject_reply` | `""` | 固定拒绝文案（留空由 LLM 按人格和上下文写；`{reason}` 替换为拒绝原因） |

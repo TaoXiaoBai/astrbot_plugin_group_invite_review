@@ -843,7 +843,8 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('class="card', _INVITE_RECORDS_TEMPLATE)
         self.assertNotIn("<table", _INVITE_RECORDS_TEMPLATE)
         self.assertIn("邀请附言", _INVITE_RECORDS_TEMPLATE)
-        self.assertIn("LLM 判断理由", _INVITE_RECORDS_TEMPLATE)
+        self.assertIn("决策理由", _INVITE_RECORDS_TEMPLATE)
+        self.assertNotIn("LLM {{ it.decision }}", _INVITE_RECORDS_TEMPLATE)
         self.assertIn("决策时用户画像", _INVITE_RECORDS_TEMPLATE)
         self.assertIn("社交来源 / 关系", _INVITE_RECORDS_TEMPLATE)
 
@@ -882,7 +883,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         path = await plugin._render_invite_records_image(FakeBot())
         self.assertEqual(path, "card.png")
         item = plugin.html_render.await_args.args[1]["items"][0]
-        self.assertEqual(item["decision"], "建议拒绝")
+        self.assertEqual(item["decision"], "LLM 建议拒绝")
         self.assertEqual(item["decision_class"], "reject")
         self.assertEqual(item["risk_text"], "76/100 · 高风险")
         self.assertEqual(len(item["tags"]), 8)
@@ -3111,6 +3112,289 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
         plugin._manual_blacklist.assert_awaited_once_with("20000", bot)
         self.assertNotIn("dealt", plugin._kv["invite_records"]["30000"][0])
         self.assertEqual(bot.calls, [])
+
+
+class TrustedInviteTests(unittest.IsolatedAsyncioTestCase):
+    make_plugin = InviteFlowTests.make_plugin
+    raw = staticmethod(InviteFlowTests.raw)
+    record = staticmethod(InviteFlowTests.record)
+    run_invite = InviteFlowTests.run_invite
+    seed_inflight = InviteFlowTests.seed_inflight
+
+    def trusted_plugin(self, **kwargs):
+        plugin = self.make_plugin("reject", **kwargs)
+        plugin.context.get_config = Mock(return_value={"admins_id": ["20000"]})
+        plugin._build_invite_context = AsyncMock(side_effect=AssertionError("no context"))
+        return plugin
+
+    async def test_admin_bypasses_llm_and_keeps_persistence_dedupe(self):
+        plugin = self.trusted_plugin(membership=["OUT", "OUT", "IN"])
+        plugin._protection_reason = Mock(side_effect=AssertionError("not a trust predicate"))
+        bot, _, rec = await self.run_invite(plugin)
+        self.assertEqual(rec["decision"], "approve")
+        self.assertEqual(rec["decision_source"], "trusted_inviter_rule")
+        self.assertEqual(rec["execution_state"], "APPROVED")
+        self.assertEqual(rec["membership_after"], "IN")
+        self.assertEqual(rec["profile_snapshot"], {})
+        plugin._ask_llm.assert_not_awaited()
+        plugin._build_invite_context.assert_not_awaited()
+        plugin._protection_reason.assert_not_called()
+        note = plugin._notify.await_args.args[1]
+        self.assertIn("规则（可信邀请免审核）", note)
+        self.assertNotIn("LLM", note)
+        await plugin.on_group_invite(FakeEvent(self.raw(), bot))
+        self.assertEqual(sum(name == "set_group_add_request" for name, _ in bot.calls), 1)
+        self.assertEqual(len(plugin._kv["invite_records"]["30000"]), 1)
+        self.assertNotIn("fixture-flag", repr(plugin._kv))
+
+    async def test_qq_whitelist_and_admin_protection_switch_are_independent(self):
+        for admins, qqs in (([], "20000"), (["20000"], "")):
+            with self.subTest(admins=admins):
+                plugin = self.trusted_plugin()
+                plugin.context.get_config.return_value = {"admins_id": admins}
+                plugin.config["protection"] = {
+                    "protect_astrbot_admins": False, "qq_whitelist": qqs,
+                }
+                _, _, rec = await self.run_invite(plugin)
+                self.assertEqual(rec["execution_state"], "APPROVED")
+                plugin._ask_llm.assert_not_awaited()
+
+    async def test_exact_matching_and_group_whitelist_never_grant_trust(self):
+        for user in (2000, 20001, 120000, "020000", ""):
+            with self.subTest(user=user):
+                plugin = self.trusted_plugin()
+                plugin.config["protection"] = {"qq_whitelist": "20000", "group_whitelist": "30000"}
+                _, _, rec = await self.run_invite(plugin, user_id=user)
+                self.assertEqual(rec["decision_source"], "llm")
+                self.assertEqual(rec["decision"], "reject")
+                plugin._ask_llm.assert_awaited_once()
+
+    async def test_latest_admins_are_read_for_every_new_request(self):
+        plugin = self.trusted_plugin(membership=["OUT"] * 6)
+        await self.run_invite(plugin)
+        plugin.context.get_config.return_value = {"admins_id": []}
+        await self.run_invite(plugin, flag="second-flag")
+        rec = plugin._kv["invite_records"]["30000"][-1]
+        self.assertEqual(rec["decision_source"], "llm")
+        plugin._ask_llm.assert_awaited_once()
+
+    async def test_bypass_off_uses_original_llm(self):
+        plugin = self.trusted_plugin()
+        plugin.config["decision"]["trusted_inviter_bypass_review"] = False
+        _, _, rec = await self.run_invite(plugin)
+        self.assertEqual(rec["decision_source"], "llm")
+        self.assertEqual(rec["execution_state"], "REJECTED")
+        plugin._ask_llm.assert_awaited_once()
+        plugin.context.get_config.assert_not_called()
+
+    async def test_auto_approve_off_only_records_and_notifies(self):
+        plugin = self.trusted_plugin()
+        plugin.config["decision"]["auto_approve"] = False
+        bot, _, rec = await self.run_invite(plugin)
+        self.assertEqual(rec["decision"], "approve")
+        self.assertEqual(rec["execution_state"], "NO_ACTION")
+        self.assertFalse(rec["action_attempted"])
+        self.assertEqual(bot.calls, [])
+        plugin._notify.assert_awaited_once()
+        plugin._ask_llm.assert_not_awaited()
+
+    async def test_configuration_failures_are_unknown_not_trust_or_llm_reject(self):
+        class BrokenConfig(dict):
+            def get(self, key, default=None):
+                if key == "decision":
+                    raise RuntimeError("unavailable")
+                return super().get(key, default)
+
+        for case in ("global_error", "missing_admins", "bad_admins", "bad_qqs",
+                     "bad_protection", "bad_decision", "bad_switch", "plugin_error"):
+            with self.subTest(case=case):
+                plugin = self.trusted_plugin()
+                if case == "global_error":
+                    plugin.context.get_config.side_effect = RuntimeError("unavailable")
+                elif case == "missing_admins":
+                    plugin.context.get_config.return_value = {}
+                elif case == "bad_admins":
+                    plugin.context.get_config.return_value = {"admins_id": [True, "20000"]}
+                elif case == "bad_qqs":
+                    plugin.config["protection"] = {"qq_whitelist": "20000,invalid"}
+                elif case == "bad_protection":
+                    plugin.config["protection"] = None
+                elif case == "bad_decision":
+                    plugin.config["decision"] = None
+                elif case == "bad_switch":
+                    plugin.config["decision"]["trusted_inviter_bypass_review"] = "true"
+                else:
+                    plugin.config = BrokenConfig(plugin.config)
+                bot, _, rec = await self.run_invite(plugin)
+                self.assertEqual(rec["decision"], "unknown")
+                self.assertEqual(rec["decision_source"], "trusted_inviter_config_error")
+                self.assertEqual(rec["execution_state"], "TRUST_CONFIG_FAILED")
+                self.assertFalse(rec["action_attempted"])
+                self.assertEqual(bot.calls, [])
+                plugin._ask_llm.assert_not_awaited()
+                self.assertNotIn("LLM", plugin._notify.await_args.args[1])
+
+    async def test_unverified_and_non_bot_targets_never_bypass(self):
+        plugin = self.trusted_plugin()
+        bot, _, rec = await self.run_invite(plugin, self_id=0, invited_id=0)
+        self.assertEqual(rec["target_state"], "UNVERIFIED")
+        self.assertEqual(rec["decision_source"], "llm")
+        plugin._ask_llm.assert_awaited_once()
+        self.assertEqual(bot.calls, [])
+        plugin = self.trusted_plugin()
+        bot, _, rec = await self.run_invite(plugin, invited_id=99999)
+        self.assertEqual(rec["execution_state"], "NOT_FOR_BOT")
+        plugin._ask_llm.assert_not_awaited()
+        self.assertEqual(bot.calls, [])
+
+    async def test_add_requests_and_missing_subtype_are_ignored(self):
+        for subtype in ("add", "", None):
+            with self.subTest(subtype=subtype):
+                plugin = self.trusted_plugin()
+                bot = FakeBot()
+                event = FakeEvent(self.raw(sub_type=subtype), bot)
+                await plugin.on_group_invite(event)
+                self.assertEqual(plugin._kv, {})
+                self.assertFalse(event.stopped)
+                self.assertEqual(bot.calls, [])
+                plugin._ask_llm.assert_not_awaited()
+
+    async def test_disabled_plugin_still_records_without_bypass(self):
+        plugin = self.trusted_plugin()
+        plugin.config["basic"]["enable"] = False
+        bot, _, rec = await self.run_invite(plugin)
+        self.assertEqual(rec["execution_state"], "DISABLED_RECORDED")
+        self.assertEqual(bot.calls, [])
+        plugin._ask_llm.assert_not_awaited()
+        plugin.context.get_config.assert_not_called()
+
+    async def test_missing_flag_and_unknown_membership_block_approval(self):
+        for raw, membership, state in (
+            ({"flag": ""}, ["OUT", "OUT"], "MISSING_FLAG"),
+            ({}, ["UNKNOWN", "UNKNOWN"], "MEMBERSHIP_UNKNOWN"),
+        ):
+            with self.subTest(state=state):
+                plugin = self.trusted_plugin(membership=membership)
+                bot, _, rec = await self.run_invite(plugin, **raw)
+                self.assertEqual(rec["decision"], "approve")
+                self.assertEqual(rec["execution_state"], state)
+                self.assertEqual(bot.calls, [])
+                plugin._ask_llm.assert_not_awaited()
+
+    async def test_pre_action_persistence_failure_blocks_trusted_approval(self):
+        plugin = self.trusted_plugin()
+        plugin.fail_put_states["APPROVE_IN_FLIGHT"] = 1
+        bot, _, rec = await self.run_invite(plugin)
+        self.assertEqual(rec["execution_state"], "PRE_ACTION_PERSIST_FAILED")
+        self.assertEqual(bot.calls, [])
+        plugin._ask_llm.assert_not_awaited()
+
+    async def test_failed_approval_does_not_send_success_reply(self):
+        plugin = self.trusted_plugin()
+        bot = FakeBot()
+        bot.fail_action = "set_group_add_request"
+        _, _, rec = await self.run_invite(plugin, bot)
+        self.assertEqual(rec["execution_state"], "ACTION_FAILED")
+        self.assertFalse(rec["action_succeeded"])
+        self.assertFalse(any(name == "send_private_msg" for name, _ in bot.calls))
+        plugin._ask_llm.assert_not_awaited()
+
+    async def test_external_join_is_rule_approval_without_duplicate_action(self):
+        plugin = self.trusted_plugin(membership=["IN", "IN"])
+        bot, _, rec = await self.run_invite(plugin)
+        self.assertEqual(rec["execution_state"], "EXTERNAL_JOIN_APPROVED")
+        self.assertNotIn("LLM", rec["execution_result"])
+        self.assertFalse(any(name == "set_group_add_request" for name, _ in bot.calls))
+        plugin._ask_llm.assert_not_awaited()
+
+    async def test_rule_source_is_visible_in_text_image_and_reconciliation(self):
+        plugin = self.trusted_plugin()
+        _, _, rec = await self.run_invite(plugin)
+        text = await plugin._list_invite_records_text()
+        self.assertIn("规则（可信邀请免审核）", text)
+        self.assertNotIn("LLM", text)
+        plugin.config["display"] = {"invite_records_show_profile": False,
+            "invite_records_show_group_profile": False}
+        plugin.html_render = AsyncMock(return_value="card.png")
+        await plugin._render_invite_records_image()
+        item = plugin.html_render.await_args.args[1]["items"][0]
+        self.assertIn("规则", item["decision"])
+        self.assertNotIn("LLM", item["decision"])
+        plugin = self.trusted_plugin(membership=["IN"])
+        raw = self.seed_inflight(plugin, "APPROVE_IN_FLIGHT", "approve")
+        self.record(plugin)["decision_source"] = "trusted_inviter_rule"
+        bot = FakeBot()
+        await plugin.on_group_invite(FakeEvent(raw, bot))
+        self.assertEqual(self.record(plugin)["execution_state"], "APPROVED_RECONCILED")
+        self.assertNotIn("LLM", plugin._notify.await_args.args[1])
+        self.assertEqual(bot.calls, [])
+        plugin._ask_llm.assert_not_awaited()
+
+
+    async def test_trusted_full_protocol_flow_and_join_binding(self):
+        class InviteApi(ApiOnly):
+            def __init__(self):
+                super().__init__()
+                self.joined = False
+
+            async def call_action(self, action, **params):
+                self.calls.append((action, params))
+                if action == "get_login_info":
+                    data = {"user_id": 10000}
+                elif action == "get_group_member_info":
+                    if not self.joined:
+                        raise RuntimeError("not in group")
+                    data = {"user_id": 10000}
+                elif action == "get_group_list":
+                    data = [{"group_id": 30000}] if self.joined else []
+                elif action == "set_group_add_request":
+                    self.joined = True
+                    data = {}
+                elif action == "send_private_msg":
+                    data = {}
+                else:
+                    raise AssertionError(action)
+                return {"status": "ok", "retcode": 0, "data": data}
+
+        plugin = self.trusted_plugin()
+        plugin._membership_state = GroupInviteGuardPlugin._membership_state.__get__(plugin)
+        bot = InviteApi()
+        _, _, rec = await self.run_invite(plugin, bot)
+        self.assertEqual(rec["membership_before"], "OUT")
+        self.assertEqual(rec["membership_after"], "IN")
+        self.assertEqual(rec["execution_state"], "APPROVED")
+        self.assertEqual(sum(name == "get_group_member_info" for name, _ in bot.calls), 3)
+        plugin._ask_llm.assert_not_awaited()
+        plugin._build_invite_context.assert_not_awaited()
+        await plugin.on_group_join(FakeEvent({"group_id": 30000,
+            "operator_id": 20000, "self_id": 10000}, bot))
+        join = plugin._kv["join_records"]["30000"]
+        self.assertEqual(join["inviter"], "20000")
+        self.assertEqual(join["request_key"], rec["request_key"])
+
+    async def test_decided_write_failure_still_persists_rule_source_before_action(self):
+        plugin = self.trusted_plugin()
+        plugin.fail_put_states["DECIDED"] = 1
+        bot = FakeBot()
+        original = bot.set_group_add_request
+
+        async def approve(**params):
+            rec = self.record(plugin)
+            self.assertEqual(rec["execution_state"], "APPROVE_IN_FLIGHT")
+            self.assertEqual(rec["decision_source"], "trusted_inviter_rule")
+            await original(**params)
+
+        bot.set_group_add_request = approve
+        _, _, rec = await self.run_invite(plugin, bot)
+        self.assertEqual(rec["execution_state"], "APPROVED")
+
+    def test_trusted_default_matches_schema(self):
+        import pathlib
+        from main import _CONFIG_GROUPS
+        schema = json.loads((pathlib.Path(__file__).resolve().parents[1] /
+            "_conf_schema.json").read_text(encoding="utf-8"))
+        self.assertIs(_CONFIG_GROUPS["decision"]["trusted_inviter_bypass_review"], True)
+        self.assertIs(schema["decision"]["items"]["trusted_inviter_bypass_review"]["default"], True)
 
 
 if __name__ == "__main__":

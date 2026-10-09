@@ -155,6 +155,7 @@ _CONFIG_GROUPS = {
         "notify_group_id": "",
     },
     "decision": {
+        "trusted_inviter_bypass_review": True,
         "auto_approve": False,
         "auto_reject": False,
         "reply_inviter_on_decision": True,
@@ -304,7 +305,7 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
           <span class="idx">#{{ it.index }}</span>
           <span class="time">{{ it.time }}</span>
           <span class="top-spacer"></span>
-          {% if it.decision %}<span class="pill decision {{ it.decision_class }}">LLM {{ it.decision }}</span>{% endif %}
+          {% if it.decision %}<span class="pill decision {{ it.decision_class }}">{{ it.decision }}</span>{% endif %}
           <span class="pill status {{ it.status_class }}">实际 · {{ it.status_text }}</span>
         </div>
 
@@ -339,7 +340,7 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
           <div class="block comment wide"><div class="label">邀请附言</div><div class="value">{{ it.comment }}</div></div>
           {% endif %}
           {% if it.reason %}
-          <div class="block reason wide"><div class="label">LLM 判断理由</div><div class="value">{{ it.reason }}</div></div>
+          <div class="block reason wide"><div class="label">决策理由</div><div class="value">{{ it.reason }}</div></div>
           {% endif %}
           {% if it.risk_text or it.tags %}
           <div class="block profile{% if not it.relation %} wide{% endif %}">
@@ -484,7 +485,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.23.0",
+    "1.23.1",
 )
 class GroupInviteGuardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -749,7 +750,7 @@ class GroupInviteGuardPlugin(Star):
     @filter.custom_filter(GroupInviteRequestFilter)
     async def on_group_invite(self, event: AstrMessageEvent):
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-        if raw is None:
+        if not GroupInviteRequestFilter().filter(event, None):
             return
 
         inviter_qq = str(_get_value(raw, "user_id") or "").strip()
@@ -1077,6 +1078,7 @@ class GroupInviteGuardPlugin(Star):
                     result_label=result, membership_before=str(rec.get("membership_before") or "UNKNOWN"),
                     membership_after=membership,
                     protocol_error="动作结果需人工确认" if not succeeded else "",
+                    decision_source=str(rec.get("decision_source") or "llm"),
                 ),
             )
 
@@ -1117,15 +1119,42 @@ class GroupInviteGuardPlugin(Star):
             membership_before=membership_before,
             execution_state="REVIEWING",
         )
-        try:
-            decision = await self._ask_llm(
-                inviter_qq, group_id, comment, bot, platform_id,
-                history_umo=history_umo, request_key=request_key,
-            )
-        except Exception as exc:
-            logger.error(f"group_invite_guard: LLM decision failed: {exc}")
-            decision = {"action": "unknown", "reason": f"LLM error: {exc}"}
-
+        decision_source = "llm"
+        decision = None
+        if target_state == "VERIFIED" and sub_type == "invite":
+            try:
+                section = self.config.get("decision", {})
+                if not isinstance(section, dict):
+                    raise ValueError("invalid decision section")
+                bypass = section.get("trusted_inviter_bypass_review", True)
+                if not isinstance(bypass, bool):
+                    raise ValueError("invalid trusted inviter switch")
+                if bypass:
+                    protection = self.config.get("protection", {})
+                    if not isinstance(protection, dict):
+                        raise ValueError("invalid protection section")
+                    qqs = self._protection_ids(protection.get("qq_whitelist", ""))
+                    admins = self.context.get_config().get("admins_id")
+                    qqs.update(self._protection_ids(admins))
+                    if inviter_qq in qqs:
+                        decision_source = "trusted_inviter_rule"
+                        decision = {
+                            "action": "approve", "reason": "可信邀请免审核",
+                            "reply": "好的，我已接受邀请。",
+                        }
+            except Exception:
+                logger.warning("group_invite_guard: trusted inviter configuration unavailable")
+                decision_source = "trusted_inviter_config_error"
+                decision = {"action": "unknown", "reason": "可信邀请配置读取异常，未自动处理，请人工确认"}
+        if decision is None:
+            try:
+                decision = await self._ask_llm(
+                    inviter_qq, group_id, comment, bot, platform_id,
+                    history_umo=history_umo, request_key=request_key,
+                )
+            except Exception as exc:
+                logger.error(f"group_invite_guard: LLM decision failed: {exc}")
+                decision = {"action": "unknown", "reason": f"LLM error: {exc}"}
         action = _safe_text(decision.get("action") if isinstance(decision, dict) else "", 32).lower()
         if action not in ("approve", "reject"):
             action = "unknown"
@@ -1149,6 +1178,7 @@ class GroupInviteGuardPlugin(Star):
             decision_reason=reason,
             review_state="DECIDED",
             execution_state="DECIDED",
+            decision_source=decision_source,
             alt_warning=alt_warning,
             profile_snapshot=profile_snapshot,
         )
@@ -1156,8 +1186,12 @@ class GroupInviteGuardPlugin(Star):
         membership_after = await self._membership_state(bot, group_id, self_id)
         outcome = await self._execute_invite_decision(
             bot, group_id, record_id, flag, sub_type, self_id, action, reason,
-            membership_after, target_state,
+            membership_after, target_state, decision_source,
         )
+        if decision_source == "trusted_inviter_config_error":
+            outcome.update(state="TRUST_CONFIG_FAILED", result="可信邀请配置读取异常，未自动处理")
+        elif decision_source == "trusted_inviter_rule" and outcome["state"] == "EXTERNAL_JOIN_APPROVED":
+            outcome["result"] = "外部提前入群，可信邀请免审核同意（未重复审批）"
         if "membership_after" in outcome:
             membership_after = str(outcome["membership_after"])
         elif outcome.get("refresh_membership"):
@@ -1194,6 +1228,7 @@ class GroupInviteGuardPlugin(Star):
             action=result_label,
             decision=action,
             decision_reason=reason,
+            decision_source=decision_source,
             review_state="COMPLETED",
             membership_after=membership_after,
             action_attempted=bool(outcome["attempted"]),
@@ -1223,13 +1258,14 @@ class GroupInviteGuardPlugin(Star):
                 membership_before=membership_before,
                 membership_after=membership_after,
                 protocol_error=protocol_error,
+                decision_source=decision_source,
             )
             await self._notify(bot, note)
 
     async def _execute_invite_decision(
         self, bot, group_id: str, record_id: str, flag: str, sub_type: str,
         self_id: str, action: str, reason: str, membership: str,
-        target_state: str,
+        target_state: str, decision_source: str = "llm",
     ) -> dict:
         outcome = {
             "attempted": False, "succeeded": False, "decision_succeeded": False,
@@ -1282,6 +1318,7 @@ class GroupInviteGuardPlugin(Star):
             decision_reason=reason,
             review_state="DECIDED",
             execution_state=in_flight,
+            decision_source=decision_source,
             execution_result="外部审批动作即将执行",
             action_attempted=True,
             action_succeeded=False,
@@ -5176,16 +5213,21 @@ class GroupInviteGuardPlugin(Star):
         self, inviter_qq, group_id, comment, action, reason, reply="",
         reply_status="", alt_warning="", result_label="",
         membership_before="UNKNOWN", membership_after="UNKNOWN", protocol_error="",
+        decision_source="llm",
     ) -> str:
         action_label = {
             "approve": "同意加入", "reject": "拒绝", "unknown": "判断失败（未处理）",
         }.get(action, action)
+        source_label = {
+            "llm": "LLM", "trusted_inviter_rule": "规则（可信邀请免审核）",
+            "trusted_inviter_config_error": "规则（配置异常）",
+        }.get(decision_source, "来源未知")
         lines = [
             "[加群邀请通知]",
             f"邀请人 QQ：{inviter_qq or '未知（协议端未识别）'}",
             f"群号：{group_id or '(未知)'}",
             f"附言：{comment or '(无)'}",
-            f"LLM 决策：{action_label}",
+            f"{source_label} 决策：{action_label}",
             f"实际执行：{result_label or '未记录'}",
             f"成员状态：审核前 {membership_before} / 执行前后 {membership_after}",
         ]
@@ -5261,6 +5303,13 @@ class GroupInviteGuardPlugin(Star):
             "skipped": "跳过",
             "unknown": "未知/未判断",
         }.get(decision, decision or "未知/未判断")
+        source = str(rec.get("decision_source") or "llm")
+        if source == "trusted_inviter_rule":
+            decision_text = "规则（可信邀请免审核）· " + decision_text
+        elif source == "trusted_inviter_config_error":
+            decision_text = "规则（配置异常）· " + decision_text
+        else:
+            decision_text = "LLM " + decision_text
         decision_class = {
             "approve": "approve",
             "reject": "reject",
@@ -5367,7 +5416,7 @@ class GroupInviteGuardPlugin(Star):
             after = str(rec.get("membership_after") or "-")
             execution = str(rec.get("execution_state") or "旧记录")
             view = self._invite_record_detail(rec)
-            decision_part = f" | LLM {view['decision']}" if show_detail else ""
+            decision_part = f" | {view['decision']}" if show_detail else ""
             lines.append(
                 f"群 {gid} -> {inviter} | {ts}{decision_part} "
                 f"| 实际 [{status_text}]/{execution} | 成员 {before}→{after} | {comment}"

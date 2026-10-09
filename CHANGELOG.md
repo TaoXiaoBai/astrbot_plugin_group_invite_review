@@ -2,6 +2,16 @@
 
 本文件记录加群邀请守卫的版本更新，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.23.1] - 2026-10-09
+
+### 新增
+- 默认开启管理员/QQ 白名单真实邀请免审核：目标 VERIFIED 且邀请人精准匹配最新 admins_id 或 protection.qq_whitelist 时直接生成 approve，不调用 LLM/画像/群成员背景
+- 规则与 LLM 决策分别记录 decision_source，通知、文字及图片记录明确标注来源
+
+### 安全
+- 免审核与处罚保护独立，群白名单不赋予邀请人信任；保留持久化、去重、auto_approve、flag 和成员状态安全检查
+- 可信配置读取异常记录 unknown/失败并通知，不调用 LLM 拒绝管理员，也不默认信任
+
 ## [1.23.0] - 2026-10-09
 
 ### 安全

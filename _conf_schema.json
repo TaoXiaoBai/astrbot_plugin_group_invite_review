@@ -63,11 +63,17 @@
     "description": "邀请决策",
     "type": "object",
     "items": {
+      "trusted_inviter_bypass_review": {
+        "description": "管理员/QQ 白名单邀请免审核",
+        "type": "bool",
+        "default": true,
+        "hint": "仅已核验的真实 bot 邀请，精准匹配最新 admins_id 或 protection.qq_whitelist 时由规则建议同意，不调用 LLM/画像/成员背景；仍受自动同意、成员状态、flag 与持久化保护约束。与处罚保护开关独立，群名单不赋予邀请人信任；配置异常暂停处理。"
+      },
       "auto_approve": {
         "description": "自动同意进群",
         "type": "bool",
         "default": false,
-        "hint": "LLM 判断要加时直接进群；关闭则只通知你"
+        "hint": "LLM 或可信邀请规则判断要加时直接进群；关闭则只记录建议并通知你"
       },
       "auto_reject": {
         "description": "自动拒绝邀请",
@@ -465,7 +471,7 @@
         "description": "显示决策与画像详情",
         "type": "bool",
         "default": true,
-        "hint": "在 /邀请记录 的文字版和图片版中显示 LLM 建议、判断理由、画像风险分、主要标签和精简社交来源。关闭后仍保留实际执行状态与成员状态。"
+        "hint": "在 /邀请记录 的文字版和图片版中区分规则与 LLM 建议，显示决策理由、画像风险分、主要标签和精简社交来源。关闭后仍保留实际执行状态与成员状态。"
       },
       "image_profile_concurrency": {
         "description": "图片资料查询并发数",
