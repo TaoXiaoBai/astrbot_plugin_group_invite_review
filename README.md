@@ -3,7 +3,7 @@
   <h1>加群邀请守卫</h1>
   <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
   <p>
-    <img src="https://img.shields.io/badge/version-1.23.1-blue" alt="version">
+    <img src="https://img.shields.io/badge/version-1.24.0-blue" alt="version">
     <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
     <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
     <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -13,6 +13,16 @@
 ## 这是什么
 
 一个 AstrBot 插件。有人拉你的 bot 进群时，管理员及 QQ 白名单的已核验真实邀请默认免审核；其他邀请交给 LLM 根据你设定的**人格**，结合目标群的成员和历史聊天印象，判断「进还是不进」。进了被踢、被禁言，还能记仇报复。
+
+## v1.24 权威动态关系与画像同步
+
+`bot_group_relations_v1` 独立 KV 以 `[platform_id,self_id,group_id]` 隔离，保存 inviter（明确邀请人）、operator（独立操作人）、request_key、join_time、membership（IN/OUT/UNKNOWN）、confirmed_at、evidence、稳定 event_key、revision 和投递创建毫秒时间。`record_bot_group_relation(...)` 为可信生命周期写入 API，`get_bot_group_relations(platform_id=..., self_id=..., group_id="", inviter="")` 为有界读取 API，均不是聊天权限授权。
+
+- 收到邀请或审批 API 成功只说明请求/动作状态；只有本 bot 的真实入群 notice 或 bot/群返回匹配的成员查询确认 IN。查询失败保持 UNKNOWN，不能当 OUT。邀请归因要求平台、bot 账号、近期 VERIFIED 请求完整且唯一；历史缺范围、多个候选或管理员直拉都保持未知，操作人不冒充邀请人。
+- 离群/被踢 notice 记录 OUT；本插件所有成功 `set_group_leave` 调用经统一入口更新 OUT，失败不写。记录不依赖报复总开关、旧 `record_group_join` 或处罚白名单（白名单继续保护动作，不掩盖客观生命周期）。客户端范围不唯一时不猜写其它 bot；收到真实离群 notice 后可补确认。协议返回成功仅为动作证据，不是永久当前在群判断。
+- 同一 KV 原子保存快照、去重键和 pending 投递。首次投递与每 30 秒恢复使用相同事件键及创建时间；重启自动恢复；画像未安装/旧接口/禁用/失败/超时均保留 pending。画像 recorded/duplicate/cancelled 才确认投递完成，确认落盘失败可安全重试。画像删除用 cutoff 和世代保护拒收旧事件，后续新生命周期仍可同步。
+- 不扫描旧历史、不调用模型补归因，不把旧全局前二十条邀请当当前关系。日常群聊 fallback 只看当前群/当前 bot，私聊只看当前发送者明确作为 inviter 的关系，最多六条、1200 字；状态表述为最近确认/待核实。画像必须实际注入关系并提供群号/版本 claims 才认领；仅去重已覆盖版本，缺失或更新关系仍提供 fallback，黑名单不被删除。新关系 KV/同步故障告警并放行旧 join/kick/审批/退群主流程，已成功退群不会因联动失败变为动作失败；取消仍向上传播。
+- 账本上限为一万条作用域关系、两万个事件键；达到上限会显式拒写，避免悄悄遗忘去重。KV 错误不覆盖旧账本；退群这种外部动作与 KV 无法跨系统事务化，动作成功至本地保存之间进程崩溃仍有窗口，后续真实 notice 可补齐，不伪造历史。无时间戳 notice 仅能按收到的生命周期顺序去重，无法从协议缺失数据推断真实先后。
 
 ## 功能一览
 
@@ -44,7 +54,7 @@
 - 管理员直拉进群没有邀请事件？也没关系——进群时间/操作人照样记录，被踢时通知你
 
 **LLM 联动**
-- 封禁/邀请/禁言记录自动注入 LLM 上下文，bot 聊天时知道谁有前科
+- 黑名单及当前平台/bot/群或明确邀请人的动态关系按范围注入；不再日常注入全局邀请与群禁言前二十条。完整历史仍可通过显式查询工具读取，历史邀请不代表当前成员关系
 - bot 可自主调用 4 个工具（可选需管理员）：`group_invite_ban_user` 拉黑、`group_invite_unban_user` 解封、`group_invite_query_ban` 查封禁状态、`group_invite_query_profile` 查某个 QQ 的完整画像
 
 **管理命令**（仅管理员，需唤醒 bot，支持 `/` 前缀）

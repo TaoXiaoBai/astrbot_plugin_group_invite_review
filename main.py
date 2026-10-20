@@ -16,6 +16,11 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Plain, Image
 from astrbot.api.star import Context, Star, register
 
+try:
+    from .group_relations import GroupRelationGuardMixin, RELATION_MARKER
+except ImportError:
+    from group_relations import GroupRelationGuardMixin, RELATION_MARKER
+
 
 _PROTECTION_EVENT = ContextVar("group_invite_guard_protection_event", default=None)
 
@@ -26,6 +31,8 @@ def _protected_notice(handler):
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
         if raw is None:
             return
+        if _get_value(raw, "notice_type") == "group_decrease" and self._cfg("basic", "enable", True):
+            await self._record_relation_notice_safely(event, "OUT")
         operator = str(_get_value(raw, "operator_id") or "")
         group = str(_get_value(raw, "group_id") or "")
         reason = self._protection_reason(operator, group)
@@ -485,9 +492,9 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.23.1",
+    "1.24.0",
 )
-class GroupInviteGuardPlugin(Star):
+class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config or {}
@@ -538,6 +545,12 @@ class GroupInviteGuardPlugin(Star):
                 raise
             except Exception as exc:
                 logger.warning(f"group_invite_guard: mute recovery failed: {exc}")
+            try:
+                await self._deliver_group_relations()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: relation recovery failed: {exc}")
             await asyncio.sleep(30)
 
     async def terminate(self):
@@ -1112,6 +1125,13 @@ class GroupInviteGuardPlugin(Star):
         request_key: str, record_id: str, target_state: str, target_error: str,
     ) -> None:
         membership_before = await self._membership_state(bot, group_id, self_id)
+        if target_state == "VERIFIED" and platform_id and self_id:
+            self._remember_relation_scope(bot, platform_id, self_id)
+            await self._record_relation_safely(
+                platform_id=platform_id, self_id=self_id, group_id=group_id,
+                membership=membership_before, evidence="邀请前匹配 bot 查询" if membership_before != "UNKNOWN" else "收到邀请，尚未确认入群",
+                event_key="relation:request:" + request_key,
+                inviter=inviter_qq if membership_before != "IN" else None, request_key=request_key)
         await self._update_invite_record(
             group_id, record_id,
             action="审核中",
@@ -1197,6 +1217,14 @@ class GroupInviteGuardPlugin(Star):
         elif outcome.get("refresh_membership"):
             membership_after = await self._membership_state(bot, group_id, self_id)
 
+        if target_state == "VERIFIED" and platform_id and self_id and membership_after in ("IN", "OUT"):
+            admission = await self._find_admission_for_join(group_id, self_id, platform_id)
+            await self._record_relation_safely(
+                platform_id=platform_id, self_id=self_id, group_id=group_id,
+                membership=membership_after, evidence="邀请后匹配 bot 查询",
+                event_key="relation:query:" + request_key,
+                inviter=str((admission or {}).get("inviter") or "") if membership_after == "IN" and membership_before != "IN" else None,
+                request_key=str((admission or {}).get("request_key") or ""))
         reply_status = ""
         may_reply = bool(outcome.get("decision_succeeded"))
         if reply and self._cfg("decision", "reply_inviter_on_decision", True):
@@ -1754,10 +1782,19 @@ class GroupInviteGuardPlugin(Star):
             note = self._compose_blacklist_inquiry_note(sender_id, text, reply, reason, is_banned)
             await self._notify(bot, note)
 
+    @filter.event_message_type(filter.EventMessageType.OTHER_MESSAGE, priority=1000)
+    async def on_group_leave_lifecycle(self, event: AstrMessageEvent):
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if (self._cfg("basic", "enable", True) and _get_value(raw, "post_type") == "notice"
+                and _get_value(raw, "notice_type") == "group_decrease"
+                and _get_value(raw, "sub_type") == "leave"):
+            await self._record_relation_notice_safely(event, "OUT")
+
     @filter.custom_filter(GroupJoinFilter)
     async def on_group_join(self, event: AstrMessageEvent):
         if not self._cfg("basic", "enable", True):
             return
+        await self._record_relation_notice_safely(event, "IN")
         if not self._cfg("kick_revenge", "record_group_join", True):
             return
 
@@ -1770,7 +1807,7 @@ class GroupInviteGuardPlugin(Star):
             return
         operator_id = str(_get_value(raw, "operator_id") or "")
         self_id = str(_get_value(raw, "self_id") or "")
-        admission = await self._find_admission_for_join(group_id, self_id)
+        admission = await self._find_admission_for_join(group_id, self_id, str(event.get_platform_id() or ""))
         await self._record_join(
             group_id,
             operator_id,
@@ -1921,7 +1958,9 @@ class GroupInviteGuardPlugin(Star):
             return result
         return f"已按设置拉黑踢人者 {operator_id}：{result}"
 
-    async def _find_admission_for_join(self, group_id: str, self_id: str) -> dict | None:
+    async def _find_admission_for_join(self, group_id: str, self_id: str, platform_id: str = "") -> dict | None:
+        if not platform_id or not self_id:
+            return None
         try:
             records = await self.get_kv_data("invite_records", {})
         except Exception:
@@ -1929,10 +1968,9 @@ class GroupInviteGuardPlugin(Star):
         now = int(time.time())
         candidates = []
         for rec in self._normalize_invite_records(records).get(str(group_id), []):
-            if str(rec.get("target_state") or "") == "NOT_FOR_BOT":
+            if str(rec.get("target_state") or "") != "VERIFIED":
                 continue
-            target_self = str(rec.get("self_id") or "")
-            if self_id and target_self and self_id != target_self:
+            if str(rec.get("self_id") or "") != self_id or str(rec.get("platform_id") or "") != platform_id:
                 continue
             try:
                 age = now - int(rec.get("time") or 0)
@@ -1941,14 +1979,10 @@ class GroupInviteGuardPlugin(Star):
             if age < -60 or age > 600:
                 continue
             state = str(rec.get("execution_state") or "")
-            if state == "REJECTED" and _as_bool(rec.get("action_succeeded")):
-                continue
-            if state == "UNEXPECTED_JOIN_LEFT" and _as_bool(rec.get("action_succeeded")):
+            if state in ("REJECTED", "UNEXPECTED_JOIN_LEFT") and _as_bool(rec.get("action_succeeded")):
                 continue
             candidates.append(rec)
-        if not candidates:
-            return None
-        return max(candidates, key=lambda rec: int(rec.get("time") or 0))
+        return candidates[0] if len(candidates) == 1 else None
 
     async def _admission_inviter(self, group_id: str, invite_records=None) -> str:
         try:
@@ -4728,7 +4762,7 @@ class GroupInviteGuardPlugin(Star):
             if owner is None:
                 continue
             if self._has_action_caller(owner):
-                return owner
+                return self._remember_relation_bot(event, owner)
             for attr in (
                 "bot",
                 "platform",
@@ -4740,7 +4774,7 @@ class GroupInviteGuardPlugin(Star):
             ):
                 nested = getattr(owner, attr, None)
                 if nested is not None and self._has_action_caller(nested):
-                    return nested
+                    return self._remember_relation_bot(event, nested)
         return None
 
     @staticmethod
@@ -4810,6 +4844,12 @@ class GroupInviteGuardPlugin(Star):
         return self._unwrap_onebot_response(result)
 
     async def _call_action(self, bot: Any, action: str, **params: Any) -> Any:
+        result = await self._call_action_raw(bot, action, **params)
+        if action == "set_group_leave":
+            await self._relation_best_effort(self._record_successful_group_leave(bot, params.get("group_id", "")))
+        return result
+
+    async def _call_action_raw(self, bot: Any, action: str, **params: Any) -> Any:
         if action in ("delete_friend", "set_group_leave"):
             reason = self._action_protection(
                 params.get("user_id", ""), params.get("group_id", "")
@@ -4849,21 +4889,27 @@ class GroupInviteGuardPlugin(Star):
         if bot is None or not str(group_id or "").strip():
             return "UNKNOWN"
         uid = str(self_id or "").strip()
+        try:
+            info = await self._call_action(bot, "get_login_info")
+            login_id = str(_get_value(info, "user_id") or "").strip()
+        except Exception:
+            login_id = ""
+        if login_id and uid and login_id != uid:
+            return "UNKNOWN"
+        uid = uid or login_id
         if not uid:
-            try:
-                info = await self._call_action(bot, "get_login_info")
-                uid = str(_get_value(info, "user_id") or "").strip()
-            except Exception:
-                uid = ""
-        if uid:
-            try:
-                await self._call_action(
-                    bot, "get_group_member_info", group_id=int(group_id),
-                    user_id=int(uid), no_cache=True,
-                )
+            return "UNKNOWN"
+        try:
+            member = await self._call_action(
+                bot, "get_group_member_info", group_id=int(group_id),
+                user_id=int(uid), no_cache=True,
+            )
+            if str(_get_value(member, "user_id") or "") == uid and str(_get_value(member, "group_id") or "") == str(group_id):
                 return "IN"
-            except Exception:
-                pass
+        except Exception:
+            pass
+        if login_id != uid:
+            return "UNKNOWN"
         try:
             groups = await self._call_action(bot, "get_group_list", no_cache=True)
             if isinstance(groups, dict):
@@ -5825,8 +5871,10 @@ class GroupInviteGuardPlugin(Star):
         except Exception as exc:
             logger.error(f"group_invite_guard: send command result failed: {exc}")
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=9999)
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=9999)
+    @filter.event_message_type(
+        filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE,
+        priority=9999,
+    )
     async def on_blacklist_message_guard(self, event: AstrMessageEvent):
         """兜底拦截：被拉黑用户发来的群聊/私聊消息直接停止传播。"""
         if not self._cfg("basic", "enable", True):
@@ -5947,15 +5995,22 @@ class GroupInviteGuardPlugin(Star):
             return
         if not self._cfg("llm_integration", "llm_context_inject", True):
             return
+        existing = str(getattr(req, "system_prompt", None) or "")
+        marker = "<!-- astrbot-invite-guard-context:v1 -->"
+        if marker in existing:
+            return
         try:
-            block = await self._build_ban_context_text()
+            entries = self._read_ban_entries()
+            lines = [f"- QQ {user_id}（{reason}）" for user_id, reason in entries[:20]]
+            block = "[加群邀请守卫·当前黑名单]\n" + "\n".join(lines) if lines else ""
+            fallback = await self._relation_best_effort(self._relation_fallback_context(event, existing))
+            if fallback:
+                block += "\n" + fallback
         except Exception as exc:
-            logger.warning(f"group_invite_guard: build ban context failed: {exc}")
+            logger.warning(f"group_invite_guard: build scoped context failed: {exc}")
             return
-        if not block:
-            return
-        existing = getattr(req, "system_prompt", None) or ""
-        req.system_prompt = f"{existing}\n\n{block}" if existing else block
+        if block:
+            req.system_prompt = existing + "\n\n" + marker + "\n" + block
 
     @filter.llm_tool(name="group_invite_ban_user")
     async def llm_ban_user(self, event, user_id: str, reason: str = ""):

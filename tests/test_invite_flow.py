@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import enum
 import json
 import sys
 import types
@@ -17,12 +18,24 @@ class _Filter:
     class CustomFilter:
         pass
 
-    class EventMessageType:
-        GROUP_MESSAGE = "group"
-        PRIVATE_MESSAGE = "private"
+    class EventMessageType(enum.Flag):
+        GROUP_MESSAGE = enum.auto()
+        PRIVATE_MESSAGE = enum.auto()
+        OTHER_MESSAGE = enum.auto()
+        ALL = GROUP_MESSAGE | PRIVATE_MESSAGE | OTHER_MESSAGE
 
     custom_filter = staticmethod(_identity_decorator)
-    event_message_type = staticmethod(_identity_decorator)
+
+    @staticmethod
+    def event_message_type(message_type, **kwargs):
+        def decorate(obj):
+            filters = list(getattr(obj, "_event_message_filters", []))
+            filters.append(message_type)
+            obj._event_message_filters = filters
+            obj._event_priority = kwargs.get("priority", 0)
+            return obj
+        return decorate
+
     on_llm_request = staticmethod(_identity_decorator)
     llm_tool = staticmethod(_identity_decorator)
 
@@ -3395,6 +3408,64 @@ class TrustedInviteTests(unittest.IsolatedAsyncioTestCase):
             "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertIs(_CONFIG_GROUPS["decision"]["trusted_inviter_bypass_review"], True)
         self.assertIs(schema["decision"]["items"]["trusted_inviter_bypass_review"]["default"], True)
+
+
+class BlacklistMessageGuardTests(unittest.IsolatedAsyncioTestCase):
+    make_plugin = InviteFlowTests.make_plugin
+
+    async def dispatch(self, plugin, message_type, sender="20000"):
+        event = FakeEvent({}, FakeBot())
+        event.get_sender_id = lambda: sender
+        handler = plugin.on_blacklist_message_guard
+        if all(message_type & mask for mask in handler._event_message_filters):
+            await handler(event)
+        return event
+
+    def test_registration_uses_one_union_filter_and_priority(self):
+        handler = GroupInviteGuardPlugin.on_blacklist_message_guard
+        self.assertEqual(handler._event_message_filters, [
+            _Filter.EventMessageType.GROUP_MESSAGE | _Filter.EventMessageType.PRIVATE_MESSAGE
+        ])
+        self.assertEqual(handler._event_priority, 9999)
+
+    async def test_banned_group_and_private_messages_stop(self):
+        for kind in (_Filter.EventMessageType.GROUP_MESSAGE,
+                     _Filter.EventMessageType.PRIVATE_MESSAGE):
+            with self.subTest(kind=kind):
+                plugin = self.make_plugin()
+                plugin._is_user_banned = AsyncMock(return_value=(True, "test ban"))
+                event = await self.dispatch(plugin, kind)
+                self.assertTrue(event.stopped)
+                plugin._is_user_banned.assert_awaited_once_with("20000")
+                self.assertEqual(event.bot.calls, [])
+                self.assertEqual(plugin.put_calls, [])
+
+    async def test_unbanned_group_and_private_messages_continue(self):
+        for kind in (_Filter.EventMessageType.GROUP_MESSAGE,
+                     _Filter.EventMessageType.PRIVATE_MESSAGE):
+            plugin = self.make_plugin()
+            plugin._is_user_banned = AsyncMock(return_value=(False, ""))
+            event = await self.dispatch(plugin, kind)
+            self.assertFalse(event.stopped)
+            plugin._is_user_banned.assert_awaited_once_with("20000")
+
+    async def test_other_messages_do_not_enter_guard(self):
+        plugin = self.make_plugin()
+        plugin._is_user_banned = AsyncMock(return_value=(True, "test ban"))
+        event = await self.dispatch(plugin, _Filter.EventMessageType.OTHER_MESSAGE)
+        self.assertFalse(event.stopped)
+        plugin._is_user_banned.assert_not_awaited()
+
+    async def test_disabled_or_missing_sender_does_not_lookup(self):
+        for settings, sender in (({"basic": {"enable": False}}, "20000"),
+                                 ({"kick_revenge": {"intercept_banned_messages": False}}, "20000"),
+                                 ({}, "")):
+            plugin = self.make_plugin()
+            plugin.config.update(settings)
+            plugin._is_user_banned = AsyncMock(return_value=(True, "test ban"))
+            event = await self.dispatch(plugin, _Filter.EventMessageType.GROUP_MESSAGE, sender)
+            self.assertFalse(event.stopped)
+            plugin._is_user_banned.assert_not_awaited()
 
 
 if __name__ == "__main__":

@@ -303,7 +303,7 @@
         "description": "记录进群事件",
         "type": "bool",
         "default": true,
-        "hint": "记录每次进群的时间和操作人，供被踢时反查"
+        "hint": "控制兼容 join_records 的时间/操作人记录。独立平台/bot/群生命周期账本不受本开关或报复开关影响；真实入群/离群仍记录并可靠同步画像，旧缺范围记录不用于动态关系归因。"
       },
       "cross_group_retaliation": {
         "description": "跨群连坐",
@@ -429,7 +429,7 @@
         "description": "注入封禁记录",
         "type": "bool",
         "default": true,
-        "hint": "把封禁/邀请/禁言记录写进 LLM 上下文，聊天时知道谁有前科"
+        "hint": "注入黑名单及当前平台/bot/群关系 fallback，私聊仅发送者明确作为 inviter 的最多六条，不注入全局前二十条邀请/群禁言。画像 marker 接管关系时保留黑名单；状态称最近确认/待核实。关闭不影响生命周期账本及可靠画像同步。"
       },
       "llm_tool_ban": {
         "description": "LLM 主动拉黑",
