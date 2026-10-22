@@ -1,246 +1,125 @@
 <div align="center">
   <img src="logo.png" width="128" alt="logo">
   <h1>加群邀请守卫</h1>
-  <p>让 LLM 根据<b>人格设定</b>判断是否通过邀请加群</p>
-  <p>
-    <img src="https://img.shields.io/badge/version-1.24.0-blue" alt="version">
-    <img src="https://img.shields.io/badge/AstrBot-4.x-4a6cf7" alt="astrbot">
-    <img src="https://img.shields.io/badge/platform-OneBot%20V11-green" alt="platform">
-    <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
-  </p>
+  <p>按人格审核加群邀请，可选被踢、被禁言后的退群与处罚</p>
+  <p>版本 1.25.0 · AstrBot 4.x · OneBot V11 · MIT</p>
 </div>
 
-## 这是什么
+## 它会做什么
 
-一个 AstrBot 插件。有人拉你的 bot 进群时，管理员及 QQ 白名单的已核验真实邀请默认免审核；其他邀请交给 LLM 根据你设定的**人格**，结合目标群的成员和历史聊天印象，判断「进还是不进」。进了被踢、被禁言，还能记仇报复。
+有人邀请 bot 加群时，守卫记录请求、核验邀请是否针对当前 bot，再给出审核建议。默认信任 AstrBot 管理员及 QQ 白名单的真实邀请；其他邀请由模型结合人格、群背景与邀请人信息判断。
 
-## v1.24 权威动态关系与画像同步
+**给出建议不等于已经进群。** 默认不自动同意、不自动拒绝，只通知管理员。只有打开对应开关、协议条件满足且操作成功，才算执行了同意或拒绝。若 bot 在审核结束前已被直接拉进群，可配置拒绝后仅通知、退出，或留言后退出。
 
-`bot_group_relations_v1` 独立 KV 以 `[platform_id,self_id,group_id]` 隔离，保存 inviter（明确邀请人）、operator（独立操作人）、request_key、join_time、membership（IN/OUT/UNKNOWN）、confirmed_at、evidence、稳定 event_key、revision 和投递创建毫秒时间。`record_bot_group_relation(...)` 为可信生命周期写入 API，`get_bot_group_relations(platform_id=..., self_id=..., group_id="", inviter="")` 为有界读取 API，均不是聊天权限授权。
+被踢、被禁言的处理是另一套可选功能：可以计数、通知、退群、删好友及拉黑，也可以将个人禁言证据交给用户画像插件。它们有各自开关，不要把“禁言报复关闭”理解成“画像联动和即时拉黑也关闭”。
 
-- 收到邀请或审批 API 成功只说明请求/动作状态；只有本 bot 的真实入群 notice 或 bot/群返回匹配的成员查询确认 IN。查询失败保持 UNKNOWN，不能当 OUT。邀请归因要求平台、bot 账号、近期 VERIFIED 请求完整且唯一；历史缺范围、多个候选或管理员直拉都保持未知，操作人不冒充邀请人。
-- 离群/被踢 notice 记录 OUT；本插件所有成功 `set_group_leave` 调用经统一入口更新 OUT，失败不写。记录不依赖报复总开关、旧 `record_group_join` 或处罚白名单（白名单继续保护动作，不掩盖客观生命周期）。客户端范围不唯一时不猜写其它 bot；收到真实离群 notice 后可补确认。协议返回成功仅为动作证据，不是永久当前在群判断。
-- 同一 KV 原子保存快照、去重键和 pending 投递。首次投递与每 30 秒恢复使用相同事件键及创建时间；重启自动恢复；画像未安装/旧接口/禁用/失败/超时均保留 pending。画像 recorded/duplicate/cancelled 才确认投递完成，确认落盘失败可安全重试。画像删除用 cutoff 和世代保护拒收旧事件，后续新生命周期仍可同步。
-- 不扫描旧历史、不调用模型补归因，不把旧全局前二十条邀请当当前关系。日常群聊 fallback 只看当前群/当前 bot，私聊只看当前发送者明确作为 inviter 的关系，最多六条、1200 字；状态表述为最近确认/待核实。画像必须实际注入关系并提供群号/版本 claims 才认领；仅去重已覆盖版本，缺失或更新关系仍提供 fallback，黑名单不被删除。新关系 KV/同步故障告警并放行旧 join/kick/审批/退群主流程，已成功退群不会因联动失败变为动作失败；取消仍向上传播。
-- 账本上限为一万条作用域关系、两万个事件键；达到上限会显式拒写，避免悄悄遗忘去重。KV 错误不覆盖旧账本；退群这种外部动作与 KV 无法跨系统事务化，动作成功至本地保存之间进程崩溃仍有窗口，后续真实 notice 可补齐，不伪造历史。无时间戳 notice 仅能按收到的生命周期顺序去重，无法从协议缺失数据推断真实先后。
+## 先这样配置
 
-## 功能一览
+安装到 AstrBot 的 `data/plugins/` 后按框架正常流程加载。在 **WebUI → 插件 → 加群邀请守卫 → 配置** 中修改，完整字段、选项和提示以配置页为准。
 
-**进群决策**
-- 收到针对 bot 的真实邀请后立即持久化；默认对最新 AstrBot `admins_id` 或 `protection.qq_whitelist` 精准匹配且目标 VERIFIED 的邀请免审核，规则直接建议同意，不调用 LLM、画像或群成员背景
-- 免审核与处罚保护开关独立，群白名单不赋予邀请人信任；仍受插件启用、`auto_approve`、成员状态、flag 和动作前持久化约束。配置读取异常记录 unknown/失败并通知，不交给 LLM 拒绝，也不默认信任
-- 普通邀请或关闭免审核开关时，收集上下文、调用 LLM、执行前复核成员状态，最后同意或拒绝；记录和通知通过 `decision_source` 区分规则与 LLM
-- 外部动作前持久化执行中状态；重启遇到未确认动作只对账和通知，不自动重放
-- 非免审核邀请即使 bot 已提前入群或审核期间入群也不会跳过 LLM；LLM 拒绝时可仅通知、直接退群或发自定义消息后退群
-- 三种处理模式：自动同意 / 自动拒绝 / 仅通知管理员（默认）
-- 审批或补偿结果确定后才按人格私聊邀请人；动作失败时不会发送承诺成功的话术
-- 决策附邀请人画像：历史邀请次数、黑名单前科、活跃度，并排除当前审核记录（纯本地数据，不额外调 LLM）
-- 安装用户画像插件时优先读取结构化风险分、标签、活跃度和社交来源，并把决策时快照写入邀请记录；旧版画像插件自动降级兼容
-- 抓到邀请人历史发言原话时，由 LLM 浓缩成一段 100 字内的印象小结（按发言条数缓存，陌生人零开销）
-- 小号识别：被拉黑的人换号再来？附言/昵称相似度命中即在决策上下文和通知里提示"疑似小号"；相似度处于灰色区间时再交 LLM 复判一次（结论缓存 7 天）
-- 单次审核复用邀请记录与历史会话快照，人格和背景并发加载；同键 LLM 小结/复判合并为一次调用，不改变审核提示词与状态机
-- 私聊里问"能不能加群"、直接甩邀请链接，也能识别并回复/通知
+1. **基础 `basic`**：确认 `enable` 开启；私聊通知默认发给全局管理员，也可用 `notify_private_qq` 指定接收人。通知名单不等于处罚白名单。
+2. **邀请决策 `decision`**：选择模型及人格；先保持 `auto_approve=false`、`auto_reject=false`，看邀请记录与通知是否符合预期。确认后再打开需要的自动操作。
+3. **异常提前入群 `unexpected_join`**：默认 `notify_only`，不会仅因模型拒绝就退出已经加入的群。
+4. **白名单保护 `protection`**：把不应被处罚的 QQ/群先加入名单，默认保护全部 AstrBot 管理员。
+5. 如需自动处罚，再单独配置下面的被踢、禁言选项。启用前确认协议客户端支持所需动作，建议先用测试账号验证。
+6. **LLM 联动 `llm_integration`**：默认允许模型工具且不要求管理员。生产环境建议先启用 `llm_tool_require_admin`，或关闭 `llm_tool_ban`；本版本不替你改变默认权限。
 
-**记仇与报复**
-- 自动记录每次进群的邀请人；被该群踢出后可自动删除好友 / 拉黑邀请人，并通知管理员
-- 可选：被踢时连执行踢人的管理员一起拉黑
-- 可选：跨群连坐——被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群再拉黑 TA
-- 被禁言自动计数，达到次数阈值直接退群 + 拉黑，不调用 LLM；未达次数但单次达到 24 小时（可调）时按现有人格与邀请人/群背景交 LLM 复核，仅明确决定退群才执行同一套动作
-- 默认把可验证的禁言操作者写入用户画像并增加 35 风险（累计默认最多 70）；可改为邀请人关联责任或两者。邀请人不会伪装成操作者，未知/非法/机器人自身 QQ 不归因。该联动与禁言报复总开关独立
-- 可另行开启“即时拉黑画像归因对象”（默认关闭），它独立于禁言报复开关，并可与画像风险增量同时启用；任务先持久化为 pending，成功后才标 completed，失败或重启后自动重试，同一事件不会和阈值报复重复拉黑
-- 长期禁言复核为默认开启的子开关，但禁言报复总开关默认关闭；LLM 保留、异常或无效输出只通知管理员并保留次数。协议时长为秒，非法或超过 366 天的值不参与复核，普通通知显示可读时长
-- 长期禁言 LLM 退群可选在所有退群/连坐/拉黑动作前私聊邀请人（默认关闭），使用独立的 `long_mute_inviter_message`；留空回退安全默认文案。它不读取被踢/审核场景的 `ban_notice_message`，LLM `reply`/`reason` 也不会外发。发送失败不影响后续动作
-- 动作前会清理本群计数以防并发重复；当前群退群明确失败或等待退群时任务被取消，会以不覆盖更大新值的方式恢复计数。退群是跨系统外部动作，极端进程崩溃窗口无法事务化，计数仍可能丢失；不会在重启后猜测或重放未知结果
-- 管理员直拉进群没有邀请事件？也没关系——进群时间/操作人照样记录，被踢时通知你
+默认行为：被踢报复关闭，禁言次数/长期复核报复关闭，个人禁言写画像开启（需画像插件接收），即时 direct 拉黑关闭。长期禁言模型复核子开关虽然默认开启，但仍受禁言报复总开关约束。
 
-**LLM 联动**
-- 黑名单及当前平台/bot/群或明确邀请人的动态关系按范围注入；不再日常注入全局邀请与群禁言前二十条。完整历史仍可通过显式查询工具读取，历史邀请不代表当前成员关系
-- bot 可自主调用 4 个工具（可选需管理员）：`group_invite_ban_user` 拉黑、`group_invite_unban_user` 解封、`group_invite_query_ban` 查封禁状态、`group_invite_query_profile` 查某个 QQ 的完整画像
+关闭 `basic.enable` 后，不执行守卫的自动审批、处罚及消息拦截，已有 direct pending 暂停，重新开启后可继续；管理员显式命令仍可用，仍受白名单限制。**qq_tools 是独立插件，其黑名单拦截不会随守卫关闭而关闭。**
 
-**管理命令**（仅管理员，需唤醒 bot，支持 `/` 前缀）
+## 三层“拉黑”不是同一回事
 
-| 命令 | 说明 |
+| 层次 | 实际影响 | `/解封` 能做什么 |
+| --- | --- | --- |
+| QQ 协议删除/拉黑 | 调用当前账号的 `delete_friend(block=True)`；效果由协议实现和 QQ 决定 | 不能恢复好友、不能撤销协议黑名单，需在客户端人工处理 |
+| AstrBot 黑名单 | 通过可选的 `astrbot_plugin_qq_tools` 持久化 `ban_list`，由其实现拦截 | 尝试移除并保存该条目；未装 qq_tools 不妨碍清理守卫状态 |
+| 守卫已处理标记 `dealt` | 邀请记录上的派生拦截依据，也影响记录展示；不是 QQ 黑名单 | 清除该 QQ 的 dealt 标记；不删除原邀请、风险或管理历史 |
+
+手动拉黑会尝试留言、协议删除并拉黑、加入 AstrBot 黑名单。某一步失败不代表其它步骤失败：例如非好友收不到留言，仍可尝试后续操作；qq_tools 未安装时协议操作仍可执行。只有真实协议成功或内部黑名单成功持久化，才记为处罚成功。通知发送成功不算封禁成功，通知发送失败也不等于封禁失败。
+
+qq_tools 有效期已到的条目不会被守卫当成有效内部黑名单；守卫独立的 dealt 标记仍需按自身状态处理。查看返回的分项结果，不要只看通知里有没有“拉黑”两个字。
+
+## 管理命令与例子
+
+以下命令仅管理员使用，需按 AstrBot 的唤醒规则唤醒 bot，支持 `/` 前缀。
+
+| 命令 | 用途 |
 | --- | --- |
-| `/邀请记录` | 图片表格展示邀请记录（别名 `/邀请列表`） |
-| `/记录邀请 <群号> <QQ>` | 手动补录一条邀请记录 |
-| `/画像 <QQ>` | 查看完整画像：邀请明细、黑名单状态、前科、发言条数、疑似小号检测 |
-| `/手动拉黑 <QQ或群号>` | 自动反查邀请记录：退相关群 + 拉黑（查无记录则直接拉黑该 QQ） |
-| `/拉黑列表` | 查看黑名单（别名 `/黑名单`） |
-| `/解封 <QQ>` | 移出黑名单 |
+| `/邀请记录`（或 `/邀请列表`） | 图片查看邀请；失败时回退文字，区分审核建议与执行结果 |
+| `/记录邀请 30000 20000` | 补录“群 30000、邀请人 20000”的历史备注；不是当前在群证明，也不会凭这条备注自动处罚 |
+| `/画像 20000` | 查看邀请、封禁、风险及可用画像信息 |
+| `/手动拉黑 QQ 20000` | 明确处罚 QQ 20000；先退出当前 bot 已确认 IN、邀请人确为该 QQ 的相关群，再拉黑一次；无群关系也可按 QQ 处理 |
+| `/手动拉黑 群 30000` | 只在当前 bot 的该群关系明确且最近确认 IN 时，退出该群并处罚明确邀请人；未知邀请人不猜测 |
+| `/手动拉黑 20000 30000` | 保留旧双数字语法：明确 QQ 20000 并指定退出群 30000，不依赖历史自动反查 |
+| `/手动拉黑 20000` | 保留无歧义单数字用法；若数字同时可能是群/邀请人，或是已知群但归因未知，会拒绝猜测，请改用显式语法 |
+| `/拉黑列表`（或 `/黑名单`） | 查看 qq_tools 黑名单条目（不是 QQ 客户端协议黑名单） |
+| `/解封 20000` | 分别报告内部黑名单移除、守卫 dealt 清理、旧 direct 任务取消结果 |
 
-> `/手动拉黑` 兼容旧用法 `/手动拉黑 <QQ> <群号>`（指定退哪个群）。各命令的详细行为见配置页分组说明。
+`/解封` 会在 direct 动作锁内等待已提交的旧 direct 动作收敛，然后清理内部黑名单；取消截至本次解封的旧 pending，并保存水位防止旧任务在重启后复活。completed 去重键不删。它不恢复好友、不退出协议黑名单、不撤回旧风险/邀请记录，也不是永久免罚：**之后真正的新事件仍可按配置处罚**。若存储/保存失败，会分项报错；不能把部分成功当成全部解封。
 
-插件被禁用时只记录邀请；不会自动审批、退群、拉黑或拦截，管理员显式手动命令与查询仍可用。
+## 自动处罚怎么选
 
-## 安装
+- **被踢 `kick_revenge`**：`revenge_mode=off` 默认不报复邀请人；`delete_friend` 执行协议删除并拉黑；`delete_and_ban` 再尝试加入 AstrBot 黑名单。`kick_ban_operator` 可独立处罚 notice 中的踢人操作者，默认关闭。
+- **跨群退出**：`cross_group_retaliation` 默认关闭。开启后，也只处理当前平台、当前 bot 最近确认 IN 且邀请人明确匹配的群，不遍历旧拒绝邀请推断目标，不退出其它 bot 的群。
+- **禁言报复 `mute_revenge`**：`mute_retaliation_enable` 默认关闭。开启后达到 `mute_threshold`（默认 3 次）会退群并处罚；未达次数、单次达到 `long_mute_threshold_hours`（默认 24 小时）时，可由模型复核是否退出。只有明确决定退出才执行，异常/无效输出不当作退出指令。**处罚次数按平台、bot 账号、群分别累计**，不同 bot 即使在同一群也不会凑次数。旧版无账号范围的次数仅保留历史展示，不迁入任何当前 bot 的处罚计数；事件范围不明时不执行危险阈值动作。
+- **处罚谁与如何处罚**：`mute_target` 可选操作者、明确邀请人或两者；`mute_ban_mode` 可选 `astrbot_ban` 或 `delete_friend`。邀请人必须来自当前平台/bot/群权威关系；进群操作人、全局历史邀请和最新被拒记录都不能替代明确邀请人。未知归因会跳过邀请人处罚并通知管理员。
+- **个人禁言联动**：`profile_mute_enable=true` 默认给操作者写画像，单事件风险增量 35，累计上限 70，可分别改 `profile_mute_target`、`profile_mute_risk_increment`、`profile_mute_risk_cap`。它独立于禁言报复总开关。
+- **即时 direct 拉黑**：`profile_mute_direct_blacklist=false` 默认关闭；开启后处罚个人禁言归因目标，可与画像风险叠加。失败保留 pending，每 30 秒及启动后恢复；关闭该子开关会暂停旧 direct，而不是把旧任务标为成功。
+- **拉黑前留言**：`kick_revenge.ban_notice_message` 用于原有拉黑场景。长期禁言模型决定退出后的邀请人留言，由 `long_mute_notify_inviter` 与 `long_mute_inviter_message` 独立控制；不会把模型 reason/reply 当该通知外发。业务发送失败不阻断 direct，已尝试后不反复每 30 秒刷留言；缺少所需账号客户端则安全等待，不借其它 bot。
 
-1. 把本仓库放进 AstrBot 的 `data/plugins/`（或在插件市场搜索安装）
-2. 重启 AstrBot
-3. WebUI → 插件 →「加群邀请守卫」里配置
+## 白名单与模型工具权限
 
-> 默认配置就是安全模式：判断要加时**不会**自动进群，只私聊通知管理员，由你拍板。
+`protection.protect_astrbot_admins=true` 实时保护全局 `admins_id` 中所有管理员。`qq_whitelist`、`group_whitelist` 用逗号或空白分隔，精准匹配完整号码，不是子串匹配。
 
-## 可选联动
+保护操作者或事件群命中名单，跳过整个处罚链；仅邀请人受保护时，跳过其自身归因、处罚与相关跨群退出，不包庇普通操作者。手动命令和模型工具同样不能绕过。配置读取异常时暂停危险动作；名单在动作已经提交给外部 API 后才变化，不能撤回在途动作。加入白名单不会自动撤销旧黑名单/风险；旧 pending 按最新保护规则取消，completed 去重继续保留。
 
-单独安装即可完整使用。如果装了「[用户画像](https://github.com/TaoXiaoBai/astrbot_plugin_user_profile)」插件，邀请审核优先调用 `get_decision_profile()`，读取结构化风险分、标签、活跃度、数据新鲜度、LLM 状态和社交来源；当前审核记录按 `request_key` 排除。旧画像插件依次降级到标签 API 或文本 API。
+管理员及 QQ 白名单的真实邀请默认免模型审核，由 `decision.trusted_inviter_bypass_review` 控制；这与处罚保护独立，**群白名单不赋予某个邀请人可信身份**，自动审批仍要满足开关、flag、持久化及成员核验条件。
 
-守卫同时提供版本化只读 API `get_inviter_evidence(qq, exclude_request_key="")`。画像插件优先通过该 API 取得有限的邀请/进群摘要，旧守卫才回退 KV；旧或脏 KV 的非法时间会安全降级为 `0`。守卫 1.21.0+ 调用画像 1.10.0+ 的禁言写入 API：先持久化待投递目标，只有 `recorded`/`duplicate` 才完成；插件缺失、旧 API、禁用、失败或返回 false 都保留 pending，由启动恢复循环继续投递。稳定事件 completed 账本不淘汰，`mute_event_jobs` 全局最多 5000 条，满后明确拒绝新事件而不删除旧键。邀请人归因和即时拉黑只接受当前群 `join_records.inviter` 明确字段，不使用 `join_records.operator` 或旧邀请记录兜底；联动 job 达上限或 KV 故障只会跳过画像/direct，不会阻断原禁言计数、阈值退群或长期复核。
+模型工具包括 `group_invite_ban_user`、`group_invite_unban_user`、`group_invite_query_ban`、`group_invite_query_profile`。默认 `llm_tool_ban=true`、`llm_tool_require_admin=false`，普通会话有机会触发模型调用危险工具；是否发生还受框架工具可用性和模型选择影响。证据内容虽标记不可信，提示注入风险并不能完全消除，建议按需要收紧管理员权限。
 
-守卫 1.22.0 配合画像 1.11.0+ 时，还会在动作**真正成功**后 fail-open 写入通用管理账本：qq_tools 黑名单成功持久化记 `astrbot_banned`，解封成功持久化记 `astrbot_unbanned`，被踢报复、禁言报复或手动拉黑中的 `delete_friend` 成功记 `bot_deleted_friend`。画像插件缺失、版本过旧、超时或抛错不会反转已经成功的守卫动作，也不会阻断原流程；失败动作绝不写成成功历史。
+## 常见故障与边界
 
-恢复客户端按 `self_id` 隔离：`delete_friend` 必须等对应 bot 账号出现后才能恢复，绝不借用其它账号；纯 AstrBot 黑名单模式无需协议客户端。初始化后尚未见到该账号时 pending 等待是正常行为。画像 `/画像删除` 会调用可信取消接口，把该 QQ 未完成的画像投递标为 cancelled 并等待在途调用收敛，但不会取消 direct blacklist；completed 账本继续保留，防止旧稳定事件重放。
+**被踢/进群/禁言没有反应？**
+先确认协议有上报 bot 自身的 notice，再检查 AstrBot 平台设置的 `ignore_bot_self_message`：开启时，框架可能在插件前丢掉通知。本功能需要能收到这些事件。关闭前同时确认协议端是否上报 bot 自己发的消息，避免自回复循环；不要假定所有客户端设置相同。
 
-结构化画像快照不复制发言原话，并保留 `age_seconds=null` 的“新鲜度未知”语义。邀请附言、好友验证语、历史印象、画像 evidence 等内容在决策 prompt 中统一标记为不可信证据并限长，模型不得执行其中指令。模型输出的 `reason` 会清控制字符并限制为 300 字，`reply` 限制为 500 字，然后才落盘或发送。`/邀请记录` 可同时查看 LLM 建议与实际执行结果。
+**查不到邀请人？为什么不按最新邀请处罚？**
+管理员直拉可能没有邀请 request，旧记录也可能属于其它 bot 或已拒请求。守卫只信当前范围内明确关系，不拿进群操作人冒充邀请人。确认身份后可用显式 QQ 命令；补录历史不会伪造成员关系。
 
-## 平台要求
+**私聊甩链接为何没有进群？**
+私聊意图识别拿不到群邀请 request 的 flag，只能回复/通知，不能凭链接完成协议审批。它和私聊“为什么被拉黑”的原因询问都可能调用模型。若 qq_tools 等更高优先级拦截已封禁用户，询问消息可能到不了守卫；本插件不会改其优先级或提供申诉旁路。
 
-OneBot V11（`aiocqhttp`），已在 **SnowLuma** 验证；NapCat / LLOneBot / Lagrange 理论上也可用。
+**任务一直 pending / 解封后仍被拦？**
+看返回的分项结果与日志。可能是缺 qq_tools、保存失败、协议不支持、当前 bot 客户端尚未出现或画像未接收。守卫禁用不关闭 qq_tools；QQ 协议黑名单也要另行解除。不要删 completed 账本来“清任务”，否则可能丢失去重保护。
 
-## 配置说明
+**存储或通知报错怎么办？**
+邀请 KV 读取异常或结构非法时停止修改，不用空账本覆盖；补录失败会明确提示。黑名单保存失败回滚运行态列表，不记成功管理历史。画像投递失败保留待办，不能因此把已成功协议动作说成失败。读故障不是“没有记录”，请先修存储再重试。
+
+**能保证所有协议场景不重复动作吗？**
+不能。外部 QQ 动作与本地存储不能做跨系统事务：动作成功到落盘前崩溃仍可能重试。关系也是“最近确认”，不是永久保证当前在群。只支持 OneBot V11；不同实现对删除好友、拉黑和通知的支持不同，本仓库离线回归不代替真实协议端验证。
+
+## 可选用户画像联动
+
+不装画像仍可审核、记录与执行可用协议动作。安装 [用户画像](https://github.com/TaoXiaoBai/astrbot_plugin_user_profile) 后，可读取结构化决策画像，投递个人禁言、成功管理动作及动态群关系；旧接口会降级或等待，不假装接收成功。
+
+画像 `/画像删除` 只取消旧画像待投递目标并等待在途画像调用，**不取消 direct 拉黑**；要解除封禁及取消旧 direct 使用守卫 `/解封`。画像、守卫和 qq_tools 是不同状态来源，清理其中一项不等于清理其它项。
 
 <details>
-<summary>点我展开完整配置表（所有配置都在 WebUI 插件页改，按分组展示）</summary>
+<summary>高级：数据范围、恢复与配置入口</summary>
 
-> 1.14.0 起配置改为分组结构；旧版平铺配置会在启动时自动迁移到对应分组，值不变，无需手动处理。
-
-**白名单保护 `protection`（1.23.0）**
-
-| 配置项 | 默认 | 说明 |
-| --- | --- | --- |
-| `protect_astrbot_admins` | `true` | 实时保护全局 `admins_id` 中全部管理员，不只是通知接收人 |
-| `qq_whitelist` | `""` | QQ 名单，逗号或空白分隔，精确匹配 |
-| `group_whitelist` | `""` | 群名单，逗号或空白分隔，精确匹配 |
-
-保护操作者禁言/踢 bot，或事件发生在保护群时，整个处罚链跳过：不累计次数、不复核、不退群、不删好友、不拉黑、不增加禁言画像。普通操作者涉及保护邀请人时，只跳过邀请人的归因、处罚与跨群退出。动作前再次检查最新名单，手动命令和 LLM 工具也不能绕过；跨群逐群跳过保护群，异常提前入群补偿也不退出保护群。配置读取异常（含管理员字段缺失/非法）时暂停危险动作。
-
-恢复旧画像/direct pending 时，保护目标标为 `cancelled`，不是处罚成功；已 completed 去重账本保留。保护 QQ 不新增守卫画像事件或管理记录。不会自动回滚旧风险/黑名单、加回 QQ 好友或重新进群；旧黑名单可单独 `/解封`，好友/群关系需人工恢复。名单在外部 API/画像 API 已提交后才变化时，不能撤回在途动作。
-
-**基础 `basic`**
-
-| 配置项 | 默认 | 说明 |
-| --- | --- | --- |
-| `enable` | `true` | 是否启用 |
-| `notify_private` | `true` | 私聊通知管理员 |
-| `notify_private_qq` | `""` | 通知 QQ（留空用全局管理员） |
-| `notify_group` | `false` | 在指定群通知 |
-| `notify_group_id` | `""` | 通知群号 |
-
-**邀请决策 `decision`**
-
-| 配置项 | 默认 | 说明 |
-| --- | --- | --- |
-| `trusted_inviter_bypass_review` | `true` | 已核验管理员/QQ 白名单真实邀请由规则建议同意，免 LLM 审核；读取异常暂停处理，与处罚保护独立 |
-| `auto_approve` | `false` | LLM 或可信规则判断要加时自动同意进群；关闭时只记录建议并通知 |
-| `auto_reject` | `false` | 判断不要加时自动拒绝 |
-| `reply_inviter_on_decision` | `true` | 审批/退群结果确定且成功后私聊邀请人 |
-| `custom_reject_reply` | `""` | 固定拒绝文案（留空由 LLM 按人格和上下文写；`{reason}` 替换为拒绝原因） |
-| `llm_provider_id` | `""` | 判断用的模型（留空用默认） |
-| `decision_persona` | `""` | 决策用人格（留空用默认人格） |
-| `enable_member_context` | `true` | 参考目标群成员 |
-| `enable_impression_context` | `true` | 参考历史印象 |
-| `impression_llm_summary` | `true` | 抓到发言原话时生成 LLM 印象小结（按发言条数缓存） |
-| `enable_user_profile` | `true` | 决策时附邀请人画像（本地记录，不额外调 LLM） |
-| `use_profile_plugin` | `true` | 安装用户画像插件时优先接入其结构化画像，失败自动降级 |
-| `truncate_marker` | `…` | 截断占位符 |
-
-**异常提前入群 `unexpected_join`**
-
-| 配置项 | 默认 | 说明 |
-| --- | --- | --- |
-| `mode` | `notify_only` | LLM 拒绝但 bot 已入群时：`notify_only` / `leave` / `message_then_leave` |
-| `custom_leave_message` | `""` | `message_then_leave` 模式退群前发送；发送失败仍会继续退群 |
-
-**小号识别 `alt_detect`**
-
-| 配置项 | 默认 | 说明 |
-| --- | --- | --- |
-| `alt_account_detect` | `true` | 识别黑名单用户的小号 |
-| `alt_similarity_threshold` | `70` | 相似度（0-100）达到该值视为同一人 |
-| `alt_gray_low` | `40` | 灰色区间下限：相似度在 [该值, 阈值) 时交 LLM 复判 |
-| `alt_llm_review` | `true` | 灰色区间 LLM 复判开关（结论缓存 7 天） |
-
-**私聊意图 `private_intent`**
-
-| 配置项 | 默认 | 说明 |
-| --- | --- | --- |
-| `enable_private_intent` | `true` | 检测私聊加群意图 |
-| `private_intent_reply` | `true` | 检测到意图时回复对方 |
-| `private_intent_notify` | `true` | 检测到意图时通知管理员 |
-| `enable_blacklist_inquiry` | `true` | 识别私聊询问拉黑、拒绝、被踢或解封原因 |
-| `blacklist_inquiry_reply` | `true` | 识别后自动回复 |
-| `blacklist_inquiry_notify` | `true` | 识别后通知管理员 |
-| `blacklist_inquiry_keywords` | 内置关键词 | 逗号分隔的粗筛关键词；未命中不调用 LLM |
-| `blacklist_inquiry_tone` | `persona` | 回复语气：`persona` / `serious` / `polite` / `cold` |
-| `blacklist_inquiry_show_reason` | `true` | 回复中是否简要说明原因 |
-| `blacklist_inquiry_max_length` | `120` | 自动回复最大字数 |
-| `blacklist_inquiry_system_prompt` | `""` | 自定义系统提示词；支持 schema 所列变量 |
-| `blacklist_inquiry_user_prompt` | `""` | 自定义用户提示词；支持 schema 所列变量 |
-
-**被踢报复 `kick_revenge`**
-
-| 配置项 | 默认 | 说明 |
-| --- | --- | --- |
-| `revenge_mode` | `off` | 被踢报复：`off` / `delete_friend` / `delete_and_ban` |
-| `revenge_notify` | `true` | 报复后通知管理员（查不到邀请人也靠它通知） |
-| `kick_ban_operator` | `false` | 被踢时把执行踢人的人也拉黑 |
-| `record_group_join` | `true` | 记录每次进群的时间/操作人 |
-| `cross_group_retaliation` | `false` | 被踢或被禁言达阈值时，连带退出该邀请人邀请过的所有群并拉黑 TA |
-| `ban_notice_message` | `""` | 被踢报复/手动拉黑等原有流程的拉黑前留言；长期禁言通知不读取此项 |
-| `intercept_banned_messages` | `true` | 兜底拦截已拉黑用户的群聊/私聊消息 |
-
-**禁言报复 `mute_revenge`**
-
-| 配置项 | 默认 | 说明 |
-| --- | --- | --- |
-| `mute_retaliation_enable` | `false` | 只控制禁言次数和长期复核/退群，不控制画像联动或即时拉黑 |
-| `mute_threshold` | `3` | 次数达到后直接退群并拉黑，不调用 LLM |
-| `long_mute_llm_review` | `true` | 未达次数时，长期禁言交给 LLM 复核 |
-| `long_mute_threshold_hours` | `24` | 单次禁言触发复核的小时数（运行时限制 1-8760） |
-| `long_mute_notify_inviter` | `false` | 仅长期禁言经 LLM 决定退群后、所有动作前私聊邀请人 |
-| `long_mute_inviter_message` | `这次禁言时间太长，我先退出本群。祝好。` | 长期禁言退群专用文案；留空回退该默认值，不读取 `ban_notice_message`，不外发 LLM reply/reason |
-| `mute_target` | `operator` | 拉黑对象：`operator` / `inviter` / `both` |
-| `mute_ban_mode` | `astrbot_ban` | 拉黑方式：`astrbot_ban` / `delete_friend` |
-| `mute_notify` | `true` | 被禁言/报复后通知管理员 |
-| `profile_mute_enable` | `true` | 将个人禁言证据写入画像；与 `mute_retaliation_enable` 独立 |
-| `profile_mute_target` | `operator` | `operator` / `inviter`（关联责任）/ `both` |
-| `profile_mute_risk_increment` | `35` | 每个去重事件的画像风险增量，限制 0-100 |
-| `profile_mute_risk_cap` | `70` | 单人禁言风险累计上限，限制 0-100 |
-| `profile_mute_direct_blacklist` | `false` | 立即拉黑画像归因对象；可与风险叠加同时开启 |
-
-**LLM 联动 `llm_integration`**
-
-| 配置项 | 默认 | 说明 |
-| --- | --- | --- |
-| `llm_context_inject` | `true` | 把封禁记录注入 LLM 上下文 |
-| `llm_tool_ban` | `true` | 允许 LLM 主动拉黑/解封/查询/查画像 |
-| `llm_tool_require_admin` | `false` | LLM 拉黑/解封/查画像需管理员 |
-
-**显示 `display`**
-
-| 配置项 | 默认 | 说明 |
-| --- | --- | --- |
-| `invite_records_show_profile` | `true` | 邀请记录图显示邀请人头像昵称 |
-| `invite_records_show_group_profile` | `true` | 邀请记录图显示群头像群名 |
-| `invite_records_hide_dealt` | `true` | 隐藏邀请人已拉黑的记录 |
-| `invite_records_show_decision_detail` | `true` | 文字/图片记录显示 LLM 建议、理由、画像风险分、主要标签和精简社交来源 |
-| `image_profile_concurrency` | `6` | 图片生成时昵称/群名 API 最大并发数（运行时限制 1-20） |
-
-图片版使用纵向卡片：顶栏展示时间与决策状态，邀请人和目标群分栏展示，执行/成员状态使用短标签；邀请附言、LLM 理由、画像标签和社交来源各自占用独立内容块，避免大量文字挤在同一个表格单元格。过长附言和理由会自动截断，画像标签以可换行 chips 展示。
-
-普通消息拦截会短时复用插件邀请记录派生索引，插件写入时立即失效；`qq_tools` 黑名单每次实时读取，不会被长期缓存。LLM 封禁上下文同样只短时缓存插件自身的邀请/禁言派生部分。动作前后的成员状态仍通过 OneBot 实时查询。
+- 权威关系 KV `bot_group_relations_v1` 按 `[platform_id,self_id,group_id]` 隔离，分开记录 inviter 与 operator。只有本 bot 入群 notice 或匹配 bot/群的成员查询才能确认 IN；审批成功本身不等于在群。入群绑定要求近期、唯一、范围完整、VERIFIED 且获准的请求；无归因则保留未知。
+- 离群/被踢 notice 及本插件成功退群 API 更新 OUT，失败不写；生命周期不依赖报复子开关、旧 `record_group_join` 或处罚白名单。关系读取失败时跳过需要归因的危险动作，独立操作者处理及通知仍可继续；联动写失败不把已成功外部动作反转为失败，取消仍传播。
+- 同一关系 KV 保存快照、seen 与 pending；首次及每 30 秒恢复使用同键同创建时间。画像返回 recorded/duplicate/cancelled 才确认，失败/禁用/超时保留 pending。画像删除 cutoff/世代拒收旧事件，新生命周期仍可同步。
+- 禁言处罚使用独立 `mute_counts_scoped_v1`，键为 `[platform_id,self_id,group_id]`；事件锁、去重、清除及失败恢复均按同一范围处理。旧 `mute_records` 不修改、不猜测迁移，只作为明确标注的无 scope 历史展示。只读画像 API 保持 schema v1 旧字段兼容，并另提供 `scoped_mute_context` 范围明细；群计数不是某个 QQ 的个人责任证据。
+- 日常模型注入只提供黑名单及当前平台/bot/群或明确邀请人的动态关系，最多六条、1200 字，不把全局旧邀请当当前群事实。画像实际注入并提供群号/版本 claims 才去重；未覆盖或更新版本仍有 fallback。查询工具仍可显式读取完整历史。
+- 关系最多一万 scope、两万个事件键；个人禁言 `mute_event_jobs` 最多 5000 条，completed 不淘汰，满额显式拒绝新联动任务而非删旧键。联动失败不阻断原有禁言计数与阈值/长期复核。未知的历史在途审批/退群结果只对账，不重放猜测动作。
+- direct 解封水位 `direct_unban_watermarks` 与动作/投递锁协调；取消旧 pending、保留 completed。协议 notice 只有秒精度、缺失时间或乱序时无法还原绝对事件顺序。没有客户端时，协议动作和已配置的邀请人留言等待相应 self_id，纯内部黑名单可无协议客户端执行。
+- 管理事件仅在实际成功后发送：内部封禁持久化→`astrbot_banned`，解封持久化→`astrbot_unbanned`，协议删除成功→`bot_deleted_friend`；画像失败不能撤销已完成动作。成功协议删除与内部黑名单失败会如实报告部分成功。
+- 模型调用并非全部“零额外开销”：普通审核、私聊意图/询问、可选历史印象小结、灰区小号复判、长期禁言复核均可能调模型。相似度只提供疑似线索，不证明两个 QQ 是同一人。
+- 配置分组：`basic` 基础通知；`decision` 审核/模型/人格/上下文；`unexpected_join` 提前入群；`alt_detect` 疑似小号；`private_intent` 意图及原因询问模板；`protection` 白名单；`kick_revenge` 被踢与拦截；`mute_revenge` 禁言/画像/direct；`llm_integration` 工具权限；`display` 展示。完整字段见 WebUI 和 `_conf_schema.json`。旧平铺配置按原值迁移，不在本版本改变默认权限。
+- 自定义询问模板支持 `{sender_id}`、`{text}`、`{is_banned}`、`{ban_reason}`、`{ban_time}`、`{invite_summary}`、`{persona_prompt}`、`{tone}`、`{show_reason}`、`{max_length}`；只替换已知变量，JSON 字面花括号可保留。模型 reason/reply 限长并清理控制字符；邀请附言、发言和画像 evidence 仍是不可信证据，而非模型指令。
 
 </details>
-
-## 常见问题
-
-**为什么 bot 被踢/被禁言/进群后插件完全没反应？**
-检查 AstrBot「平台设置」里的 **忽略机器人自身的消息**（`ignore_bot_self_message`）。开着它时，所有针对 bot 自身的通知（被踢、进群、被禁言）会在 waking_check 阶段被框架直接丢弃，插件根本收不到。本插件的这些功能依赖该开关**关闭**。只要协议端不上报 bot 自己发的消息（如 NapCat/SnowLuma 的 `reportSelfMessage=false`），关掉它是安全的。
-
-**为什么 bot 被踢了却没有报复邀请人？**
-如果拉 bot 进群的人是那个群的管理员/群主，QQ 直接放行、**不产生邀请事件**，插件无从记录邀请人。这种情况会在被踢时私聊通知你（附进群时间和操作人），你可以用 `/手动拉黑` 处理。
-
-**私聊发邀请链接为什么 bot 只是回复，没有直接进群？**
-私聊场景拿不到加群 `request` 事件（没有 `flag`），协议上就无法直接同意，只能通知你手动处理。
 
 ## License
 

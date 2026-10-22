@@ -60,14 +60,22 @@ class GroupRelationGuardMixin:
                 raise ValueError("invalid bot group relation ledger field")
         return copy.deepcopy(ledger)
 
+    async def _relation_revision(self, platform_id, self_id, group_id):
+        async with self._invite_lock("_relation_kv_lock"):
+            ledger = await self._relation_ledger()
+            return int((ledger["records"].get(scope_key(platform_id, self_id, group_id)) or {}).get("revision") or 0)
+
     async def record_bot_group_relation(self, *, platform_id, self_id, group_id, membership,
-                                        evidence, event_key, inviter=None, operator="", request_key="", event_time=0):
+                                        evidence, event_key, inviter=None, operator="", request_key="", event_time=0,
+                                        expected_revision=None):
         if not all((platform_id, self_id, group_id, event_key)) or membership not in ("IN", "OUT", "UNKNOWN"):
             return {"status": "invalid"}
         key = scope_key(platform_id, self_id, group_id)
         async with self._invite_lock("_relation_kv_lock"):
             ledger = await self._relation_ledger()
             previous = ledger["records"].get(key) or {}
+            if expected_revision is not None and int(previous.get("revision") or 0) != expected_revision:
+                return {"status": "stale"}
             now = int(time.time())
             timestamp = int(event_time or now)
             if event_time and timestamp < int(previous.get("confirmed_at") or 0):
@@ -108,6 +116,30 @@ class GroupRelationGuardMixin:
         return [copy.deepcopy(r) for r in ledger["records"].values()
                 if r.get("platform_id") == platform_id and r.get("self_id") == self_id
                 and (r.get("group_id") == group_id if group_id else bool(inviter and r.get("inviter") == inviter))][:6]
+
+    async def _danger_relations(self, *, event=None, bot=None, group_id="", inviter=""):
+        from astrbot.api import logger
+        if event is not None:
+            platform_id, self_id = event_scope(event)
+        else:
+            entry = getattr(self, "_relation_bot_scopes", {}).get(id(bot))
+            if not entry or len(entry[1]) != 1:
+                return []
+            platform_id, self_id = next(iter(entry[1]))
+        if not platform_id or not self_id:
+            return []
+        try:
+            async with self._invite_lock("_relation_kv_lock"):
+                ledger = await self._relation_ledger()
+            return [copy.deepcopy(r) for r in ledger["records"].values()
+                    if isinstance(r, dict) and r.get("platform_id") == platform_id
+                    and r.get("self_id") == self_id and r.get("membership") == "IN"
+                    and str(r.get("inviter") or "").isdigit()
+                    and (not group_id or r.get("group_id") == str(group_id))
+                    and (not inviter or r.get("inviter") == str(inviter))]
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: authoritative relation lookup failed: {exc}")
+            raise
 
     async def _deliver_group_relations(self):
         async with self._invite_lock("_relation_delivery_lock"):

@@ -73,7 +73,16 @@ sys.modules.update({
     "astrbot.api.star": star,
 })
 
-from main import GroupInviteGuardPlugin, _invite_status_label, _parse_json
+from main import ActionResult, GroupInviteGuardPlugin, _invite_status_label, _parse_json
+from group_relations import RELATIONS_KEY, scope_key
+
+
+def seed_relation(plugin, group="30000", inviter="21000", platform="test", self_id="10000", membership="IN"):
+    ledger = plugin._kv.setdefault(RELATIONS_KEY, {"records": {}, "pending": {}, "seen": {}})
+    ledger["records"][scope_key(platform, self_id, group)] = {
+        "platform_id": platform, "self_id": self_id, "group_id": group,
+        "membership": membership, "inviter": inviter, "revision": 1,
+    }
 
 
 class FakeBot:
@@ -245,7 +254,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "reason": "long mute review",
             "reply": "我先退群了，祝好。",
         })
-        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        plugin._apply_mute_ban = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         plugin._admission_inviter = AsyncMock(return_value="21000")
         plugin._cross_group_leave = AsyncMock(return_value="")
         return plugin
@@ -253,6 +262,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def mute_raw(**overrides):
         data = {
+            "post_type": "notice", "notice_type": "group_ban", "self_id": 10000,
             "group_id": 30000,
             "user_id": 10000,
             "operator_id": 20000,
@@ -986,7 +996,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(data["invited"][0][0], "30000")
         self.assertNotIn("invite_records", plugin.get_calls)
-        self.assertCountEqual(plugin.get_calls, ["join_records", "mute_records"])
+        self.assertCountEqual(plugin.get_calls, ["join_records", "mute_records", "mute_counts_scoped_v1", RELATIONS_KEY])
 
     async def test_context_snapshot_sees_other_request_latest_terminal_state(self):
         plugin = self.make_plugin()
@@ -1292,7 +1302,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         bot = FakeBot()
         await plugin.on_group_mute(FakeEvent(self.mute_raw(duration=3661), bot))
         plugin._ask_long_mute_review.assert_not_awaited()
-        self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "30000"): 1})
         self.assertFalse(any(name == "set_group_leave" for name, _ in bot.calls))
         note = plugin._notify.await_args.args[1]
         self.assertIn("1 小时 1 分钟 1 秒", note)
@@ -1302,7 +1312,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         bot = FakeBot()
         await plugin.on_group_mute(FakeEvent(self.mute_raw(duration=86400), bot))
         plugin._ask_long_mute_review.assert_awaited_once()
-        self.assertEqual(plugin._kv["mute_records"], {})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {})
         self.assertTrue(any(name == "set_group_leave" for name, _ in bot.calls))
         plugin._apply_mute_ban.assert_awaited_once_with("20000", bot)
         note = plugin._notify.await_args.args[1]
@@ -1313,7 +1323,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         plugin = self.make_mute_plugin("stay")
         bot = FakeBot()
         await plugin.on_group_mute(FakeEvent(self.mute_raw(duration="86400"), bot))
-        self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "30000"): 1})
         self.assertEqual(bot.calls, [])
         plugin._apply_mute_ban.assert_not_awaited()
         self.assertIn("保留在群内", plugin._notify.await_args.args[1])
@@ -1326,7 +1336,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         bot = FakeBot()
         await plugin.on_group_mute(FakeEvent(self.mute_raw(duration=86400), bot))
-        self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "30000"): 1})
         self.assertEqual(bot.calls, [])
         plugin._apply_mute_ban.assert_not_awaited()
         self.assertIn("安全保留", plugin._notify.await_args.args[1])
@@ -1359,7 +1369,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.mute_raw(duration=duration, time=100 + index), FakeBot()
             ))
             plugin._ask_long_mute_review.assert_not_awaited()
-            self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+            self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "30000"): 1})
             self.assertIn("协议值无效", plugin._notify.await_args.args[1])
 
     async def test_long_mute_inviter_notice_uses_independent_custom_message(self):
@@ -1456,7 +1466,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         bot = FakeBot()
         await plugin.on_group_mute(FakeEvent(self.mute_raw(duration=86400), bot))
         plugin._ask_long_mute_review.assert_not_awaited()
-        self.assertEqual(plugin._kv["mute_records"], {})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {})
         self.assertTrue(any(name == "set_group_leave" for name, _ in bot.calls))
 
     async def test_long_mute_review_requires_retaliation_master_switch(self):
@@ -1464,7 +1474,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         bot = FakeBot()
         await plugin.on_group_mute(FakeEvent(self.mute_raw(duration=86400), bot))
         plugin._ask_long_mute_review.assert_not_awaited()
-        self.assertNotIn("mute_records", plugin._kv)
+        self.assertNotIn("mute_counts_scoped_v1", plugin._kv)
         self.assertEqual(bot.calls, [])
 
     async def test_long_mute_prompt_keeps_rules_in_system_and_json_encodes_evidence(self):
@@ -1520,7 +1530,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         bot = FakeBot()
         bot.fail_action = "set_group_leave"
         await plugin.on_group_mute(FakeEvent(self.mute_raw(duration=86400), bot))
-        self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "30000"): 1})
         self.assertTrue(any(name == "set_group_leave" for name, _ in bot.calls))
 
     async def test_long_mute_cancelled_while_leaving_restores_count_and_reraises(self):
@@ -1538,18 +1548,19 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             FakeEvent(self.mute_raw(duration=86400), BlockingBot())
         ))
         await leave_entered.wait()
-        self.assertEqual(plugin._kv["mute_records"], {})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {})
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
-        self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "30000"): 1})
         plugin._apply_mute_ban.assert_not_awaited()
 
     async def test_restore_mute_count_never_overwrites_larger_value(self):
         plugin = self.make_mute_plugin()
-        plugin._kv["mute_records"] = {"30000": 5, "40000": 2}
-        await plugin._restore_mute_count("30000", 2)
-        self.assertEqual(plugin._kv["mute_records"], {"30000": 5, "40000": 2})
+        a, b = scope_key("test", "10000", "30000"), scope_key("test", "10000", "40000")
+        plugin._kv["mute_counts_scoped_v1"] = {a: 5, b: 2}
+        await plugin._restore_mute_count(a, 2)
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {a: 5, b: 2})
 
     async def test_inviter_lookup_failure_does_not_abort_current_leave_or_operator_ban(self):
         plugin = self.make_mute_plugin("leave", mute_target="both")
@@ -1558,7 +1569,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         await plugin.on_group_mute(FakeEvent(self.mute_raw(duration=86400), bot))
         self.assertTrue(any(name == "set_group_leave" for name, _ in bot.calls))
         plugin._apply_mute_ban.assert_awaited_once_with("20000", bot)
-        self.assertEqual(plugin._kv["mute_records"], {})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {})
 
     async def test_mute_kv_failure_rolls_back_fingerprint_and_stops_action(self):
         plugin = self.make_plugin()
@@ -1569,13 +1580,13 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "mute_ban_mode": "astrbot_ban",
             "mute_notify": False,
         }
-        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        plugin._apply_mute_ban = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         original_put = plugin.put_kv_data
         attempts = 0
 
         async def put_kv(key, value):
             nonlocal attempts
-            if key == "mute_records":
+            if key == "mute_counts_scoped_v1":
                 attempts += 1
                 if attempts == 1:
                     raise RuntimeError("mute write failed")
@@ -1584,6 +1595,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         plugin.put_kv_data = put_kv
         bot = FakeBot()
         raw = {
+            "self_id": 10000,
             "group_id": 30000,
             "user_id": 10000,
             "operator_id": 20000,
@@ -1592,15 +1604,15 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "sub_type": "ban",
         }
         await plugin.on_group_mute(FakeEvent(raw, bot))
-        self.assertNotIn("mute_records", plugin._kv)
+        self.assertNotIn("mute_counts_scoped_v1", plugin._kv)
         self.assertEqual(bot.calls, [])
         plugin._apply_mute_ban.assert_not_awaited()
         self.assertNotIn(
-            plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
+            (scope_key("test", "10000", "30000"),) + plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
         )
 
         await plugin.on_group_mute(FakeEvent(dict(raw), bot))
-        self.assertEqual(plugin._kv["mute_records"], {})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {})
         self.assertEqual(
             [name for name, _ in bot.calls if name == "set_group_leave"],
             ["set_group_leave"],
@@ -1616,14 +1628,14 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "mute_ban_mode": "astrbot_ban",
             "mute_notify": False,
         }
-        plugin._kv["mute_records"] = {"40000": 2}
-        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        plugin._kv["mute_counts_scoped_v1"] = {scope_key("test", "10000", "40000"): 2}
+        plugin._apply_mute_ban = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         original_get = plugin.get_kv_data
         attempts = 0
 
         async def get_kv(key, default):
             nonlocal attempts
-            if key == "mute_records":
+            if key == "mute_counts_scoped_v1":
                 attempts += 1
                 if attempts == 1:
                     raise RuntimeError("mute read failed")
@@ -1632,6 +1644,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         plugin.get_kv_data = get_kv
         bot = FakeBot()
         raw = {
+            "self_id": 10000,
             "group_id": 30000,
             "user_id": 10000,
             "operator_id": 20000,
@@ -1640,17 +1653,17 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "sub_type": "ban",
         }
         await plugin.on_group_mute(FakeEvent(raw, bot))
-        self.assertEqual(plugin._kv["mute_records"], {"40000": 2})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "40000"): 2})
         self.assertEqual(plugin.put_calls, [])
         self.assertEqual(bot.calls, [])
         plugin._apply_mute_ban.assert_not_awaited()
         self.assertNotIn(
-            plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
+            (scope_key("test", "10000", "30000"),) + plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
         )
 
         await plugin.on_group_mute(FakeEvent(dict(raw), bot))
         self.assertEqual(
-            plugin._kv["mute_records"], {"40000": 2, "30000": 1}
+            plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "40000"): 2, scope_key("test", "10000", "30000"): 1}
         )
         self.assertEqual(bot.calls, [])
 
@@ -1661,10 +1674,11 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "mute_threshold": 1,
             "mute_notify": False,
         }
-        plugin._kv["mute_records"] = ["invalid"]
-        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        plugin._kv["mute_counts_scoped_v1"] = ["invalid"]
+        plugin._apply_mute_ban = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         bot = FakeBot()
         raw = {
+            "self_id": 10000,
             "group_id": 30000,
             "user_id": 10000,
             "operator_id": 20000,
@@ -1673,12 +1687,12 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "sub_type": "ban",
         }
         await plugin.on_group_mute(FakeEvent(raw, bot))
-        self.assertEqual(plugin._kv["mute_records"], ["invalid"])
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], ["invalid"])
         self.assertEqual(plugin.put_calls, [])
         self.assertEqual(bot.calls, [])
         plugin._apply_mute_ban.assert_not_awaited()
         self.assertNotIn(
-            plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
+            (scope_key("test", "10000", "30000"),) + plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
         )
 
     async def test_mute_preclear_failure_rolls_back_and_stops_action(self):
@@ -1690,14 +1704,14 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "mute_ban_mode": "astrbot_ban",
             "mute_notify": False,
         }
-        plugin._kv["mute_records"] = {"40000": 2}
-        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        plugin._kv["mute_counts_scoped_v1"] = {scope_key("test", "10000", "40000"): 2}
+        plugin._apply_mute_ban = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         original_put = plugin.put_kv_data
         attempts = 0
 
         async def put_kv(key, value):
             nonlocal attempts
-            if key == "mute_records":
+            if key == "mute_counts_scoped_v1":
                 attempts += 1
                 if attempts == 2:
                     raise RuntimeError("preclear failed")
@@ -1706,6 +1720,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         plugin.put_kv_data = put_kv
         bot = FakeBot()
         raw = {
+            "self_id": 10000,
             "group_id": 30000,
             "user_id": 10000,
             "operator_id": 20000,
@@ -1715,12 +1730,12 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         }
         await plugin.on_group_mute(FakeEvent(raw, bot))
         self.assertEqual(
-            plugin._kv["mute_records"], {"40000": 2, "30000": 1}
+            plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "40000"): 2, scope_key("test", "10000", "30000"): 1}
         )
         self.assertEqual(bot.calls, [])
         plugin._apply_mute_ban.assert_not_awaited()
         self.assertNotIn(
-            plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
+            (scope_key("test", "10000", "30000"),) + plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
         )
 
     async def test_mute_preclear_read_failure_rolls_back_and_stops_action(self):
@@ -1732,14 +1747,14 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "mute_ban_mode": "astrbot_ban",
             "mute_notify": False,
         }
-        plugin._kv["mute_records"] = {"40000": 2}
-        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        plugin._kv["mute_counts_scoped_v1"] = {scope_key("test", "10000", "40000"): 2}
+        plugin._apply_mute_ban = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         original_get = plugin.get_kv_data
         reads = 0
 
         async def get_kv(key, default):
             nonlocal reads
-            if key == "mute_records":
+            if key == "mute_counts_scoped_v1":
                 reads += 1
                 if reads == 2:
                     raise RuntimeError("preclear read failed")
@@ -1748,6 +1763,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         plugin.get_kv_data = get_kv
         bot = FakeBot()
         raw = {
+            "self_id": 10000,
             "group_id": 30000,
             "user_id": 10000,
             "operator_id": 20000,
@@ -1757,12 +1773,12 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         }
         await plugin.on_group_mute(FakeEvent(raw, bot))
         self.assertEqual(
-            plugin._kv["mute_records"], {"40000": 2, "30000": 1}
+            plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "40000"): 2, scope_key("test", "10000", "30000"): 1}
         )
         self.assertEqual(bot.calls, [])
         plugin._apply_mute_ban.assert_not_awaited()
         self.assertNotIn(
-            plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
+            (scope_key("test", "10000", "30000"),) + plugin._mute_event_fingerprint(raw), plugin._mute_event_fingerprints
         )
 
     async def test_duplicate_mute_packet_does_not_count_or_survive_threshold_clear(self):
@@ -1774,11 +1790,12 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "mute_ban_mode": "astrbot_ban",
             "mute_notify": False,
         }
-        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        plugin._apply_mute_ban = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         bot = FakeBot()
 
         def raw(event_time):
             return {
+                "self_id": 10000,
                 "group_id": 30000,
                 "user_id": 10000,
                 "operator_id": 20000,
@@ -1792,14 +1809,14 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             plugin.on_group_mute(FakeEvent(first, bot)),
             plugin.on_group_mute(FakeEvent(dict(first), bot)),
         )
-        self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "30000"): 1})
         second = raw(101)
         await plugin.on_group_mute(FakeEvent(second, bot))
-        self.assertEqual(plugin._kv["mute_records"], {})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {})
         await plugin.on_group_mute(FakeEvent(dict(second), bot))
-        self.assertEqual(plugin._kv["mute_records"], {})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {})
         await plugin.on_group_mute(FakeEvent(raw(102), bot))
-        self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "30000"): 1})
         leaves = [name for name, _ in bot.calls if name == "set_group_leave"]
         self.assertEqual(leaves, ["set_group_leave"])
         plugin._apply_mute_ban.assert_awaited_once_with("20000", bot)
@@ -1813,10 +1830,11 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "mute_ban_mode": "astrbot_ban",
             "mute_notify": False,
         }
-        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        plugin._apply_mute_ban = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         bot = FakeBot()
         bot.fail_action = "set_group_leave"
         base = {
+            "self_id": 10000,
             "group_id": 30000,
             "user_id": 10000,
             "operator_id": 20000,
@@ -1838,8 +1856,8 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "mute_ban_mode": "astrbot_ban",
             "mute_notify": False,
         }
-        plugin._kv["mute_records"] = {"30000": 1, "40000": 2}
-        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        plugin._kv["mute_counts_scoped_v1"] = {scope_key("test", "10000", "30000"): 1, scope_key("test", "10000", "40000"): 2}
+        plugin._apply_mute_ban = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         leave_entered = asyncio.Event()
         block_leave = asyncio.Event()
 
@@ -1851,6 +1869,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
 
         bot = BlockingBot()
         base = {
+            "self_id": 10000,
             "group_id": 30000,
             "user_id": 10000,
             "operator_id": 20000,
@@ -1861,17 +1880,17 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             plugin.on_group_mute(FakeEvent({**base, "time": 100}, bot))
         )
         await leave_entered.wait()
-        self.assertEqual(plugin._kv["mute_records"], {"40000": 2})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "40000"): 2})
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
         plugin._apply_mute_ban.assert_not_awaited()
-        self.assertEqual(plugin._kv["mute_records"], {"40000": 2, "30000": 2})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "40000"): 2, scope_key("test", "10000", "30000"): 2})
 
         plugin.config["mute_revenge"]["mute_threshold"] = 4
         await plugin.on_group_mute(FakeEvent({**base, "time": 101}, bot))
         self.assertEqual(
-            plugin._kv["mute_records"], {"40000": 2, "30000": 3}
+            plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "40000"): 2, scope_key("test", "10000", "30000"): 3}
         )
         self.assertEqual(
             [name for name, _ in bot.calls if name == "set_group_leave"],
@@ -1887,7 +1906,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "mute_ban_mode": "astrbot_ban",
             "mute_notify": False,
         }
-        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        plugin._apply_mute_ban = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         group_a_entered = asyncio.Event()
         release_group_a = asyncio.Event()
         group_b_done = asyncio.Event()
@@ -1905,6 +1924,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
 
         def raw(group_id, event_time):
             return {
+                "self_id": 10000,
                 "group_id": group_id,
                 "user_id": 10000,
                 "operator_id": 20000 + group_id,
@@ -1940,9 +1960,10 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "mute_ban_mode": "astrbot_ban",
             "mute_notify": False,
         }
-        plugin._apply_mute_ban = AsyncMock(return_value="已拉黑")
+        plugin._apply_mute_ban = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         bot = FakeBot()
         base = {
+            "self_id": 10000,
             "group_id": 30000,
             "user_id": 10000,
             "operator_id": 20000,
@@ -2497,7 +2518,7 @@ class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
         bot = FakeBot()
         raw = self.verified_raw()
         await plugin.on_group_mute(FakeEvent(raw, bot))
-        self.assertNotIn("mute_records", plugin._kv)
+        self.assertNotIn("mute_counts_scoped_v1", plugin._kv)
         recorder.assert_awaited_once()
         self.assertEqual(recorder.await_args.args, ("20000",))
         self.assertEqual(recorder.await_args.kwargs["attribution"], "operator")
@@ -2516,6 +2537,7 @@ class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
         plugin._kv["join_records"] = {
             "30000": {"inviter": "21000", "operator": "21000", "time": 1}
         }
+        seed_relation(plugin)
         raw = self.verified_raw()
         bot = FakeBot()
         await asyncio.gather(
@@ -2608,7 +2630,7 @@ class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
         plugin = self.make_mute_plugin(mute_retaliation_enable=False,
                                        profile_mute_enable=False,
                                        profile_mute_direct_blacklist=True)
-        plugin._apply_mute_ban = AsyncMock(side_effect=["加入黑名单失败：down", "已拉黑"])
+        plugin._apply_mute_ban = AsyncMock(side_effect=[ActionResult("加入黑名单失败：down"), ActionResult("已拉黑", persisted=True)])
         raw = self.verified_raw()
         event = FakeEvent(raw, FakeBot())
         await plugin.on_group_mute(event)
@@ -2659,6 +2681,7 @@ class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
         plugin._kv["join_records"] = {
             "30000": {"inviter": "21000", "operator": "29999", "time": 1}
         }
+        seed_relation(plugin)
         await plugin.on_group_mute(FakeEvent(self.verified_raw(time=102), FakeBot()))
         self.assertEqual([call.args[0] for call in recorder.await_args_list[-2:]], ["20000", "21000"])
 
@@ -2684,6 +2707,7 @@ class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
         )
         plugin.config["kick_revenge"]["ban_notice_message"] = "notice"
         plugin._kv["join_records"] = {"30000": {"inviter": "21000", "time": 1}}
+        seed_relation(plugin)
         class OrderedBot(FakeBot):
             async def send_private_msg(self, **params):
                 order.append(("notice", str(params["user_id"])))
@@ -2691,7 +2715,7 @@ class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
                 order.append(("leave", str(params["group_id"])))
         async def ban(qq, bot):
             order.append(("ban", str(qq)))
-            return "已拉黑"
+            return ActionResult("已拉黑", persisted=True)
         plugin._apply_mute_ban = AsyncMock(side_effect=ban)
         await plugin.on_group_mute(FakeEvent(self.verified_raw(), OrderedBot()))
         self.assertLess(order.index(("leave", "30000")), order.index(("notice", "21000")))
@@ -2712,7 +2736,7 @@ class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
                 order.append(("leave", str(params["group_id"])))
         async def ban(qq, bot):
             order.append(("ban", str(qq)))
-            return "已拉黑"
+            return ActionResult("已拉黑", persisted=True)
         plugin._apply_mute_ban = AsyncMock(side_effect=ban)
         await plugin.on_group_mute(FakeEvent(self.verified_raw(), OrderedBot()))
         self.assertEqual(order.count(("notice", "threshold notice")), 1)
@@ -2725,6 +2749,7 @@ class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
         )
         plugin.config["kick_revenge"]["ban_notice_message"] = "must not send"
         plugin._kv["join_records"] = {"30000": {"inviter": "21000", "time": 1}}
+        seed_relation(plugin)
         bot = FakeBot()
         await plugin.on_group_mute(FakeEvent(self.verified_raw(duration=86400), bot))
         private = [params["message"] for action, params in bot.calls if action == "send_private_msg"]
@@ -2799,7 +2824,7 @@ class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         async def ban(qq, bot):
             calls.append((str(qq), bot))
-            return "已拉黑"
+            return ActionResult("已拉黑", persisted=True)
         plugin._apply_mute_ban = AsyncMock(side_effect=ban)
         plugin._mute_recovery_bots = {"10000": bot_a}
         await plugin._recover_mute_jobs()
@@ -2921,6 +2946,7 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
             profile_mute_target="both", profile_mute_direct_blacklist=True)
         plugin.config["protection"] = {"qq_whitelist": "21000"}
         plugin._kv["join_records"] = {"30000": {"inviter": "21000"}}
+        seed_relation(plugin)
         recorder = AsyncMock(return_value=True)
         plugin._get_profile_plugin_instance = lambda: types.SimpleNamespace(record_bot_mute_event=recorder)
         await plugin.on_group_mute(FakeEvent(self.verified_raw(), FakeBot()))
@@ -2957,7 +2983,8 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
         plugin._kv["invite_records"] = {"30000": [{"inviter": "20000"}]}
         await plugin._mark_inviter_dealt("20000")
         self.assertNotIn("dealt", plugin._kv["invite_records"]["30000"][0])
-        self.assertIn("白名单保护", await plugin._manual_ban_text(FakeEvent({}, bot), ["30000"]))
+        seed_relation(plugin, inviter="20000")
+        self.assertIn("白名单保护", await plugin._manual_ban_text(FakeEvent({"self_id": 10000}, bot), ["30000"]))
         self.assertEqual(bot.calls, [])
 
     async def test_config_failure_fails_closed_and_recovers(self):
@@ -2966,7 +2993,7 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
         for value in (None, {}, {"admins_id": None}, {"admins_id": ["bad"]}):
             plugin.context.get_config = lambda: value
             await plugin.on_group_mute(FakeEvent(self.verified_raw(), bot))
-            self.assertNotIn("mute_records", plugin._kv)
+            self.assertNotIn("mute_counts_scoped_v1", plugin._kv)
             self.assertIn("配置读取异常", await plugin._ban_inviter("20000"))
         plugin.context.get_config = Mock(side_effect=RuntimeError("unavailable"))
         await plugin.on_group_mute(FakeEvent(self.verified_raw(), bot))
@@ -2984,6 +3011,7 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
         ):
             plugin = self.make_mute_plugin(mute_retaliation_enable=False, profile_mute_target="both")
             plugin._kv["join_records"] = {"30000": {"inviter": "21000"}}
+            seed_relation(plugin)
             raw = self.verified_raw()
             key, _ = await plugin._prepare_personal_mute_job(FakeEvent(raw, FakeBot()), raw,
                 "30000", "20000", True, True)
@@ -3012,6 +3040,9 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
         plugin.config["protection"] = {"qq_whitelist": "200001", "group_whitelist": "30001"}
         records = {gid: [{"inviter": "20000"}] for gid in ("30000", "30001", "30002")}
         bot = FakeBot()
+        plugin._remember_relation_scope(bot, "test", "10000")
+        for gid in records:
+            seed_relation(plugin, group=gid, inviter="20000")
         result = await plugin._cross_group_leave("20000", "30000", records, bot)
         self.assertIn("白名单保护", result)
         self.assertEqual([p["group_id"] for name, p in bot.calls], [30002])
@@ -3039,7 +3070,7 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
         await plugin.on_group_mute(FakeEvent(InviteFlowTests.mute_raw(duration=86400), bot))
         self.assertEqual(bot.calls, [])
         plugin._apply_mute_ban.assert_not_awaited()
-        self.assertEqual(plugin._kv["mute_records"], {"30000": 1})
+        self.assertEqual(plugin._kv["mute_counts_scoped_v1"], {scope_key("test", "10000", "30000"): 1})
 
     async def test_whitelist_changes_while_notice_waits(self):
         plugin = self.make_plugin()
@@ -3061,6 +3092,7 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
         plugin = self.make_mute_plugin(mute_retaliation_enable=False,
             profile_mute_enable=False, profile_mute_target="inviter", profile_mute_direct_blacklist=True)
         plugin._kv["join_records"] = {"30000": {"inviter": "21000"}}
+        seed_relation(plugin)
         plugin.config["kick_revenge"]["ban_notice_message"] = "fixture"
         class Bot(FakeBot):
             async def send_private_msg(inner, **params):
@@ -3081,7 +3113,8 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
                     plugin.config["protection"] = {"group_whitelist": "30000"}
                 return await super().call_action(action, **params)
         bot = Bot()
-        result = await plugin._manual_ban_text(FakeEvent({}, bot), ["30000"])
+        seed_relation(plugin, inviter="20000")
+        result = await plugin._manual_ban_text(FakeEvent({"self_id": 10000}, bot), ["30000"])
         self.assertIn("白名单保护", result)
         self.assertFalse(any(name == "delete_friend" for name, _ in bot.calls))
         self.assertNotIn("dealt", plugin._kv["invite_records"]["30000"][0])
@@ -3090,6 +3123,7 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
         plugin = self.make_mute_plugin(mute_retaliation_enable=False,
             profile_mute_target="both", profile_mute_direct_blacklist=True)
         plugin._kv["join_records"] = {"30000": {"inviter": "21000"}}
+        seed_relation(plugin)
         calls = []
         async def recorder(qq, **kwargs):
             calls.append(qq)
@@ -3119,7 +3153,7 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
         plugin.config["kick_revenge"] = {"revenge_mode": "delete_and_ban",
             "kick_ban_operator": True, "cross_group_retaliation": True}
         plugin._kv["invite_records"] = {"30000": [{"inviter": "21000"}]}
-        plugin._manual_blacklist = AsyncMock(return_value="已拉黑")
+        plugin._manual_blacklist = AsyncMock(return_value=ActionResult("已拉黑", persisted=True))
         bot = ApiOnly()
         await plugin.on_group_kick(FakeEvent(self.verified_raw(), bot))
         plugin._manual_blacklist.assert_awaited_once_with("20000", bot)

@@ -309,7 +309,7 @@
         "description": "跨群连坐",
         "type": "bool",
         "default": false,
-        "hint": "触发报复时，连带退出该邀请人邀请的所有群"
+        "hint": "触发报复时，只退出当前平台/当前 bot 最近确认 IN 且明确邀请人匹配的其它群；不根据旧邀请历史猜测"
       },
       "ban_notice_message": {
         "description": "拉黑前留言",

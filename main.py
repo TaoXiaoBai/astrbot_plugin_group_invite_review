@@ -3,6 +3,7 @@ import difflib
 import hashlib
 import inspect
 import json
+import math
 import re
 import time
 import uuid
@@ -17,12 +18,28 @@ from astrbot.api.message_components import Plain, Image
 from astrbot.api.star import Context, Star, register
 
 try:
-    from .group_relations import GroupRelationGuardMixin, RELATION_MARKER
+    from .group_relations import GroupRelationGuardMixin, RELATION_MARKER, event_scope, scope_key
 except ImportError:
-    from group_relations import GroupRelationGuardMixin, RELATION_MARKER
+    from group_relations import GroupRelationGuardMixin, RELATION_MARKER, event_scope, scope_key
+
+
+class ActionResult(str):
+    def __new__(cls, text, *, protected=False, protocol_deleted=False, persisted=False, errors=()):
+        result = super().__new__(cls, text)
+        result.protected = protected
+        result.protocol_deleted = protocol_deleted
+        result.persisted = persisted
+        result.errors = tuple(errors)
+        return result
+
+    @property
+    def success(self):
+        return not self.protected and (self.protocol_deleted or self.persisted)
 
 
 _PROTECTION_EVENT = ContextVar("group_invite_guard_protection_event", default=None)
+_KICK_INVITER = ContextVar("group_invite_guard_kick_inviter", default="")
+_AUTO_DIRECT = ContextVar("group_invite_guard_auto_direct", default=None)
 
 
 def _protected_notice(handler):
@@ -31,18 +48,26 @@ def _protected_notice(handler):
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
         if raw is None:
             return
+        group = str(_get_value(raw, "group_id") or "")
+        inviter = ""
         if _get_value(raw, "notice_type") == "group_decrease" and self._cfg("basic", "enable", True):
+            try:
+                relations = await self._danger_relations(event=event, group_id=group)
+                inviter = str(relations[0].get("inviter") or "") if len(relations) == 1 else ""
+            except Exception as exc:
+                logger.warning(f"group_invite_guard: inviter punishment skipped: {exc}")
             await self._record_relation_notice_safely(event, "OUT")
         operator = str(_get_value(raw, "operator_id") or "")
-        group = str(_get_value(raw, "group_id") or "")
         reason = self._protection_reason(operator, group)
         if reason:
             logger.info(f"group_invite_guard: {reason}")
             return
         token = _PROTECTION_EVENT.set((self, operator, group))
+        inviter_token = _KICK_INVITER.set(inviter)
         try:
             return await handler(self, event)
         finally:
+            _KICK_INVITER.reset(inviter_token)
             _PROTECTION_EVENT.reset(token)
     return guarded
 
@@ -492,7 +517,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.24.0",
+    "1.25.0",
 )
 class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -1124,13 +1149,17 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         sub_type: str, self_id: str, platform_id: str, history_umo: str,
         request_key: str, record_id: str, target_state: str, target_error: str,
     ) -> None:
+        relation_scope = target_state == "VERIFIED" and bool(platform_id and self_id)
+        before_revision = await self._relation_best_effort(
+            self._relation_revision(platform_id, self_id, group_id)
+        ) if relation_scope else None
         membership_before = await self._membership_state(bot, group_id, self_id)
-        if target_state == "VERIFIED" and platform_id and self_id:
+        if before_revision is not None:
             self._remember_relation_scope(bot, platform_id, self_id)
             await self._record_relation_safely(
                 platform_id=platform_id, self_id=self_id, group_id=group_id,
                 membership=membership_before, evidence="邀请前匹配 bot 查询" if membership_before != "UNKNOWN" else "收到邀请，尚未确认入群",
-                event_key="relation:request:" + request_key,
+                event_key="relation:request:" + request_key, expected_revision=before_revision,
                 inviter=inviter_qq if membership_before != "IN" else None, request_key=request_key)
         await self._update_invite_record(
             group_id, record_id,
@@ -1203,6 +1232,9 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             profile_snapshot=profile_snapshot,
         )
 
+        after_revision = await self._relation_best_effort(
+            self._relation_revision(platform_id, self_id, group_id)
+        ) if relation_scope else None
         membership_after = await self._membership_state(bot, group_id, self_id)
         outcome = await self._execute_invite_decision(
             bot, group_id, record_id, flag, sub_type, self_id, action, reason,
@@ -1217,14 +1249,6 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         elif outcome.get("refresh_membership"):
             membership_after = await self._membership_state(bot, group_id, self_id)
 
-        if target_state == "VERIFIED" and platform_id and self_id and membership_after in ("IN", "OUT"):
-            admission = await self._find_admission_for_join(group_id, self_id, platform_id)
-            await self._record_relation_safely(
-                platform_id=platform_id, self_id=self_id, group_id=group_id,
-                membership=membership_after, evidence="邀请后匹配 bot 查询",
-                event_key="relation:query:" + request_key,
-                inviter=str((admission or {}).get("inviter") or "") if membership_after == "IN" and membership_before != "IN" else None,
-                request_key=str((admission or {}).get("request_key") or ""))
         reply_status = ""
         may_reply = bool(outcome.get("decision_succeeded"))
         if reply and self._cfg("decision", "reply_inviter_on_decision", True):
@@ -1269,6 +1293,14 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             reply_status=reply_status,
             alt_warning=alt_warning,
         )
+        if after_revision is not None and membership_after in ("IN", "OUT"):
+            admission = await self._find_admission_for_join(group_id, self_id, platform_id) if saved else None
+            await self._record_relation_safely(
+                platform_id=platform_id, self_id=self_id, group_id=group_id,
+                membership=membership_after, evidence="邀请后匹配 bot 查询",
+                event_key="relation:query:" + request_key, expected_revision=after_revision,
+                inviter=str((admission or {}).get("inviter") or "") if membership_after == "IN" and membership_before != "IN" else None,
+                request_key=str((admission or {}).get("request_key") or ""))
         if not saved:
             replay_guard = (
                 "persisted IN_FLIGHT state prevents automatic replay"
@@ -1687,10 +1719,10 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 "回复中是否说明原因：{show_reason}\n"
                 "回复最大字数：{max_length}\n\n"
                 "请判断对方是否在询问拉黑/拒绝/踢人/解封相关问题。"
-                "只输出一个 JSON 对象：{"
+                "只输出一个 JSON 对象：{{"
                 "\"is_inquiry\": true 或 false, "
                 "\"reply\": \"若为询问，给对方的简短回复（控制在 {max_length} 字内）；否则空字符串\", "
-                "\"reason\": \"给管理员的简短说明\"}"
+                "\"reason\": \"给管理员的简短说明\"}}"
             ).format(**variables)
 
         resp = await self.context.llm_generate(
@@ -1846,7 +1878,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         except Exception as exc:
             logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
             records = {}
-        inviter_qq = await self._admission_inviter(group_id, records)
+        inviter_qq = _KICK_INVITER.get()
 
         mode = str(self._cfg("kick_revenge", "revenge_mode", "off") or "off").strip().lower()
         revenge_on = mode in ("delete_friend", "delete_and_ban")
@@ -1869,7 +1901,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             # 跨群连坐：先退出该邀请人邀请过的其它群，再报复（消息仍只发一次）
             cross_line = await self._cross_group_leave(inviter_qq, group_id, records, bot)
             result = await self._take_revenge(inviter_qq, bot)
-            if "白名单保护" not in result:
+            if self._ban_result_ok(result):
                 await self._mark_inviter_dealt(inviter_qq)
                 banned.add(inviter_qq)
             logger.info(
@@ -1907,19 +1939,17 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             await self._notify(bot, note)
 
     async def _cross_group_leave(self, inviter_qq: str, exclude_group: str, records, bot) -> str:
-        """跨群连坐：退出该邀请人邀请过的所有其它群（invite_records 记录保留不删）；返回通知用结果行，未执行返回空。"""
+        """只退出当前账号最近确认 IN 且邀请人明确匹配的其它群。"""
         if not _as_bool(self._cfg("kick_revenge", "cross_group_retaliation", False)):
             return ""
         inviter_qq = str(inviter_qq or "").strip()
         if not inviter_qq or bot is None:
             return ""
-        normalized = self._normalize_invite_records(records)
-        groups = [
-            str(gid)
-            for gid, recs in normalized.items()
-            if str(gid) != str(exclude_group)
-            and any(self._record_inviter(r) == inviter_qq for r in recs)
-        ]
+        try:
+            groups = [r["group_id"] for r in await self._danger_relations(bot=bot, inviter=inviter_qq)
+                      if r["group_id"] != str(exclude_group)]
+        except Exception as exc:
+            return f"连坐退群停止：权威关系读取失败：{exc}"
         if not groups:
             return ""
         parts = []
@@ -1954,9 +1984,9 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             return protected
         result = await self._manual_blacklist(operator_id, bot)
         logger.info(f"group_invite_guard: kick operator {operator_id}: {result}")
-        if "白名单保护" in result:
+        if getattr(result, "protected", False):
             return result
-        return f"已按设置拉黑踢人者 {operator_id}：{result}"
+        return f"踢人者 {operator_id} 处理结果：{result}"
 
     async def _find_admission_for_join(self, group_id: str, self_id: str, platform_id: str = "") -> dict | None:
         if not platform_id or not self_id:
@@ -1979,34 +2009,14 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             if age < -60 or age > 600:
                 continue
             state = str(rec.get("execution_state") or "")
-            if state in ("REJECTED", "UNEXPECTED_JOIN_LEFT") and _as_bool(rec.get("action_succeeded")):
+            if state not in ("APPROVED", "EXTERNAL_JOIN_APPROVED", "APPROVE_IN_FLIGHT"):
                 continue
             candidates.append(rec)
         return candidates[0] if len(candidates) == 1 else None
 
-    async def _admission_inviter(self, group_id: str, invite_records=None) -> str:
-        try:
-            joins = await self.get_kv_data("join_records", {})
-        except Exception:
-            joins = {}
-        join = joins.get(str(group_id)) if isinstance(joins, dict) else None
-        if isinstance(join, dict):
-            inviter = str(join.get("inviter") or "").strip()
-            if inviter:
-                return inviter
-        if invite_records is None:
-            try:
-                invite_records = await self.get_kv_data("invite_records", {})
-            except Exception:
-                invite_records = {}
-        relevant = [
-            rec for rec in self._normalize_invite_records(invite_records).get(str(group_id), [])
-            if str(rec.get("target_state") or "") != "NOT_FOR_BOT"
-        ]
-        if not relevant:
-            return ""
-        latest = max(relevant, key=lambda rec: int(rec.get("time") or 0))
-        return self._record_inviter(latest)
+    async def _admission_inviter(self, group_id: str, invite_records=None, *, bot=None, event=None) -> str:
+        relations = await self._danger_relations(bot=bot, event=event, group_id=group_id)
+        return str(relations[0].get("inviter") or "") if len(relations) == 1 else ""
 
     async def _record_join(
         self, group_id: str, operator_id: str, request_key: str = "", inviter: str = ""
@@ -2121,7 +2131,11 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             profile_enabled = direct_blacklist = False
             if not retaliation_enabled:
                 return
-        lock = await self._acquire_mute_group_lock(group_id)
+        counter_key = self._mute_counter_key(event, group_id)
+        if not counter_key:
+            logger.warning("group_invite_guard: missing mute event scope; no automatic punishment")
+            return
+        lock = await self._acquire_mute_group_lock(counter_key)
         event_key_for_activity, _ = self._personal_mute_event_key(event, raw)
         active_events = getattr(self, "_active_mute_events", None)
         if active_events is None:
@@ -2183,7 +2197,12 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                     )
         finally:
             active_events.discard(event_key_for_activity)
-            await self._release_mute_group_lock(group_id, lock)
+            await self._release_mute_group_lock(counter_key, lock)
+
+    @staticmethod
+    def _mute_counter_key(event, group_id):
+        platform_id, self_id = event_scope(event)
+        return scope_key(platform_id, self_id, group_id) if platform_id and self_id and group_id else ""
 
     async def _acquire_mute_group_lock(self, group_id: str) -> asyncio.Lock:
         registry_lock = self._invite_lock("_mute_lock_registry_lock")
@@ -2232,7 +2251,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             )
         )
 
-    def _claim_mute_event(self, raw: Any) -> tuple[bool, tuple[str, ...]]:
+    def _claim_mute_event(self, raw: Any, counter_key: str = "") -> tuple[bool, tuple[str, ...]]:
         fingerprints = getattr(self, "_mute_event_fingerprints", None)
         if fingerprints is None:
             fingerprints = {}
@@ -2241,7 +2260,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         for fingerprint, seen_at in list(fingerprints.items()):
             if now - seen_at >= 10.0:
                 fingerprints.pop(fingerprint, None)
-        fingerprint = self._mute_event_fingerprint(raw)
+        fingerprint = (counter_key,) + self._mute_event_fingerprint(raw)
         if fingerprint in fingerprints:
             return False, fingerprint
         if len(fingerprints) >= 256:
@@ -2340,20 +2359,16 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         payload = json.dumps(values, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         return f"{prefix}:{hashlib.sha256(payload.encode()).hexdigest()}", event_time
 
-    async def _verified_join_inviter(self, group_id: str, self_id: str) -> str:
-        try:
-            records = await self.get_kv_data("join_records", {})
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: load verified join record failed: {exc}")
-            return ""
-        record = records.get(str(group_id)) if isinstance(records, dict) else None
-        if not isinstance(record, dict):
-            return ""
-        return self._valid_person_qq(record.get("inviter"), self_id)
+    async def _verified_join_inviter(self, group_id: str, self_id: str, event=None) -> str:
+        relations = await self._danger_relations(event=event, group_id=group_id)
+        inviter = relations[0].get("inviter") if len(relations) == 1 else ""
+        return self._valid_person_qq(inviter, self_id)
 
     async def _load_mute_jobs(self) -> dict:
         jobs = await self.get_kv_data("mute_event_jobs", {})
-        return jobs if isinstance(jobs, dict) else {}
+        if not isinstance(jobs, dict):
+            raise ValueError("invalid mute_event_jobs ledger")
+        return json.loads(json.dumps(jobs))
 
     async def _save_mute_jobs(self, jobs: dict) -> None:
         if len(jobs) > 5000:
@@ -2384,7 +2399,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         ).strip().lower()
         if target_mode not in ("operator", "inviter", "both"):
             target_mode = "operator"
-        inviter_id = await self._verified_join_inviter(group_id, self_id) if target_mode in ("inviter", "both") else ""
+        inviter_id = await self._verified_join_inviter(group_id, self_id, event=event) if target_mode in ("inviter", "both") else ""
         targets = []
         if target_mode in ("operator", "both"):
             targets.append((operator_id, "operator"))
@@ -2405,7 +2420,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             "created_at_ms": int(time.time() * 1000),
             "duration": self._parse_mute_duration(_get_value(raw, "duration")),
             "operator_id": operator_id, "inviter_id": inviter_id,
-            "self_id": self_id,
+            "self_id": self_id, "platform_id": event_scope(event)[0],
             "risk_increment": self._bounded_mute_risk(
                 self._cfg("mute_revenge", "profile_mute_risk_increment", 35), 35
             ),
@@ -2433,9 +2448,27 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                         for qq, attribution in targets
                     ] if direct_blacklist else [],
                 }
+                watermarks = await self._direct_watermarks()
+                for item in job["direct_targets"]:
+                    if self._direct_predates_unban(payload, watermarks.get(item["qq"], 0)):
+                        item["state"] = "cancelled"
                 jobs[event_key] = job
                 await self._save_mute_jobs(jobs)
             return event_key, job
+
+    async def _direct_watermarks(self):
+        values = await self.get_kv_data("direct_unban_watermarks", {})
+        if not isinstance(values, dict):
+            raise ValueError("invalid direct unban watermarks")
+        return values
+
+    @staticmethod
+    def _direct_predates_unban(payload, watermark):
+        watermark = int(watermark or 0)
+        return bool(watermark and (
+            int(payload.get("created_at_ms") or 0) <= watermark
+            or 0 < int(payload.get("event_time") or 0) < watermark // 1000
+        ))
 
     @staticmethod
     def _profile_delivery_status(result: Any) -> str:
@@ -2527,8 +2560,12 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
 
     @staticmethod
     def _ban_result_ok(result: Any) -> bool:
-        text = str(result or "")
-        return text.startswith(("已加入 AstrBot 黑名单", "已删除并拉黑好友", "已拉黑")) and "未能持久化" not in text
+        return isinstance(result, ActionResult) and result.success
+
+    def _direct_enabled(self):
+        return _as_bool(self._cfg("basic", "enable", True)) and _as_bool(
+            self._cfg("mute_revenge", "profile_mute_direct_blacklist", False)
+        )
 
     async def _apply_retaliation_outcome_to_direct(
         self, event_key: str, outcome: dict,
@@ -2544,6 +2581,8 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             if not isinstance(job, dict):
                 return banned
             for target in job.get("direct_targets") or []:
+                if target.get("state") != "pending":
+                    continue
                 qq = str(target.get("qq") or "")
                 if qq in banned:
                     target["state"] = "completed"
@@ -2563,15 +2602,25 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     async def _run_direct_job_locked(
         self, event_key: str, skip: set[str] | None = None,
     ) -> set[str]:
-        await self._cancel_protected_mute_targets(event_key)
         completed = set(skip or set())
+        if not self._direct_enabled():
+            return completed
+        await self._cancel_protected_mute_targets(event_key)
         async with self._invite_lock("_mute_delivery_lock"):
             jobs = await self._load_mute_jobs()
             job = jobs.get(event_key)
             if not isinstance(job, dict):
                 return completed
-            targets = [dict(item) for item in job.get("direct_targets") or []]
             payload = dict(job.get("payload") or {})
+            watermarks = await self._direct_watermarks()
+            changed = False
+            for item in job.get("direct_targets") or []:
+                if item.get("state") == "pending" and self._direct_predates_unban(payload, watermarks.get(item.get("qq"), 0)):
+                    item["state"] = "cancelled"
+                    changed = True
+            if changed:
+                await self._save_mute_jobs(jobs)
+            targets = [dict(item) for item in job.get("direct_targets") or []]
         self_id = str(payload.get("self_id") or "")
         bot = getattr(self, "_mute_recovery_bots", {}).get(self_id)
         mode = str(
@@ -2579,6 +2628,8 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             or "astrbot_ban"
         ).strip().lower()
         for target in targets:
+            if not self._direct_enabled():
+                return completed
             qq = str(target.get("qq") or "")
             if target.get("state") in ("completed", "cancelled"):
                 if target.get("state") == "completed":
@@ -2602,8 +2653,6 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                         await self._send_mute_inviter_notice(bot, qq)
                         if long_only else await self._send_ban_notice(bot, qq)
                     )
-                    if "失败" in notice:
-                        continue
                     async with self._invite_lock("_mute_delivery_lock"):
                         jobs = await self._load_mute_jobs()
                         current = jobs.get(event_key)
@@ -2611,21 +2660,26 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                             for item in current.get("direct_targets") or []:
                                 if item.get("qq") == qq:
                                     item["notice_done"] = True
+                                    item["notice_result"] = str(notice)[:500]
                             await self._save_mute_jobs(jobs)
                 if mode == "delete_friend" and bot is None:
                     continue
                 try:
+                    if not self._direct_enabled():
+                        return completed
                     if self._mute_target_protection(payload, qq):
                         await self._cancel_protected_mute_targets(event_key)
                         continue
                     token = _PROTECTION_EVENT.set((
                         self, payload.get("operator_id", ""), payload.get("group_id", "")
                     ))
+                    direct_token = _AUTO_DIRECT.set(self)
                     try:
                         result = await self._apply_mute_ban(qq, bot)
                     finally:
+                        _AUTO_DIRECT.reset(direct_token)
                         _PROTECTION_EVENT.reset(token)
-                    if "白名单保护" in str(result):
+                    if getattr(result, "protected", False):
                         await self._cancel_protected_mute_targets(event_key)
                 except asyncio.CancelledError:
                     raise
@@ -2687,8 +2741,9 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             if key in getattr(self, "_active_mute_events", set()):
                 continue
             job = jobs.get(key)
-            group_id = str((job.get("payload") or {}).get("group_id") or "")
-            group_entry = getattr(self, "_mute_group_locks", {}).get(group_id)
+            payload = job.get("payload") or {}
+            counter_key = scope_key(payload.get("platform_id", ""), payload.get("self_id", ""), payload.get("group_id", ""))
+            group_entry = getattr(self, "_mute_group_locks", {}).get(counter_key)
             if group_entry and group_entry[0].locked():
                 continue
             await self._deliver_profile_job(key)
@@ -2705,13 +2760,17 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         outcome = {"banned": set(), "left": False}
         if self._action_protection(operator_id, group_id):
             return outcome
+        counter_key = self._mute_counter_key(event, group_id)
+        if not counter_key:
+            logger.warning("group_invite_guard: missing scoped mute counter; punishment skipped")
+            return outcome
         duration = self._parse_mute_duration(_get_value(raw, "duration"))
         async with self._invite_lock("_mute_kv_lock"):
-            claimed, fingerprint = self._claim_mute_event(raw)
+            claimed, fingerprint = self._claim_mute_event(raw, counter_key)
             if not claimed:
                 return outcome
             try:
-                records = await self.get_kv_data("mute_records", {})
+                records = await self.get_kv_data("mute_counts_scoped_v1", {})
             except Exception as exc:
                 getattr(self, "_mute_event_fingerprints", {}).pop(fingerprint, None)
                 logger.warning(f"group_invite_guard: load mute_records failed: {exc}")
@@ -2724,13 +2783,13 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             if self._action_protection(operator_id, group_id):
                 return outcome
             try:
-                count = int(records.get(group_id, 0) or 0) + 1
+                count = int(records.get(counter_key, 0) or 0) + 1
             except (TypeError, ValueError):
-                logger.warning(f"group_invite_guard: mute_records[{group_id}] 非数字，按 1 计")
+                logger.warning(f"group_invite_guard: scoped mute count[{counter_key}] 非数字，按 1 计")
                 count = 1
-            records[group_id] = count
+            records[counter_key] = count
             try:
-                await self.put_kv_data("mute_records", records)
+                await self.put_kv_data("mute_counts_scoped_v1", records)
                 self._invalidate_derived_cache("ban_context")
             except Exception as exc:
                 getattr(self, "_mute_event_fingerprints", {}).pop(fingerprint, None)
@@ -2749,10 +2808,10 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             return outcome
 
         if count >= threshold:
-            if not await self._clear_mute_count(group_id, fingerprint):
+            if not await self._clear_mute_count(counter_key, fingerprint):
                 return outcome
             outcome = await self._execute_mute_retaliation(
-                bot, group_id, operator_id, count, duration=duration,
+                bot, group_id, operator_id, count, duration=duration, count_scope=counter_key,
             )
             return outcome
 
@@ -2766,7 +2825,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         if long_mute:
             inviter_qq = ""
             try:
-                inviter_qq = await self._admission_inviter(group_id)
+                inviter_qq = await self._admission_inviter(group_id, bot=bot)
             except Exception as exc:
                 logger.warning(f"group_invite_guard: mute inviter lookup failed: {exc}")
             platform_id = ""
@@ -2788,11 +2847,11 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             action = _safe_text(decision.get("action"), 32).lower()
             reason = _safe_text(decision.get("reason"), 300)
             if action == "leave":
-                if not await self._clear_mute_count(group_id, fingerprint):
+                if not await self._clear_mute_count(counter_key, fingerprint):
                     return outcome
                 outcome = await self._execute_mute_retaliation(
                     bot, group_id, operator_id, count, duration=duration,
-                    decision_reason=reason, inviter_qq=inviter_qq, llm_leave=True,
+                    decision_reason=reason, inviter_qq=inviter_qq, llm_leave=True, count_scope=counter_key,
                 )
                 return outcome
             verdict = "保留在群内" if action == "stay" else "复核异常，安全保留在群内"
@@ -2826,7 +2885,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     ) -> bool:
         async with self._invite_lock("_mute_kv_lock"):
             try:
-                records = await self.get_kv_data("mute_records", {})
+                records = await self.get_kv_data("mute_counts_scoped_v1", {})
             except Exception as exc:
                 getattr(self, "_mute_event_fingerprints", {}).pop(fingerprint, None)
                 logger.warning(
@@ -2839,7 +2898,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 return False
             records.pop(group_id, None)
             try:
-                await self.put_kv_data("mute_records", records)
+                await self.put_kv_data("mute_counts_scoped_v1", records)
                 self._invalidate_derived_cache("ban_context")
                 return True
             except Exception as exc:
@@ -2850,9 +2909,11 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 return False
 
     async def _restore_mute_count(self, group_id: str, count: int) -> None:
+        if not group_id:
+            return
         async with self._invite_lock("_mute_kv_lock"):
             try:
-                records = await self.get_kv_data("mute_records", {})
+                records = await self.get_kv_data("mute_counts_scoped_v1", {})
                 if not isinstance(records, dict):
                     raise ValueError("mute_records is not a dict")
                 try:
@@ -2861,7 +2922,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                     current = 0
                 if current < count:
                     records[group_id] = count
-                    await self.put_kv_data("mute_records", records)
+                    await self.put_kv_data("mute_counts_scoped_v1", records)
                     self._invalidate_derived_cache("ban_context")
             except Exception as exc:
                 logger.error(f"group_invite_guard: restore mute_records failed: {exc}")
@@ -2946,7 +3007,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         self, bot, group_id: str, operator_id: str, count: int,
         duration: int | None = None, decision_reason: str = "",
         inviter_qq: str = "", llm_leave: bool = False,
-        already_banned: set[str] | None = None,
+        already_banned: set[str] | None = None, count_scope: str = "",
     ) -> dict:
         actually_banned = set(already_banned or set())
         outcome = {
@@ -2955,7 +3016,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             "left": False,
         }
         if self._action_protection(operator_id, group_id):
-            await self._restore_mute_count(group_id, count)
+            await self._restore_mute_count(count_scope, count)
             return outcome
         target = str(
             self._cfg("mute_revenge", "mute_target", "operator") or "operator"
@@ -2974,7 +3035,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                     invite_records = {}
                 if not inviter_qq:
                     try:
-                        inviter_qq = await self._admission_inviter(group_id, invite_records)
+                        inviter_qq = await self._admission_inviter(group_id, bot=bot)
                     except Exception as exc:
                         logger.warning(f"group_invite_guard: mute inviter lookup failed: {exc}")
 
@@ -2993,11 +3054,11 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 if notice:
                     ban_results.append(notice)
         except asyncio.CancelledError:
-            await self._restore_mute_count(group_id, count)
+            await self._restore_mute_count(count_scope, count)
             raise
 
         if self._action_protection(operator_id, group_id):
-            await self._restore_mute_count(group_id, count)
+            await self._restore_mute_count(count_scope, count)
             return outcome
         try:
             await self._call_action(
@@ -3006,10 +3067,10 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             leave_result = f"已退出群 {group_id}"
             outcome["left"] = True
         except asyncio.CancelledError:
-            await self._restore_mute_count(group_id, count)
+            await self._restore_mute_count(count_scope, count)
             raise
         except Exception as exc:
-            await self._restore_mute_count(group_id, count)
+            await self._restore_mute_count(count_scope, count)
             leave_result = f"退群失败：{exc}"
 
         targets = []
@@ -3259,6 +3320,29 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             context = context[:4000] + marker
         return context, alt_warning, profile_snapshot
 
+    async def _scoped_mute_context(self, qq=""):
+        try:
+            counts = await self.get_kv_data("mute_counts_scoped_v1", {})
+            async with self._invite_lock("_relation_kv_lock"):
+                relations = (await self._relation_ledger())["records"]
+            if not isinstance(counts, dict):
+                raise ValueError("invalid scoped mute counters")
+            result = []
+            for key, count in counts.items():
+                values = json.loads(key)
+                if not isinstance(values, list) or len(values) != 3 or not all(isinstance(v, str) and v for v in values):
+                    continue
+                relation = relations.get(key) or {}
+                if qq and relation.get("inviter") != qq:
+                    continue
+                count = max(0, int(count))
+                if count:
+                    result.append(dict(platform_id=values[0], self_id=values[1], group_id=values[2], count=count))
+            return result[:20]
+        except Exception as exc:
+            logger.warning(f"group_invite_guard: scoped mute context unavailable: {exc}")
+            return []
+
     async def get_inviter_evidence(
         self, qq: str, exclude_request_key: str = ""
     ) -> dict:
@@ -3327,6 +3411,8 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             "invite": invite,
             "join": join,
             "group_mute_context": group_mute_context,
+            "group_mute_context_scope": "legacy_unscoped_history",
+            "scoped_mute_context": await self._scoped_mute_context(qq),
         }
 
     async def _collect_profile_data(
@@ -3339,7 +3425,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             "invited": [],      # [(群号, 记录)]：该 QQ 邀请 bot 进过的群
             "operated": [],     # [群号]：该 QQ 作为操作人拉 bot 进过的群
             "rejected": 0,      # 历史邀请被拒绝次数
-            "mute_total": 0,    # TA 邀请的群累计禁言 bot 次数
+            "mute_total": 0,    # 关联群旧无 scope 禁言历史（非个人责任/非当前处罚计数） 次数
             "ban_entry": None,  # 黑名单记录 dict（含原因/拉黑时间），不在黑名单为 None
         }
         if not qq:
@@ -3398,7 +3484,26 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             except (TypeError, ValueError):
                 continue
         data["mute_total"] = mute_total
+        data["scoped_mute_context"] = await self._scoped_mute_context(qq)
         return data
+
+    @staticmethod
+    def _ban_entry_active(item):
+        try:
+            duration = item.get("duration", -1)
+            if isinstance(duration, bool):
+                return False
+            duration = float(duration)
+            if duration == -1:
+                return True
+            start = item.get("ban_time", 0)
+            if isinstance(start, bool):
+                return False
+            start = float(start)
+            expiry = start + duration
+            return duration > 0 and start >= 0 and all(map(math.isfinite, (duration, start, expiry))) and time.time() < expiry
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     def _find_ban_entry(self, qq: str) -> dict | None:
         """在 qq_tools 黑名单里找某 QQ 的完整记录（含原因/拉黑时间），找不到或黑名单不可用返回 None。
@@ -3417,6 +3522,8 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         qq = str(qq or "").strip()
         for item in ban_list:
             if not isinstance(item, dict):
+                continue
+            if not self._ban_entry_active(item):
                 continue
             for field in ("user_id", "qq", "id", "uin"):
                 if str(item.get(field) or "").strip() == qq:
@@ -3881,7 +3988,9 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         if data["rejected"]:
             lines.append(f"历史邀请被拒绝 {data['rejected']} 次")
         if data["mute_total"]:
-            lines.append(f"TA 邀请的群累计禁言 bot {data['mute_total']} 次")
+            lines.append(f"关联群旧无 scope 禁言历史（非个人责任/非当前处罚计数） {data['mute_total']} 次")
+        for item in data.get("scoped_mute_context", []):
+            lines.append(f"群禁言待处理计数（非个人责任）：平台 {item['platform_id']} / bot {item['self_id']} / 群 {item['group_id']}：{item['count']} 次")
 
         if speaker_count:
             lines.append(f"活跃度：历史会话中本人发言 {speaker_count} 条")
@@ -3938,8 +4047,10 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         if data["rejected"]:
             priors.append(f"历史邀请被拒绝 {data['rejected']} 次")
         if data["mute_total"]:
-            priors.append(f"TA 邀请的群累计禁言 bot {data['mute_total']} 次")
-        lines.append("前科：" + ("；".join(priors) if priors else "无"))
+            priors.append(f"关联群旧无 scope 禁言历史（非个人责任/非当前处罚计数） {data['mute_total']} 次")
+        lines.append("历史背景：" + ("；".join(priors) if priors else "无"))
+        for item in data.get("scoped_mute_context", []):
+            lines.append(f"群禁言待处理计数（非个人责任）：平台 {item['platform_id']} / bot {item['self_id']} / 群 {item['group_id']}：{item['count']} 次")
 
         speaker_lines = await self._extract_speaker_quotes(qq)
         lines.append(f"活跃度：历史会话中本人发言 {len(speaker_lines)} 条")
@@ -4944,32 +5055,40 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
 
     async def _take_revenge(self, inviter_qq: str, bot) -> str:
         """按 revenge_mode 对邀请人执行报复，返回人类可读结果；单个动作失败不抛出，写入结果字符串。"""
-        protected = self._action_protection(inviter_qq)
-        if protected:
-            return protected
         mode = str(self._cfg("kick_revenge", "revenge_mode", "off") or "off").strip().lower()
         if mode not in ("delete_friend", "delete_and_ban"):
-            return "未启用报复"
+            return ActionResult("未启用报复")
+        return await self._punish_user(inviter_qq, bot, "被踢后报复", internal_ban=mode == "delete_and_ban")
 
-        parts = []
-        notice = await self._send_ban_notice(bot, inviter_qq)
+    async def _punish_user(self, qq, bot, reason, *, internal_ban=True, notice=True):
+        protected = self._action_protection(qq)
+        if protected:
+            return ActionResult(protected, protected=True)
+        parts, errors = [], []
+        deleted = False
         if notice:
-            parts.append(notice)
+            message = await self._send_ban_notice(bot, qq)
+            if message:
+                parts.append(message)
         try:
-            await self._call_action(bot, "delete_friend", user_id=int(inviter_qq), block=True)
-            deleted_at = int(time.time())
-            parts.append(f"已删除并拉黑好友 {inviter_qq}")
-            await self._record_profile_management(
-                inviter_qq, "bot_deleted_friend",
-                event_key=f"guard:kick-delete:{inviter_qq}:{deleted_at}",
-                reason="被踢后报复", event_time=deleted_at,
-            )
+            await self._call_action(bot, "delete_friend", user_id=int(qq), block=True)
+            deleted = True
+            parts.append(f"已删除并拉黑好友 {qq}")
         except Exception as exc:
+            errors.append(str(exc))
             parts.append(f"删除好友失败：{exc}")
-
-        if mode == "delete_and_ban":
-            parts.append(await self._ban_inviter(inviter_qq, "被踢后报复"))
-        return "；".join(parts)
+        if deleted:
+            timestamp = int(time.time())
+            await self._record_profile_management(
+                qq, "bot_deleted_friend", event_key=f"guard:delete:{qq}:{timestamp}",
+                reason=reason, event_time=timestamp,
+            )
+        ban = await self._ban_inviter(qq, reason) if internal_ban else ActionResult("")
+        if ban:
+            parts.append(ban)
+        return ActionResult("；".join(parts), protocol_deleted=deleted,
+                            persisted=getattr(ban, "persisted", False),
+                            errors=errors + list(getattr(ban, "errors", ())))
 
     def _get_qq_tools_instance(self) -> Any:
         """获取 qq_tools 插件实例，未安装或不可用时返回 None。"""
@@ -5035,9 +5154,16 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         async with self._invite_lock("_invite_kv_lock"):
             try:
                 records = await self.get_kv_data("invite_records", {})
+                if not isinstance(records, dict) or any(
+                    not isinstance(value, (dict, str, list))
+                    or (isinstance(value, list) and any(not isinstance(rec, dict) for rec in value))
+                    for value in records.values()
+                ):
+                    raise ValueError("invalid invite_records ledger")
+                records = json.loads(json.dumps(records))
             except Exception as exc:
-                logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
-                records = {}
+                logger.warning(f"group_invite_guard: load invite_records failed; mutation stopped: {exc}")
+                return False
             records = self._normalize_invite_records(records)
             changed = mutate(records)
             if changed is None:
@@ -5135,9 +5261,9 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                         rec.pop("dealt", None)
                         rec.pop("dealt_time", None)
                         changed = True
-            return changed if found else None
+            return changed if found else False
 
-        await self._mutate_invite_records(mutate)
+        return await self._mutate_invite_records(mutate)
 
     def _get_ban_config(self):
         """读取 qq_tools 配置；返回 (config, err)。err 为空表示成功。"""
@@ -5175,37 +5301,33 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     async def _ban_inviter(self, inviter_qq: str, reason: str = "拉黑") -> str:
         """把邀请人加入 AstrBot 黑名单（qq_tools 插件），不可用时降级并注明。"""
         async with self._invite_lock("_qq_tools_lock"):
+            if _AUTO_DIRECT.get() is self and not self._direct_enabled():
+                return ActionResult("自动 direct 已暂停，保留 pending")
             protected = self._action_protection(inviter_qq)
             if protected:
-                return protected
+                return ActionResult(protected, protected=True)
             config, err = self._get_ban_config()
             if config is None:
-                return err
+                return ActionResult(err, errors=(err,))
+            old_list = config.get("ban_list")
             try:
                 ban_time = int(time.time())
-                ban_list = self._filter_ban_list(config.get("ban_list"), inviter_qq)
-                ban_list.append(
-                    {
-                        "user_id": str(inviter_qq),
-                        "ban_time": ban_time,
-                        "duration": -1,
-                        "reason": reason,
-                    }
-                )
+                ban_list = self._filter_ban_list(old_list, inviter_qq)
+                ban_list.append({"user_id": str(inviter_qq), "ban_time": ban_time,
+                                 "duration": -1, "reason": reason})
                 config["ban_list"] = ban_list
-                persisted = await self._save_ban_config(config)
-                msg = f"已加入 AstrBot 黑名单：{inviter_qq}"
-                if not persisted:
-                    msg += "（未能持久化）"
-                else:
-                    await self._record_profile_management(
-                        inviter_qq, "astrbot_banned",
-                        event_key=f"guard:ban:{inviter_qq}:{ban_time}",
-                        reason=reason, event_time=ban_time,
-                    )
-                return msg
-            except Exception as exc:
-                return f"加入黑名单失败：{exc}"
+                if not await self._save_ban_config(config):
+                    raise RuntimeError("未能持久化")
+            except BaseException as exc:
+                config["ban_list"] = old_list
+                if not isinstance(exc, Exception):
+                    raise
+                return ActionResult(f"加入黑名单失败：{exc}", errors=(str(exc),))
+            await self._record_profile_management(
+                inviter_qq, "astrbot_banned", event_key=f"guard:ban:{inviter_qq}:{ban_time}",
+                reason=reason, event_time=ban_time,
+            )
+            return ActionResult(f"已加入 AstrBot 黑名单：{inviter_qq}", persisted=True)
 
     def _compose_revenge_note(self, group_id, inviter_qq, result) -> str:
         lines = [
@@ -5220,23 +5342,13 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         """按 mute_ban_mode 对目标执行拉黑，返回人类可读结果；单个动作失败不抛出，写入结果字符串。"""
         protected = self._action_protection(qq)
         if protected:
-            return protected
+            return ActionResult(protected, protected=True)
         mode = str(self._cfg("mute_revenge", "mute_ban_mode", "astrbot_ban") or "astrbot_ban").strip().lower()
         if mode == "astrbot_ban":
             return await self._ban_inviter(qq, "被禁言后报复")
         if mode == "delete_friend":
-            try:
-                await self._call_action(bot, "delete_friend", user_id=int(qq), block=True)
-                deleted_at = int(time.time())
-                await self._record_profile_management(
-                    qq, "bot_deleted_friend",
-                    event_key=f"guard:mute-delete:{qq}:{deleted_at}",
-                    reason="被禁言后报复", event_time=deleted_at,
-                )
-                return f"已删除并拉黑好友 {qq}"
-            except Exception as exc:
-                return f"删除好友失败：{exc}"
-        return "未启用拉黑"
+            return await self._punish_user(qq, bot, "被禁言后报复", internal_ban=False, notice=False)
+        return ActionResult("未启用拉黑")
 
     def _compose_mute_revenge_note(
         self, group_id, count, leave_result, ban_results, duration=None,
@@ -5632,8 +5744,9 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             return False
 
     async def _record_invite_text(self, group_id: str, inviter_qq: str) -> str:
-        await self._record_invite(group_id, inviter_qq, action="手动记录")
-        return f"已记录 群号 {group_id} -> 邀请人 {inviter_qq}"
+        if not await self._record_invite(group_id, inviter_qq, action="手动记录"):
+            return "记录失败：邀请账本读取或落盘失败，请检查日志；未确认写入"
+        return f"已记录 群号 {group_id} -> 邀请人 {inviter_qq}（仅历史备注，不是当前群关系证明）"
 
     async def _list_ban_list_text(self) -> str:
         config, err = self._get_ban_config()
@@ -5662,32 +5775,60 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         return "\n".join(lines) if lines else "黑名单为空"
 
     async def _unban_text(self, qq: str) -> str:
-        async with self._invite_lock("_qq_tools_lock"):
-            config, err = self._get_ban_config()
-            if config is None:
-                return err
+        qq = str(qq).strip()
+        watermark = int(time.time() * 1000)
+        parts = []
+        persisted = False
+        async with self._invite_lock("_mute_action_lock"):
             try:
-                ban_list = config.get("ban_list")
-                normalized = ban_list if isinstance(ban_list, list) else []
-                new_list = self._filter_ban_list(normalized, qq)
-                if len(new_list) == len(normalized):
-                    return f"{qq} 不在黑名单中"
-                config["ban_list"] = new_list
-                persisted = await self._save_ban_config(config)
-                unban_time = int(time.time())
-                msg = f"已解封 {qq}"
-                if not persisted:
-                    msg += "（未能持久化）"
+                async with self._invite_lock("_mute_delivery_lock"):
+                    watermarks = await self._direct_watermarks()
+                    watermarks[qq] = max(int(watermarks.get(qq) or 0), watermark)
+                    await self.put_kv_data("direct_unban_watermarks", watermarks)
+                    jobs = await self._load_mute_jobs()
+                    cancelled = 0
+                    for job in jobs.values():
+                        if not isinstance(job, dict):
+                            continue
+                        for target in job.get("direct_targets") or []:
+                            if target.get("qq") == qq and target.get("state") == "pending" and self._direct_predates_unban(job.get("payload") or {}, watermark):
+                                target["state"] = "cancelled"
+                                cancelled += 1
+                    await self._save_mute_jobs(jobs)
+                parts.append(f"旧 direct 任务已取消 {cancelled} 项（保留 completed 去重记录）")
             except Exception as exc:
-                return f"解封失败：{exc}"
+                parts.append(f"旧 direct 任务取消失败：{exc}")
+            async with self._invite_lock("_qq_tools_lock"):
+                config, err = self._get_ban_config()
+                if config is None:
+                    parts.append(f"AstrBot 黑名单：{err}")
+                else:
+                    old_list = config.get("ban_list")
+                    normalized = old_list if isinstance(old_list, list) else []
+                    new_list = self._filter_ban_list(normalized, qq)
+                    if len(new_list) == len(normalized):
+                        parts.append(f"AstrBot 黑名单：{qq} 不在黑名单中")
+                    else:
+                        try:
+                            config["ban_list"] = new_list
+                            if not await self._save_ban_config(config):
+                                raise RuntimeError("未能持久化")
+                            persisted = True
+                            parts.append(f"AstrBot 黑名单：已解封 {qq}")
+                        except BaseException as exc:
+                            config["ban_list"] = old_list
+                            if not isinstance(exc, Exception):
+                                raise
+                            parts.append(f"AstrBot 黑名单解封失败：{exc}")
+            cleared = await self._mark_inviter_dealt(qq, dealt=False)
+            parts.append("守卫 dealt 状态：已清理或无记录" if cleared else "守卫 dealt 状态：清理失败")
         if persisted:
+            unban_time = int(time.time())
             await self._record_profile_management(
-                qq, "astrbot_unbanned",
-                event_key=f"guard:unban:{qq}:{unban_time}",
+                qq, "astrbot_unbanned", event_key=f"guard:unban:{qq}:{unban_time}",
                 reason="管理员或工具解封", event_time=unban_time,
             )
-        await self._mark_inviter_dealt(qq, dealt=False)
-        return msg
+        return "；".join(parts) + "；不恢复好友、QQ 协议黑名单或风险历史；新事件仍按配置处理"
 
     async def _manual_blacklist(self, target_qq: str, bot, group_id: str = "") -> str:
         protected = self._action_protection(target_qq, group_id)
@@ -5705,98 +5846,62 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
 
     async def _manual_blacklist_scoped(self, target_qq: str, bot) -> str:
         """手动拉黑某人：发自定义通知 + 删除并拉黑好友 + 加入 AstrBot 黑名单。"""
-        protected = self._action_protection(target_qq)
-        if protected:
-            return protected
-        parts = []
-        notice = await self._send_ban_notice(bot, target_qq)
-        if notice:
-            parts.append(notice)
-        try:
-            await self._call_action(bot, "delete_friend", user_id=int(target_qq), block=True)
-            deleted_at = int(time.time())
-            parts.append(f"已删除并拉黑好友 {target_qq}")
-            await self._record_profile_management(
-                target_qq, "bot_deleted_friend",
-                event_key=f"guard:manual-delete:{target_qq}:{deleted_at}",
-                reason="手动拉黑", event_time=deleted_at,
-            )
-        except Exception as exc:
-            parts.append(f"删除好友失败：{exc}")
-        parts.append(await self._ban_inviter(target_qq, "手动拉黑"))
-        return "；".join(parts)
+        return await self._punish_user(target_qq, bot, "手动拉黑")
 
     async def _manual_ban_text(self, event: AstrMessageEvent, args) -> str:
-        """手动拉黑：反查目标并退出相关群；兼容旧两参数用法，保护目标始终拒绝。"""
-        usage = "用法：/手动拉黑 <QQ或群号>（旧用法：/手动拉黑 <QQ> <群号>）"
-        if not args:
+        usage = "用法：/手动拉黑 QQ <QQ> 或 /手动拉黑 群 <群号>；兼容 /手动拉黑 <QQ> <群号> 和无歧义单数字"
+        args = [str(value or "").strip() for value in args]
+        kind = args[0].upper() if args else ""
+        explicit = kind in ("QQ", "群")
+        if explicit:
+            if len(args) != 2:
+                return usage
+            target = args[1]
+        elif len(args) in (1, 2):
+            target = args[0]
+        else:
             return usage
-        target = str(args[0] or "").strip()
-        if not target:
+        if not target.isdigit() or (not explicit and len(args) == 2 and not args[1].isdigit()):
             return usage
-
         bot = self._find_onebot_client(event)
         if bot is None:
             return "手动拉黑失败：未找到 OneBot 客户端"
-
-        if len(args) > 1:
-            group_id = str(args[1] or "").strip()
-            protected = self._action_protection(target, group_id)
-            if protected:
-                return protected
-            parts = []
-            if group_id:
-                try:
-                    await self._call_action(bot, "set_group_leave", group_id=int(group_id), is_dismiss=False)
-                    parts.append(f"已退出群 {group_id}")
-                except Exception as exc:
-                    parts.append(f"退群失败：{exc}")
-            try:
-                result = await self._manual_blacklist(target, bot, group_id=group_id)
-            except Exception as exc:
-                result = f"拉黑失败：{exc}"
-            parts.append(f"拉黑 {target}：{result}")
-            if "白名单保护" not in result:
-                await self._mark_inviter_dealt(target)
-            return "；".join(parts)
-
-        # 单参数：先查邀请记录
-        try:
-            records = await self.get_kv_data("invite_records", {})
-        except Exception as exc:
-            logger.warning(f"group_invite_guard: load invite_records failed: {exc}")
-            records = {}
-        if not isinstance(records, dict):
-            records = {}
-
-        target_qq = ""
-        groups = []
-        normalized = self._normalize_invite_records(records)
-        if target in normalized:
-            # 参数是群号：取该群最新记录的邀请人
-            latest = self._latest_invite_record(records, target)
-            inviter = self._record_inviter(latest) if latest else ""
-            if inviter:
-                target_qq = inviter
-                groups = [target]
+        self._remember_relation_bot(event, bot)
+        groups, source_group = [], ""
+        target_qq = target
+        if not explicit and len(args) == 2:
+            source_group = args[1]
+            groups = [source_group]
         else:
-            # 参数是邀请人 QQ：收集 TA 邀请过的所有群（一人可能邀请多群）
-            for gid in normalized:
-                if any(self._record_inviter(r) == target for r in normalized[gid]):
-                    groups.append(gid)
-            if groups:
-                target_qq = target
-
-        parts = []
-        if not target_qq:
-            target_qq = target
-            parts.append(f"未找到 {target} 的相关邀请记录，按 QQ 直接拉黑")
-
-        protected = self._action_protection(target_qq, target if target in normalized else "")
+            try:
+                relations = await self._danger_relations(event=event)
+                group_relations = [r for r in relations if r.get("group_id") == target]
+                qq_relations = [r for r in relations if r.get("inviter") == target]
+                records = await self.get_kv_data("invite_records", {})
+                if not isinstance(records, dict):
+                    raise ValueError("invalid invite_records ledger")
+                from_group = kind == "群" or (not explicit and bool(group_relations))
+                platform_id, self_id = event_scope(event)
+                known_group = target in records or bool(await self.get_bot_group_relations(
+                    platform_id=platform_id, self_id=self_id, group_id=target
+                ))
+                if not explicit and ((group_relations and qq_relations) or (known_group and not group_relations)):
+                    return "目标有歧义或群邀请人未知，不猜测处罚对象。请使用 /手动拉黑 QQ <QQ> 或 /手动拉黑 群 <群号>"
+                if from_group:
+                    if len(group_relations) != 1:
+                        return "该群没有当前 bot 已确认 IN 且邀请人明确的关系，不执行处罚；可核实后显式指定 QQ"
+                    source_group = target
+                    target_qq = group_relations[0]["inviter"]
+                    groups = [target]
+                else:
+                    groups = [r["group_id"] for r in qq_relations]
+            except Exception as exc:
+                return f"手动拉黑停止：读取权威关系失败：{exc}"
+        protected = self._action_protection(target_qq, source_group)
         if protected:
             return protected
-        # 先退群（单个失败不影响后面），再统一拉黑一次（消息只发一次）
-        for gid in groups:
+        parts = []
+        for gid in dict.fromkeys(groups):
             protected = self._action_protection(target_qq, gid)
             if protected:
                 parts.append(f"群 {gid}：{protected}")
@@ -5806,17 +5911,14 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 parts.append(f"已退出群 {gid}")
             except Exception as exc:
                 parts.append(f"退群 {gid} 失败：{exc}")
-
         try:
-            result = await self._manual_blacklist(
-                target_qq, bot, group_id=target if target in normalized else ""
-            )
+            result = await self._manual_blacklist(target_qq, bot, group_id=source_group)
         except Exception as exc:
-            result = f"拉黑失败：{exc}"
+            result = ActionResult(f"拉黑失败：{exc}", errors=(str(exc),))
         parts.append(f"拉黑 {target_qq}：{result}")
-        if "白名单保护" not in result:
-            await self._mark_inviter_dealt(target_qq)
-
+        if self._ban_result_ok(result):
+            if not await self._mark_inviter_dealt(target_qq):
+                parts.append("守卫状态落盘失败，请检查存储日志")
         return "；".join(parts)
 
     async def _profile_text(self, event: AstrMessageEvent, args) -> str:
@@ -5908,7 +6010,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             return []
         entries = []
         for item in ban_list:
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or not self._ban_entry_active(item):
                 continue
             user_id = str(item.get("user_id") or "").strip()
             if not user_id:
@@ -5953,9 +6055,11 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 if shown >= 20:
                     break
         if isinstance(mute, dict) and mute:
-            lines.append("被禁言记录（群号：次数）：")
+            lines.append("旧无 scope 禁言历史（不参与当前处罚，非个人责任）：")
             for gid, cnt in list(mute.items())[:20]:
                 lines.append(f"- 群 {gid}：{cnt} 次")
+        for item in await self._scoped_mute_context():
+            lines.append(f"- 禁言待处理计数：平台 {item['platform_id']} / bot {item['self_id']} / 群 {item['group_id']}：{item['count']} 次（非个人责任）")
         if self._derived_cache_version("ban_context") == version:
             cache["ban_context"] = (now, tuple(lines))
         return lines
@@ -6014,7 +6118,12 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
 
     @filter.llm_tool(name="group_invite_ban_user")
     async def llm_ban_user(self, event, user_id: str, reason: str = ""):
-        """把某个 QQ 用户加入机器人黑名单（拉黑）。当用户有骚扰、辱骂、恶意邀请后踢机器人等行为，或历史已多次违规时，主动调用此工具拉黑。"""
+        """把指定 QQ 加入 AstrBot 黑名单，不执行协议删除好友。
+
+        Args:
+            user_id(string): 要拉黑的 QQ 号。
+            reason(string): 拉黑原因，可留空。
+        """
         event = _unwrap_event(event)
         allowed, msg = self._tool_allowed(event)
         if not allowed:
@@ -6023,11 +6132,24 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         if not user_id:
             return "拉黑失败：缺少 user_id（QQ 号）。"
         reason = str(reason or "").strip() or "LLM 主动拉黑"
-        return await self._ban_inviter(user_id, reason)
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        group_id = str(_get_value(raw, "group_id") or "")
+        getter = getattr(event, "get_group_id", None)
+        if callable(getter):
+            group_id = str(getter() or group_id)
+        token = _PROTECTION_EVENT.set((self, user_id, group_id))
+        try:
+            return await self._ban_inviter(user_id, reason)
+        finally:
+            _PROTECTION_EVENT.reset(token)
 
     @filter.llm_tool(name="group_invite_unban_user")
     async def llm_unban_user(self, event, user_id: str):
-        """把某个 QQ 用户从机器人黑名单移除（解封）。当确认是误伤、用户已道歉或不再需要拉黑时主动调用。"""
+        """解除指定 QQ 的 AstrBot/守卫封禁并取消旧 direct，不恢复好友或协议黑名单。
+
+        Args:
+            user_id(string): 要解封的 QQ 号。
+        """
         event = _unwrap_event(event)
         allowed, msg = self._tool_allowed(event)
         if not allowed:
@@ -6052,7 +6174,11 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
 
     @filter.llm_tool(name="group_invite_query_profile")
     async def llm_query_profile(self, event, qq: str):
-        """查询某个 QQ 用户的完整画像：历史邀请记录、黑名单状态（原因/时间）、被拒与禁言前科、发言活跃度，以及与黑名单用户的小号相似度候选。需要评估某个邀请人/用户是否可信、是否疑似黑名单用户的小号时调用。"""
+        """查询指定 QQ 的邀请历史、黑名单、画像及疑似小号线索；相似度不证明同一人。
+
+        Args:
+            qq(string): 要查询的 QQ 号。
+        """
         event = _unwrap_event(event)
         allowed, msg = self._tool_allowed(event)
         if not allowed:
