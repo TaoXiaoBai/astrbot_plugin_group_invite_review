@@ -402,16 +402,28 @@
         "hint": "邀请人只标为关联责任，不会被记录为亲自禁言；未知、非法或机器人自身 QQ 不归因。"
       },
       "profile_mute_risk_increment": {
-        "description": "每次画像风险增量",
+        "description": "直接操作者每次画像风险增量",
         "type": "int",
         "default": 35,
-        "hint": "每个去重禁言事件增加的风险分，运行时严格限制为 0-100。"
+        "hint": "亲自禁言 bot 的每个去重事件增加的风险分，与关联邀请人分账；运行时严格限制为 0-100。"
       },
       "profile_mute_risk_cap": {
-        "description": "单人禁言风险累计上限",
+        "description": "直接操作者禁言风险上限",
         "type": "int",
         "default": 70,
-        "hint": "个人禁言事件最多叠加的风险分，查询时生效并严格限制为 0-100；最终综合风险仍不超过 100。"
+        "hint": "亲自禁言 bot 的操作者累计最多贡献的禁言风险分，查询时生效并严格限制为 0-100；最终风险仍不超过 100。"
+      },
+      "profile_mute_associated_risk_increment": {
+        "description": "关联邀请人每次风险增量",
+        "type": "int",
+        "default": 10,
+        "hint": "仅所邀请群内发生 bot 被禁言时的关联责任增量，独立于直接操作者；默认明显低于直接禁言，运行时限制 0-100。"
+      },
+      "profile_mute_associated_risk_cap": {
+        "description": "关联邀请人禁言风险上限",
+        "type": "int",
+        "default": 20,
+        "hint": "关联邀请责任累计最多贡献的分数，与直接操作者分账计算；运行时限制 0-100。"
       },
       "profile_mute_direct_blacklist": {
         "description": "即时拉黑画像归因对象",

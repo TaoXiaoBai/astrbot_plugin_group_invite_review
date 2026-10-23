@@ -170,6 +170,28 @@ _BLACKLIST_INQUIRY_KEYWORDS = (
     "解封", "放出来", "取消拉黑", "撤销拉黑",
 )
 
+_UNBAN_RESOLUTION_ALIASES = {
+    "普通": "normal", "手动": "normal", "常规": "normal", "normal": "normal",
+    "申诉": "appeal_approved", "申诉通过": "appeal_approved",
+    "appeal": "appeal_approved", "appeal_approved": "appeal_approved",
+    "误封": "false_positive", "误判": "false_positive",
+    "false_positive": "false_positive",
+    "到期": "expired", "过期": "expired", "expired": "expired",
+}
+_UNBAN_RESOLUTION_LABELS = {
+    "normal": "管理员或工具解封",
+    "appeal_approved": "申诉通过",
+    "false_positive": "误封确认",
+    "expired": "处罚到期",
+}
+
+
+def _parse_unban_resolution(value: str | None) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return "normal"
+    return _UNBAN_RESOLUTION_ALIASES.get(text)
+
 
 # 配置分组：group -> {key: 默认值}。嵌套读取与旧平铺配置迁移都以它为准，
 # 新增配置项时同步修改这里和 _conf_schema.json。
@@ -248,6 +270,8 @@ _CONFIG_GROUPS = {
         "profile_mute_target": "operator",
         "profile_mute_risk_increment": 35,
         "profile_mute_risk_cap": 70,
+        "profile_mute_associated_risk_increment": 10,
+        "profile_mute_associated_risk_cap": 20,
         "profile_mute_direct_blacklist": False,
     },
     "llm_integration": {
@@ -517,7 +541,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.25.0",
+    "1.27.1",
 )
 class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -2427,6 +2451,12 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             "risk_cap": self._bounded_mute_risk(
                 self._cfg("mute_revenge", "profile_mute_risk_cap", 70), 70
             ),
+            "associated_risk_increment": self._bounded_mute_risk(
+                self._cfg("mute_revenge", "profile_mute_associated_risk_increment", 10), 10
+            ),
+            "associated_risk_cap": self._bounded_mute_risk(
+                self._cfg("mute_revenge", "profile_mute_associated_risk_cap", 20), 20
+            ),
         }
         async with self._invite_lock("_mute_delivery_lock"):
             jobs = await self._load_mute_jobs()
@@ -2520,12 +2550,18 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 if self._mute_target_protection(payload, target.get("qq", "")):
                     await self._cancel_protected_mute_targets(event_key)
                     continue
+                associated = target.get("attribution") == "associated_inviter"
+                increment_key = "associated_risk_increment" if associated else "risk_increment"
+                cap_key = "associated_risk_cap" if associated else "risk_cap"
+                increment_default = 10 if associated else 35
+                cap_default = 20 if associated else 70
                 result = recorder(
                     target.get("qq"), event_key=payload.get("event_key", event_key),
                     group_id=payload.get("group_id", ""), event_time=payload.get("event_time", 0),
                     duration=payload.get("duration"), operator_id=payload.get("operator_id", ""),
                     inviter_id=payload.get("inviter_id", ""), attribution=target.get("attribution", ""),
-                    risk_increment=payload.get("risk_increment", 35), risk_cap=payload.get("risk_cap", 70),
+                    risk_increment=payload.get(increment_key, increment_default),
+                    risk_cap=payload.get(cap_key, cap_default),
                     self_id=payload.get("self_id", ""),
                     event_created_at_ms=payload.get("created_at_ms", 0),
                 )
@@ -3583,28 +3619,54 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     async def _record_profile_management(
         self, qq: str, event_type: str, *, event_key: str,
         reason: str = "", group_id: str = "", event_time: int | None = None,
-    ) -> None:
-        if self._action_protection(qq, group_id):
-            return
+        resolution: str = "",
+    ) -> bool | None:
+        # 白名单只保护处罚；解封/恢复等状态同步必须仍能到达画像。
+        if (
+            event_type in ("astrbot_banned", "bot_deleted_friend")
+            and self._action_protection(qq, group_id)
+        ):
+            return None
         try:
             instance = self._get_profile_plugin_instance()
             recorder = getattr(instance, "record_management_event", None) if instance else None
             if not callable(recorder):
-                return
+                return None
             timestamp = int(event_time or time.time())
-            result = recorder(
-                str(qq), event_key=_safe_text(event_key, 160),
-                event_type=event_type, source="astrbot_plugin_group_invite_guard",
-                event_time=timestamp, group_id=_safe_text(group_id, 32),
-                reason=_safe_text(reason, 200), result="success",
-                event_created_at_ms=int(time.time() * 1000),
-            )
+            kwargs = {
+                "event_key": _safe_text(event_key, 160),
+                "event_type": event_type,
+                "source": "astrbot_plugin_group_invite_guard",
+                "event_time": timestamp,
+                "group_id": _safe_text(group_id, 32),
+                "reason": _safe_text(reason, 200),
+                "result": "success",
+                "event_created_at_ms": int(time.time() * 1000),
+            }
+            resolution = _safe_text(resolution, 32).lower()
+            if resolution:
+                try:
+                    params = inspect.signature(recorder).parameters.values()
+                    supports_resolution = any(
+                        param.name == "resolution"
+                        or param.kind == inspect.Parameter.VAR_KEYWORD
+                        for param in params
+                    )
+                except (TypeError, ValueError):
+                    supports_resolution = False
+                if supports_resolution:
+                    kwargs["resolution"] = resolution
+            result = recorder(str(qq), **kwargs)
             if inspect.isawaitable(result):
-                await asyncio.wait_for(result, timeout=3)
+                result = await asyncio.wait_for(result, timeout=3)
+            if isinstance(result, dict):
+                return result.get("status") in ("recorded", "duplicate")
+            return bool(result)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning(f"group_invite_guard: profile management linkage failed: {exc}")
+            return False
 
     @staticmethod
     def _sanitize_profile_snapshot(raw: Any) -> dict:
@@ -3614,7 +3676,8 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         recognized = {
             "provider", "score", "level", "tags", "activity", "social_origin",
             "data_freshness", "llm_status", "partial_errors", "evidence_untrusted",
-            "impression", "traits", "management",
+            "impression", "traits", "management", "risk_status",
+            "risk_components", "risk_scope",
         }
         if not recognized.intersection(raw):
             return {}
@@ -3675,10 +3738,19 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             )
             if len(joins) >= 10:
                 break
-        try:
-            score = max(0, min(100, int(raw.get("score") or 0)))
-        except (TypeError, ValueError):
-            score = 0
+        raw_score = raw.get("score")
+        if raw_score is None or isinstance(raw_score, bool):
+            score = None
+        else:
+            try:
+                score = max(0, min(100, int(raw_score)))
+            except (TypeError, ValueError, OverflowError):
+                score = None
+        components_raw = raw.get("risk_components") if isinstance(raw.get("risk_components"), dict) else {}
+        risk_components = {
+            key: max(0, min(100, _safe_int(components_raw.get(key))))
+            for key in ("verified", "semantic", "behavior", "mute_operator", "mute_associated")
+        }
         freshness_raw = raw.get("data_freshness") if isinstance(raw.get("data_freshness"), dict) else {}
         errors_raw = raw.get("partial_errors") if isinstance(raw.get("partial_errors"), list) else []
         management_raw = raw.get("management") if isinstance(raw.get("management"), dict) else {}
@@ -3696,9 +3768,46 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 "time": _safe_int(item.get("time")),
                 "group_id": _safe_text(item.get("group_id"), 32),
                 "reason": _safe_text(item.get("reason"), 200),
+                "resolution": _safe_text(item.get("resolution"), 32),
             })
             if len(management_recent) >= 10:
                 break
+        state_raw = management_raw.get("state") if isinstance(management_raw.get("state"), dict) else {}
+        factors_raw = state_raw.get("risk_factors") if isinstance(state_raw.get("risk_factors"), dict) else {}
+        risk_factors = {}
+        for kind in ("astrbot_banned", "bot_deleted_friend"):
+            item = factors_raw.get(kind) if isinstance(factors_raw.get(kind), dict) else {}
+            try:
+                factor = max(0.0, min(1.0, float(item.get("factor") or 0)))
+            except (TypeError, ValueError, OverflowError):
+                factor = 0.0
+            risk_factors[kind] = {
+                "factor": round(factor, 2),
+                "status": _safe_text(item.get("status"), 32),
+                "resolution": _safe_text(item.get("resolution"), 32),
+                "resolved_at": _safe_int(item.get("resolved_at")),
+            }
+        mute_raw = state_raw.get("mute_resolution") if isinstance(state_raw.get("mute_resolution"), dict) else {}
+        mute_effects_raw = mute_raw.get("effects") if isinstance(mute_raw.get("effects"), dict) else {}
+        try:
+            mute_factor = max(0.0, min(1.0, float(mute_raw.get("factor", 1.0))))
+        except (TypeError, ValueError, OverflowError):
+            mute_factor = 1.0
+        management_state = {
+            "unban_resolution": _safe_text(state_raw.get("unban_resolution"), 32),
+            "appeal_resolution": _safe_text(state_raw.get("appeal_resolution"), 32),
+            "risk_factors": risk_factors,
+            "mute_resolution": {
+                "resolution": _safe_text(mute_raw.get("resolution"), 32),
+                "resolved_at": _safe_int(mute_raw.get("resolved_at")),
+                "factor": round(mute_factor, 2),
+                "event_count": _safe_int(mute_raw.get("event_count")),
+                "effects": {
+                    role: max(0, min(100000, _safe_int(mute_effects_raw.get(role))))
+                    for role in ("mute_operator", "mute_associated")
+                },
+            },
+        }
         return {
             "schema_version": _safe_int(raw.get("schema_version"), 1),
             "provider": str(raw.get("provider") or "astrbot_plugin_user_profile")[:64],
@@ -3726,6 +3835,11 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             ][:5],
             "score": score,
             "level": str(raw.get("level") or "")[:16],
+            "risk_status": str(
+                raw.get("risk_status") or ("ready" if score is not None else "no_evidence")
+            )[:24],
+            "risk_components": risk_components,
+            "risk_scope": str(raw.get("risk_scope") or "group")[:16],
             "tags": tags,
             "activity": activity,
             "social_origin": {
@@ -3747,6 +3861,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                     if _safe_int(management_counts_raw.get(kind)) > 0
                 },
                 "recent": management_recent,
+                "state": management_state,
             },
         }
 
@@ -3755,15 +3870,32 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         """把结构化画像变成决策上下文；守卫来源标签交给内置前科区块展示。"""
         if not snapshot:
             return ""
-        lines = [
-            f"用户画像插件：综合风险 {snapshot.get('score', 0)}/100"
-            f"（{snapshot.get('level') or '未知'}）"
-        ]
-        tags = [
-            item
-            for item in snapshot.get("tags") or []
-            if item.get("tag") and item.get("source") not in ("guard", "ban_list")
-        ]
+        score = snapshot.get("score")
+        if score is None:
+            risk_text = "风险 未知（资料不足，不等于安全）"
+        else:
+            risk_text = f"风险关注分 {score}/100（{snapshot.get('level') or '未知'}）"
+        scope_text = {
+            "group": "群聊公开证据",
+            "private": "私聊证据",
+            "fused": "群私融合证据",
+        }.get(snapshot.get("risk_scope"), "群聊公开证据")
+        lines = [f"用户画像插件：{risk_text}；证据范围：{scope_text}"]
+        tags = []
+        for item in snapshot.get("tags") or []:
+            if not item.get("tag") or item.get("source") in ("guard", "ban_list"):
+                continue
+            try:
+                confidence = float(item.get("confidence") or 0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if (
+                item.get("source") == "management_event"
+                and item.get("tag") in ("astrbot_banned", "bot_deleted_friend")
+                and confidence <= 0
+            ):
+                continue
+            tags.append(item)
         if tags:
             rendered = []
             for item in tags[:8]:
@@ -3850,6 +3982,47 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         ]
         if rendered_management:
             lines.append("管理历史：" + "；".join(rendered_management))
+        management_state = management.get("state") if isinstance(management.get("state"), dict) else {}
+        factors = management_state.get("risk_factors") if isinstance(management_state.get("risk_factors"), dict) else {}
+        resolution_parts = []
+        for kind, label in (
+            ("astrbot_banned", "拉黑历史"),
+            ("bot_deleted_friend", "删除好友历史"),
+        ):
+            item = factors.get(kind) if isinstance(factors.get(kind), dict) else {}
+            status = str(item.get("status") or "")
+            if not status or status == "none":
+                continue
+            resolution = str(item.get("resolution") or "")
+            resolution_label = _UNBAN_RESOLUTION_LABELS.get(
+                resolution, "好友恢复" if resolution == "friend_restored" else ""
+            )
+            if status == "appeal_cleared":
+                resolution_parts.append(f"{label}：{resolution_label or '申诉/误封'}，已结清")
+            elif status == "decaying":
+                try:
+                    percent = int(float(item.get("factor") or 0) * 100)
+                except (TypeError, ValueError, OverflowError):
+                    percent = 0
+                resolution_parts.append(f"{label}：{resolution_label or '已结清'}，剩余 {percent}%")
+            elif status == "resolved":
+                resolution_parts.append(f"{label}：已归零")
+            elif status == "unresolved":
+                resolution_parts.append(f"{label}：未结清")
+        if resolution_parts:
+            lines.append("管理结清：" + "；".join(resolution_parts))
+        mute_resolution = management_state.get("mute_resolution") if isinstance(management_state.get("mute_resolution"), dict) else {}
+        mute_effects = mute_resolution.get("effects") if isinstance(mute_resolution.get("effects"), dict) else {}
+        if sum(int(mute_effects.get(role) or 0) for role in ("mute_operator", "mute_associated")) > 0:
+            mute_label = _UNBAN_RESOLUTION_LABELS.get(
+                str(mute_resolution.get("resolution") or ""), "结清"
+            )
+            try:
+                mute_factor = float(mute_resolution.get("factor", 1.0))
+            except (TypeError, ValueError, OverflowError):
+                mute_factor = 1.0
+            mute_text = "快照内旧禁言风险已冲销" if mute_factor <= 0 else f"快照内旧禁言风险冲销 {mute_factor:.0%}"
+            lines.append(f"禁言结清：{mute_label}，{mute_text}；快照外/新事件仍计分")
         return "\n".join(lines)
 
     async def _fetch_external_decision_profile(
@@ -5774,11 +5947,16 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             lines.append(f"QQ {user_id} | 拉黑时间 {ban_time_str} | 时长 {duration_str} | 原因 {reason}")
         return "\n".join(lines) if lines else "黑名单为空"
 
-    async def _unban_text(self, qq: str) -> str:
+    async def _unban_text(self, qq: str, resolution: str = "normal") -> str:
         qq = str(qq).strip()
+        resolution = _parse_unban_resolution(resolution)
+        if resolution is None or not re.fullmatch(r"\d{5,12}", qq):
+            return "用法：/解封 <QQ> [普通|申诉|误封|到期]"
         watermark = int(time.time() * 1000)
         parts = []
         persisted = False
+        ban_state_known = False
+        ban_write_failed = False
         async with self._invite_lock("_mute_action_lock"):
             try:
                 async with self._invite_lock("_mute_delivery_lock"):
@@ -5803,6 +5981,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 if config is None:
                     parts.append(f"AstrBot 黑名单：{err}")
                 else:
+                    ban_state_known = True
                     old_list = config.get("ban_list")
                     normalized = old_list if isinstance(old_list, list) else []
                     new_list = self._filter_ban_list(normalized, qq)
@@ -5817,18 +5996,30 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                             parts.append(f"AstrBot 黑名单：已解封 {qq}")
                         except BaseException as exc:
                             config["ban_list"] = old_list
+                            ban_write_failed = True
                             if not isinstance(exc, Exception):
                                 raise
                             parts.append(f"AstrBot 黑名单解封失败：{exc}")
             cleared = await self._mark_inviter_dealt(qq, dealt=False)
             parts.append("守卫 dealt 状态：已清理或无记录" if cleared else "守卫 dealt 状态：清理失败")
-        if persisted:
+        clear_resolution = resolution in ("appeal_approved", "false_positive")
+        should_sync_resolution = persisted or (
+            clear_resolution and ban_state_known and not ban_write_failed
+        )
+        if should_sync_resolution:
             unban_time = int(time.time())
-            await self._record_profile_management(
-                qq, "astrbot_unbanned", event_key=f"guard:unban:{qq}:{unban_time}",
-                reason="管理员或工具解封", event_time=unban_time,
+            recorded = await self._record_profile_management(
+                qq, "astrbot_unbanned",
+                event_key=f"guard:unban:{qq}:{unban_time}:{resolution}",
+                reason=_UNBAN_RESOLUTION_LABELS[resolution],
+                event_time=unban_time,
+                resolution=resolution,
             )
-        return "；".join(parts) + "；不恢复好友、QQ 协议黑名单或风险历史；新事件仍按配置处理"
+            if recorded is True:
+                parts.append(f"画像历史：已同步{_UNBAN_RESOLUTION_LABELS[resolution]}")
+            elif recorded is False:
+                parts.append("画像历史：同步失败（黑名单操作结果不受影响）")
+        return "；".join(parts) + "；不恢复好友、QQ 协议黑名单或删除历史记录；画像历史按结清类型处理，新事件仍按配置处理"
 
     async def _manual_blacklist(self, target_qq: str, bot, group_id: str = "") -> str:
         protected = self._action_protection(target_qq, group_id)
@@ -5950,9 +6141,11 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         if cmd in ("拉黑列表", "黑名单"):
             return await self._list_ban_list_text()
         if cmd == "解封":
-            if not args:
-                return "用法：/解封 <QQ>"
-            return await self._unban_text(args[0])
+            if not args or len(args) > 2:
+                return "用法：/解封 <QQ> [普通|申诉|误封|到期]"
+            return await self._unban_text(
+                args[0], args[1] if len(args) == 2 else "normal"
+            )
         if cmd == "手动拉黑":
             return await self._manual_ban_text(event, args)
         if cmd == "画像":
@@ -6145,7 +6338,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
 
     @filter.llm_tool(name="group_invite_unban_user")
     async def llm_unban_user(self, event, user_id: str):
-        """解除指定 QQ 的 AstrBot/守卫封禁并取消旧 direct，不恢复好友或协议黑名单。
+        """解除指定 QQ 的 AstrBot/守卫封禁并取消旧 direct；画像只同步普通解封，不恢复好友或协议黑名单。
 
         Args:
             user_id(string): 要解封的 QQ 号。

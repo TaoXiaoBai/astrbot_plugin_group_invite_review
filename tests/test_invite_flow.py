@@ -792,13 +792,27 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "schema_version": "bad",
             "captured_at": "bad",
             "score": "bad",
+            "risk_components": {
+                "verified": "40", "semantic": -5, "behavior": "bad",
+                "mute_operator": 200,
+            },
+            "risk_scope": "fused",
             "social_origin": {
                 "friend_add_time": "bad",
                 "friend_request_time": [],
                 "join_sources": [{"gid": "1", "time": "bad"}],
             },
         })
-        self.assertEqual(snapshot["score"], 0)
+        self.assertIsNone(snapshot["score"])
+        self.assertEqual(snapshot["risk_status"], "no_evidence")
+        self.assertEqual(snapshot["risk_scope"], "fused")
+        self.assertEqual(snapshot["risk_components"]["verified"], 40)
+        self.assertEqual(snapshot["risk_components"]["semantic"], 0)
+        self.assertEqual(snapshot["risk_components"]["mute_operator"], 100)
+        text = GroupInviteGuardPlugin._format_external_decision_profile(snapshot)
+        self.assertIn("风险 未知（资料不足，不等于安全）", text)
+        self.assertIn("群私融合证据", text)
+        self.assertNotIn("None/100", text)
         self.assertEqual(snapshot["schema_version"], 1)
         self.assertEqual(snapshot["social_origin"]["join_sources"][0]["time"], 0)
         self.assertEqual(
@@ -2545,8 +2559,44 @@ class PersonalMuteLinkTests(unittest.IsolatedAsyncioTestCase):
             plugin.on_group_mute(FakeEvent(dict(raw), bot)),
         )
         self.assertEqual(plugin._apply_mute_ban.await_count, 2)
+        self.assertEqual(recorder.await_args_list[0].kwargs["risk_increment"], 35)
+        self.assertEqual(recorder.await_args_list[0].kwargs["risk_cap"], 70)
         self.assertEqual(recorder.await_args_list[1].kwargs["attribution"], "associated_inviter")
         self.assertEqual(recorder.await_args_list[1].args, ("21000",))
+        self.assertEqual(recorder.await_args_list[1].kwargs["risk_increment"], 10)
+        self.assertEqual(recorder.await_args_list[1].kwargs["risk_cap"], 20)
+
+    async def test_legacy_pending_associated_uses_lower_default_risk(self):
+        plugin = self.make_mute_plugin(
+            mute_retaliation_enable=False, profile_mute_target="both",
+        )
+        plugin._kv["mute_event_jobs"] = {
+            "stable:legacy": {
+                "payload": {
+                    "event_key": "stable:legacy", "group_id": "30000",
+                    "event_time": 1, "created_at_ms": 1000, "duration": 60,
+                    "operator_id": "20000", "inviter_id": "21000",
+                    "self_id": "10000",
+                },
+                "profile_targets": [{
+                    "qq": "21000", "attribution": "associated_inviter",
+                    "state": "pending",
+                }],
+                "direct_targets": [],
+            }
+        }
+        recorder = AsyncMock(return_value={"status": "recorded"})
+        plugin._get_profile_plugin_instance = lambda: types.SimpleNamespace(
+            record_bot_mute_event=recorder
+        )
+        await plugin._deliver_profile_job("stable:legacy")
+        recorder.assert_awaited_once()
+        self.assertEqual(recorder.await_args.kwargs["risk_increment"], 10)
+        self.assertEqual(recorder.await_args.kwargs["risk_cap"], 20)
+        self.assertEqual(
+            plugin._kv["mute_event_jobs"]["stable:legacy"]["profile_targets"][0]["state"],
+            "completed",
+        )
 
     async def test_invalid_identity_old_api_and_failure_are_safe(self):
         plugin = self.make_mute_plugin(mute_retaliation_enable=False,
