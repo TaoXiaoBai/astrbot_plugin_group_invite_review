@@ -2112,6 +2112,10 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "score": 30,
             "impression": "  话痨但友好\x00  " + "长" * 300,
             "traits": ["开朗", "", "  谨慎  ", "x" * 100, "t5", "t6"],
+            "long_term_traits": [
+                {"trait": "稳定偏好\x00", "confidence": 2, "reason": "多次确认"},
+                {"trait": ""}, "无效",
+            ],
         })
         self.assertTrue(snapshot["impression"].startswith("话痨但友好"))
         self.assertNotIn("\x00", snapshot["impression"])
@@ -2119,6 +2123,9 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["traits"][:2], ["开朗", "谨慎"])
         self.assertEqual(len(snapshot["traits"]), 5)
         self.assertLessEqual(max(len(t) for t in snapshot["traits"]), 48)
+        self.assertEqual(len(snapshot["long_term_traits"]), 1)
+        self.assertEqual(snapshot["long_term_traits"][0]["confidence"], 1.0)
+        self.assertNotIn("\x00", snapshot["long_term_traits"][0]["trait"])
 
     def test_format_external_profile_renders_impression_traits_and_quality(self):
         text = GroupInviteGuardPlugin._format_external_decision_profile({
@@ -2127,15 +2134,22 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             "level": "中",
             "impression": "经常深夜发广告链接",
             "traits": ["功利"],
+            "long_term_traits": [{"trait": "长期关注同类软件", "confidence": 0.8, "reason": "反复讨论"}],
             "llm_status": "cached_error",
             "partial_errors": ["history_scan_failed"],
             "data_freshness": {"age_seconds": 10 * 86400},
         })
         self.assertIn("综合印象：经常深夜发广告链接", text)
         self.assertIn("性格特质：功利", text)
-        self.assertIn("LLM 分析失败", text)
+        self.assertIn("长期特点（历史背景，非风险定论）：长期关注同类软件(80%)：反复讨论", text)
+        self.assertIn("LLM 刷新失败，沿用最近一次成功画像", text)
         self.assertIn("历史扫描失败", text)
         self.assertIn("数据较旧", text)
+        rule_only = GroupInviteGuardPlugin._format_external_decision_profile({
+            "provider": "astrbot_plugin_user_profile", "score": 10,
+            "llm_status": "error", "tags": [],
+        })
+        self.assertIn("LLM 分析失败，标签仅来自规则", rule_only)
 
     def test_format_external_profile_clean_snapshot_has_no_quality_note(self):
         text = GroupInviteGuardPlugin._format_external_decision_profile({

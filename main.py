@@ -541,7 +541,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.27.1",
+    "1.27.2",
 )
 class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -3676,7 +3676,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         recognized = {
             "provider", "score", "level", "tags", "activity", "social_origin",
             "data_freshness", "llm_status", "partial_errors", "evidence_untrusted",
-            "impression", "traits", "management", "risk_status",
+            "impression", "traits", "long_term_traits", "management", "risk_status",
             "risk_components", "risk_scope",
         }
         if not recognized.intersection(raw):
@@ -3808,6 +3808,25 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 },
             },
         }
+        long_term_traits = []
+        raw_long_term = raw.get("long_term_traits")
+        for item in raw_long_term if isinstance(raw_long_term, list) else []:
+            if not isinstance(item, dict):
+                continue
+            trait = _safe_text(item.get("trait"), 48)
+            if not trait:
+                continue
+            try:
+                confidence = max(0.0, min(1.0, float(item.get("confidence") or 0)))
+            except (TypeError, ValueError, OverflowError):
+                confidence = 0.0
+            long_term_traits.append({
+                "trait": trait,
+                "confidence": round(confidence, 2),
+                "reason": _safe_text(item.get("reason"), 160),
+            })
+            if len(long_term_traits) >= 5:
+                break
         return {
             "schema_version": _safe_int(raw.get("schema_version"), 1),
             "provider": str(raw.get("provider") or "astrbot_plugin_user_profile")[:64],
@@ -3833,6 +3852,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 )
                 if text
             ][:5],
+            "long_term_traits": long_term_traits,
             "score": score,
             "level": str(raw.get("level") or "")[:16],
             "risk_status": str(
@@ -3914,11 +3934,28 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         ][:5]
         if traits:
             lines.append("性格特质：" + "、".join(traits))
+        long_term = [
+            item for item in (snapshot.get("long_term_traits") or [])
+            if isinstance(item, dict) and str(item.get("trait") or "").strip()
+        ][:5]
+        if long_term:
+            lines.append("长期特点（历史背景，非风险定论）：" + "；".join(
+                f"{str(item['trait']).strip()}({int(float(item.get('confidence') or 0) * 100)}%)"
+                + (f"：{str(item.get('reason') or '').strip()}" if str(item.get("reason") or "").strip() else "")
+                for item in long_term
+            ))
 
         notes = []
         llm_status = str(snapshot.get("llm_status") or "").strip()
         if llm_status in ("error", "cached_error"):
-            notes.append("LLM 分析失败，标签仅来自规则")
+            has_cached_llm = bool(
+                impression or traits or long_term
+                or any(item.get("source") == "llm" for item in tags)
+            )
+            notes.append(
+                "LLM 刷新失败，沿用最近一次成功画像"
+                if has_cached_llm else "LLM 分析失败，标签仅来自规则"
+            )
         errors = snapshot.get("partial_errors") or []
         if "history_scan_failed" in errors:
             notes.append("历史扫描失败")
