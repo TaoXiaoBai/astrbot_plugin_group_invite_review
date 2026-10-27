@@ -2,7 +2,7 @@
   <img src="logo.png" width="128" alt="logo">
   <h1>加群邀请守卫</h1>
   <p>按人格审核加群邀请，可选被踢、被禁言后的退群与处罚</p>
-  <p>版本 1.27.2 · AstrBot 4.x · OneBot V11 · MIT</p>
+  <p>版本 1.27.3 · AstrBot 4.x · OneBot V11 · MIT</p>
 </div>
 
 ## 它会做什么
@@ -125,6 +125,18 @@ qq_tools 有效期已到的条目不会被守卫当成有效内部黑名单；�
 - 自定义询问模板支持 `{sender_id}`、`{text}`、`{is_banned}`、`{ban_reason}`、`{ban_time}`、`{invite_summary}`、`{persona_prompt}`、`{tone}`、`{show_reason}`、`{max_length}`；只替换已知变量，JSON 字面花括号可保留。模型 reason/reply 限长并清理控制字符；邀请附言、发言和画像 evidence 仍是不可信证据，而非模型指令。
 
 </details>
+
+## 可信内部只读策略 API
+
+`await plugin.get_actor_policy_snapshot(qq, *, platform_id, self_id, group_id='')` 只供可信插件代码调用，不注册为模型工具。调用方应从真实事件提供 QQ 与作用域；本接口不审核邀请、不处罚、不发送、不写配置/KV/派生缓存，也不查询 QQ 协议黑名单。
+
+返回固定 `schema_version=1`，`provider='astrbot_plugin_group_invite_guard'`，`captured_at` 为 Unix 秒（浮点数）；`scope={qq, platform_id, self_id, group_id}` 保存去除首尾空白后的字符串，私聊群号为空。**作用域是请求元信息，不表示封禁按账号/群隔离**：qq_tools 黑名单与守卫 dealt 仍按本插件实例的全局 QQ 状态合并，不把其它群的 dealt 漏掉。
+
+- `blacklist={status, sources, reason}`：`status` 为 `banned|clear|unknown`；`sources` 仅包含实际命中的 `qq_tools`、`dealt`，`reason` 为有限内部理由（每源最多 200 字）。当前有效黑名单或 dealt 任一命中即 `banned`，即使另一源失败；两源均成功读取且未命中才 `clear`。依赖缺失、读取失败、无法判定的非法数据不当作 clear；已到期条目不封禁，但 dealt 不随其自动到期。
+- `protection={status, qq_protected, group_protected, admin_protected}`：`status` 为 `ready|unknown`，三个布尔值分别表示 QQ 白名单、群白名单、启用中的管理员保护命中，彼此独立。unknown 时 false 不能证明未受保护。**保护不撤销封禁，也不授予空间发帖或其它业务权限。**
+- `availability` 为 `ready|partial|unavailable`：全部来源可读且作用域有效为 ready，部分来源可读/已有确定封禁为 partial，全不可读为 unavailable；`partial_errors` 为有限错误码列表，不含原始异常/路径。保护失败可能与 `blacklist.status=clear` 同时出现，调用方仍须处理 partial。当前错误码为 `scope_invalid`、`qq_tools_unavailable_or_invalid`、`dealt_unavailable_or_invalid`、`protection_unavailable_or_invalid`。
+
+每次读取当前数据，不使用旧派生缓存；快照不是跨配置/KV 的事务，执行其它业务前应重新检查关键策略。理由仅供可信内部决策，不应原样向普通请求者泄露。
 
 ## License
 

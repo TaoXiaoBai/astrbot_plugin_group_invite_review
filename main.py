@@ -541,7 +541,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.27.2",
+    "1.27.3",
 )
 class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -3565,6 +3565,147 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 if str(item.get(field) or "").strip() == qq:
                     return item
         return None
+
+    async def get_actor_policy_snapshot(
+        self, qq, *, platform_id, self_id, group_id=""
+    ) -> dict:
+        """供可信内部调用的只读策略快照；保护状态不是发布授权。"""
+        qq = str(qq or "").strip()
+        scope = {
+            "qq": qq,
+            "platform_id": str(platform_id or "").strip(),
+            "self_id": str(self_id or "").strip(),
+            "group_id": str(group_id or "").strip(),
+        }
+        captured_at = time.time()
+        errors = []
+        sources = []
+        reasons = []
+        ready_sources = 0
+        identity_valid = bool(re.fullmatch(r"\d+", qq))
+        if not identity_valid or not scope["platform_id"] or not scope["self_id"]:
+            errors.append("scope_invalid")
+
+        ban_readable = False
+        try:
+            config, error = self._get_ban_config()
+            if config is None or error:
+                raise ValueError("qq_tools unavailable")
+            entries = config.get("ban_list")
+            if not isinstance(entries, list):
+                raise ValueError("invalid ban list")
+            ban_readable = True
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    ban_readable = False
+                    continue
+                ids = [str(entry.get(key) or "").strip()
+                       for key in ("user_id", "qq", "id", "uin")]
+                if not any(ids):
+                    ban_readable = False
+                    continue
+                if not identity_valid or qq not in ids:
+                    continue
+                try:
+                    duration = entry.get("duration", -1)
+                    if isinstance(duration, bool):
+                        raise ValueError("invalid duration")
+                    duration = float(duration)
+                    if duration == -1:
+                        active = True
+                    else:
+                        start = entry.get("ban_time", 0)
+                        if isinstance(start, bool):
+                            raise ValueError("invalid ban time")
+                        start = float(start)
+                        expiry = start + duration
+                        if not all(map(math.isfinite, (duration, start, expiry))) or duration < 0 or start < 0:
+                            raise ValueError("invalid expiry")
+                        active = duration > 0 and captured_at < expiry
+                    if active and "qq_tools" not in sources:
+                        sources.append("qq_tools")
+                        reasons.append(_safe_text(entry.get("reason") or "当前 qq_tools 黑名单", 200))
+                except (TypeError, ValueError, OverflowError):
+                    ban_readable = False
+        except Exception:
+            ban_readable = False
+        if ban_readable:
+            ready_sources += 1
+        else:
+            errors.append("qq_tools_unavailable_or_invalid")
+
+        dealt_readable = False
+        try:
+            records = await self.get_kv_data("invite_records", {})
+            if not isinstance(records, dict):
+                raise ValueError("invalid invite records")
+            dealt_readable = True
+            for value in records.values():
+                if isinstance(value, str):
+                    continue
+                items = value if isinstance(value, list) else [value]
+                for record in items:
+                    if not isinstance(record, dict):
+                        dealt_readable = False
+                        continue
+                    if "dealt" in record and str(record["dealt"]).strip().lower() not in (
+                        "true", "false", "1", "0", "yes", "no", "是", "否", "",
+                    ):
+                        dealt_readable = False
+                        continue
+                    if _as_bool(record.get("dealt")):
+                        inviter = self._record_inviter(record)
+                        if not inviter:
+                            dealt_readable = False
+                        elif identity_valid and inviter == qq and "dealt" not in sources:
+                            sources.append("dealt")
+                            reasons.append("邀请记录已标记拉黑")
+        except Exception:
+            dealt_readable = False
+        if dealt_readable:
+            ready_sources += 1
+        else:
+            errors.append("dealt_unavailable_or_invalid")
+
+        protection = {
+            "status": "unknown", "qq_protected": False,
+            "group_protected": False, "admin_protected": False,
+        }
+        try:
+            section = self.config.get("protection", {})
+            if not isinstance(section, dict):
+                raise ValueError("invalid protection section")
+            protect_admins = section.get("protect_astrbot_admins", True)
+            if not isinstance(protect_admins, bool):
+                raise ValueError("invalid administrator protection switch")
+            qqs = self._protection_ids(section.get("qq_whitelist", ""))
+            groups = self._protection_ids(section.get("group_whitelist", ""))
+            protection["qq_protected"] = identity_valid and qq in qqs
+            protection["group_protected"] = bool(scope["group_id"] and scope["group_id"] in groups)
+            if protect_admins:
+                admins = self._protection_ids(self.context.get_config().get("admins_id"))
+                protection["admin_protected"] = identity_valid and qq in admins
+            protection["status"] = "ready"
+            ready_sources += 1
+        except Exception:
+            errors.append("protection_unavailable_or_invalid")
+
+        status = "banned" if sources else (
+            "clear" if ban_readable and dealt_readable and identity_valid else "unknown"
+        )
+        availability = "ready" if not errors else (
+            "partial" if ready_sources or sources else "unavailable"
+        )
+        return {
+            "schema_version": 1,
+            "provider": "astrbot_plugin_group_invite_guard",
+            "captured_at": captured_at,
+            "scope": scope,
+            "blacklist": {"status": status, "sources": sources, "reason": "；".join(reasons)},
+            "protection": protection,
+            "availability": availability,
+            "partial_errors": errors,
+        }
 
     async def _is_user_banned(self, qq: str) -> tuple[bool, str]:
         """综合判断某 QQ 是否应被拦截：qq_tools 黑名单 / 邀请记录已拉黑。

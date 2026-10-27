@@ -2,6 +2,12 @@
 
 本文件记录加群邀请守卫的版本更新，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.27.3] - 2026-10-26
+
+- 新增可信内部只读 `get_actor_policy_snapshot`（schema v1），合并当前有效 qq_tools 黑名单及 dealt，区分 clear/banned/unknown，保留依赖错误且确定封禁优先
+- 独立返回 QQ/群/管理员处罚保护、请求作用域与数据可用性；保护不授予空间发布权限，不触发审批、处罚、发送或状态写入
+- 补充只读性、有效期、异常降级和作用域元信息回归测试及简短 API 契约
+
 ## [1.27.2] - 2026-10-25
 
 - 决策画像 sanitizer 与审核上下文支持画像 1.17 的 `long_term_traits`，最多保留 5 项经清洗的特点、置信度和理由，仅作历史背景，不直接增加风险分
