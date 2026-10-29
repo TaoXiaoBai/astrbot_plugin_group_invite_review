@@ -417,7 +417,7 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
     {% else %}
     <div class="empty">暂无邀请记录</div>
     {% endif %}
-    <div class="hint">操作提示：/手动拉黑 &lt;QQ或群号&gt; ｜ /解封 &lt;QQ&gt; ｜ /拉黑列表 ｜ /画像 &lt;QQ&gt; ｜ /记录邀请 &lt;群号&gt; &lt;邀请人QQ&gt;</div>
+    <div class="hint">操作提示：/手动拉黑 &lt;QQ或群号&gt; ｜ /解封 &lt;QQ&gt; ｜ /拉黑列表 ｜ /守卫画像 &lt;QQ&gt; ｜ /记录邀请 &lt;群号&gt; &lt;邀请人QQ&gt;</div>
   </div>
 </body>
 </html>"""
@@ -523,7 +523,7 @@ class GroupMuteFilter(filter.CustomFilter):
 
 
 class AdminCommandFilter(filter.CustomFilter):
-    """只匹配管理员发起的命令消息（邀请记录/记录邀请/拉黑列表/解封/手动拉黑/画像）。"""
+    """只匹配管理员命令；共享画像入口在执行时判断是否让位。"""
 
     def filter(self, event: AstrMessageEvent, cfg) -> bool:
         try:
@@ -534,14 +534,14 @@ class AdminCommandFilter(filter.CustomFilter):
         text = (event.get_message_str() or "").strip()
         cmd = text.lstrip("/#").strip()
         first = cmd.split(" ", 1)[0] if cmd else ""
-        return first in ("邀请记录", "邀请列表", "记录邀请", "拉黑列表", "黑名单", "解封", "手动拉黑", "画像")
+        return first in ("邀请记录", "邀请列表", "记录邀请", "拉黑列表", "黑名单", "解封", "手动拉黑", "画像", "守卫画像")
 
 
 @register(
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.27.3",
+    "1.27.4",
 )
 class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -4351,10 +4351,10 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         return "邀请人画像：\n" + "\n".join(lines)
 
     async def _build_full_profile(self, qq: str, bot=None) -> str:
-        """完整画像（/画像 命令与 LLM 工具用）：比决策版更全，附黑名单详情与所有 ≥30% 的小号相似度候选。"""
+        """完整画像（/守卫画像 命令与 LLM 工具用）：比决策版更全，附黑名单详情与所有 ≥30% 的小号相似度候选。"""
         qq = str(qq or "").strip()
         if not qq:
-            return "用法：/画像 <QQ>"
+            return "用法：/守卫画像 <QQ>"
 
         data = await self._collect_profile_data(qq)
         lines = [f"QQ {qq} 的画像："]
@@ -6291,12 +6291,12 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         return "；".join(parts)
 
     async def _profile_text(self, event: AstrMessageEvent, args) -> str:
-        """/画像 <QQ>：输出该 QQ 的完整画像（邀请记录/黑名单/前科/活跃度/小号相似度候选）。"""
+        """/守卫画像 <QQ>：输出该 QQ 的完整画像（邀请记录/黑名单/前科/活跃度/小号相似度候选）。"""
         if not args:
-            return "用法：/画像 <QQ>"
+            return "用法：/守卫画像 <QQ>"
         qq = str(args[0] or "").strip()
         if not qq:
-            return "用法：/画像 <QQ>"
+            return "用法：/守卫画像 <QQ>"
         bot = self._find_onebot_client(event)
         try:
             return await self._full_profile(qq, bot, event)
@@ -6326,14 +6326,43 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             )
         if cmd == "手动拉黑":
             return await self._manual_ban_text(event, args)
-        if cmd == "画像":
+        if cmd in ("画像", "守卫画像"):
             return await self._profile_text(event, args)
         return "未知命令"
+
+    async def _profile_command_owned_externally(self, event: AstrMessageEvent) -> bool:
+        """画像插件在当前消息可触发时让位，不代调其查询或改变事件状态。"""
+        try:
+            name = "astrbot_plugin_user_profile"
+            metadata = self.context.get_registered_star(name)
+            if not metadata or not getattr(metadata, "activated", False) or not getattr(metadata, "star_cls", None):
+                return False
+            plugins = getattr(event, "plugins_name", None)
+            if plugins is not None and "*" not in plugins and name not in plugins:
+                return False
+            handlers = event.get_extra("activated_handlers", None)
+            if handlers is not None:
+                # 框架已按命令、配置及会话筛选，避免依赖插件执行顺序。
+                module = getattr(metadata, "module_path", None)
+                return bool(module) and any(
+                    getattr(handler, "handler_module_path", None) == module
+                    for handler in handlers
+                )
+            from astrbot.core.star.session_plugin_manager import SessionPluginManager
+            return await SessionPluginManager.is_plugin_enabled_for_session(
+                event.unified_msg_origin, name
+            )
+        except Exception:
+            # 无法确认画像插件可用时不抢占共享入口，专用命令始终保留。
+            return True
 
     @filter.custom_filter(AdminCommandFilter)
     async def on_admin_command(self, event: AstrMessageEvent):
         text = (event.get_message_str() or "").strip().lstrip("/#").strip()
-        cmd = text.split(" ", 1)[0] if text else ""
+        parts = text.split()
+        cmd = parts[0] if parts else ""
+        if cmd == "画像" and await self._profile_command_owned_externally(event):
+            return
         # 邀请记录优先发图片表格，渲染/发送失败则回退纯文本
         if cmd in ("邀请记录", "邀请列表"):
             if await self._send_invite_records_image(event):
