@@ -541,7 +541,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.27.4",
+    "1.27.5",
 )
 class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -1178,13 +1178,32 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             self._relation_revision(platform_id, self_id, group_id)
         ) if relation_scope else None
         membership_before = await self._membership_state(bot, group_id, self_id)
+        if membership_before == "IN":
+            result = "已在群，跳过重复邀请（未审批、未退群）"
+            await self._update_invite_record(
+                group_id, record_id,
+                action=result, decision="skipped", decision_source="existing_member_rule",
+                decision_reason="审核开始时已在目标群，不将重复邀请视为退群请求",
+                review_state="COMPLETED", execution_state="ALREADY_MEMBER",
+                execution_result=result, membership_before="IN", membership_after="IN",
+                action_attempted=False, action_succeeded=False, auto_executed=False,
+                reply="", reply_status="未发送（已在群，跳过审核）",
+            )
+            if bot is not None:
+                await self._notify(bot, self._compose_note(
+                    inviter_qq, group_id, comment, "skipped",
+                    "审核开始时已在目标群，不将重复邀请视为退群请求",
+                    result_label=result, membership_before="IN", membership_after="IN",
+                    decision_source="existing_member_rule",
+                ))
+            return
         if before_revision is not None:
             self._remember_relation_scope(bot, platform_id, self_id)
             await self._record_relation_safely(
                 platform_id=platform_id, self_id=self_id, group_id=group_id,
                 membership=membership_before, evidence="邀请前匹配 bot 查询" if membership_before != "UNKNOWN" else "收到邀请，尚未确认入群",
                 event_key="relation:request:" + request_key, expected_revision=before_revision,
-                inviter=inviter_qq if membership_before != "IN" else None, request_key=request_key)
+                inviter=inviter_qq if membership_before == "OUT" else None, request_key=request_key)
         await self._update_invite_record(
             group_id, record_id,
             action="审核中",
@@ -1263,6 +1282,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         outcome = await self._execute_invite_decision(
             bot, group_id, record_id, flag, sub_type, self_id, action, reason,
             membership_after, target_state, decision_source,
+            membership_before=membership_before,
         )
         if decision_source == "trusted_inviter_config_error":
             outcome.update(state="TRUST_CONFIG_FAILED", result="可信邀请配置读取异常，未自动处理")
@@ -1323,7 +1343,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 platform_id=platform_id, self_id=self_id, group_id=group_id,
                 membership=membership_after, evidence="邀请后匹配 bot 查询",
                 event_key="relation:query:" + request_key, expected_revision=after_revision,
-                inviter=str((admission or {}).get("inviter") or "") if membership_after == "IN" and membership_before != "IN" else None,
+                inviter=str((admission or {}).get("inviter") or "") if membership_after == "IN" and membership_before == "OUT" else None,
                 request_key=str((admission or {}).get("request_key") or ""))
         if not saved:
             replay_guard = (
@@ -1350,6 +1370,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         self, bot, group_id: str, record_id: str, flag: str, sub_type: str,
         self_id: str, action: str, reason: str, membership: str,
         target_state: str, decision_source: str = "llm",
+        *, membership_before: str = "UNKNOWN",
     ) -> dict:
         outcome = {
             "attempted": False, "succeeded": False, "decision_succeeded": False,
@@ -1373,6 +1394,13 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             return outcome
 
         if membership == "IN":
+            if membership_before != "OUT":
+                outcome.update(
+                    state="ALREADY_MEMBER" if membership_before == "IN" else "UNEXPECTED_JOIN_UNVERIFIED",
+                    result="已在群，跳过重复邀请（未审批、未退群）" if membership_before == "IN" else
+                    "已在群，但审核前状态未知；仅通知管理员，未审批、未退群",
+                )
+                return outcome
             if action == "approve":
                 outcome.update(
                     succeeded=True, decision_succeeded=True,
@@ -5726,10 +5754,12 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     ) -> str:
         action_label = {
             "approve": "同意加入", "reject": "拒绝", "unknown": "判断失败（未处理）",
+            "skipped": "跳过审核",
         }.get(action, action)
         source_label = {
             "llm": "LLM", "trusted_inviter_rule": "规则（可信邀请免审核）",
             "trusted_inviter_config_error": "规则（配置异常）",
+            "existing_member_rule": "规则（已在群）",
         }.get(decision_source, "来源未知")
         lines = [
             "[加群邀请通知]",
@@ -5817,6 +5847,8 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             decision_text = "规则（可信邀请免审核）· " + decision_text
         elif source == "trusted_inviter_config_error":
             decision_text = "规则（配置异常）· " + decision_text
+        elif source == "existing_member_rule":
+            decision_text = "规则（已在群）· " + decision_text
         else:
             decision_text = "LLM " + decision_text
         decision_class = {

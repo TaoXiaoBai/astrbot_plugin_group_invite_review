@@ -347,34 +347,35 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.stopped)
         self.assertEqual(bot.calls, [])
 
-    async def test_already_in_group_approve_still_reviews(self):
-        plugin = self.make_plugin("approve", membership=["IN", "IN"])
+    async def test_already_in_group_skips_review_and_actions(self):
+        plugin = self.make_plugin("approve", membership=["IN"])
         bot, _, rec = await self.run_invite(plugin)
-        plugin._ask_llm.assert_awaited_once()
-        self.assertEqual(rec["execution_state"], "EXTERNAL_JOIN_APPROVED")
-        self.assertFalse(any(name == "set_group_add_request" for name, _ in bot.calls))
+        plugin._ask_llm.assert_not_awaited()
+        self.assertEqual(rec["execution_state"], "ALREADY_MEMBER")
+        self.assertEqual(rec["decision"], "skipped")
+        self.assertEqual(bot.calls, [])
 
     async def test_in_group_reject_notify_only(self):
-        plugin = self.make_plugin("reject", "notify_only", ["IN", "IN"])
+        plugin = self.make_plugin("reject", "notify_only", ["OUT", "IN"])
         bot, _, rec = await self.run_invite(plugin)
         self.assertEqual(rec["execution_state"], "UNEXPECTED_JOIN_NOTIFIED")
         self.assertFalse(any(name == "set_group_leave" for name, _ in bot.calls))
 
     async def test_in_group_reject_leave(self):
-        plugin = self.make_plugin("reject", "leave", ["IN", "IN", "OUT"])
+        plugin = self.make_plugin("reject", "leave", ["OUT", "IN", "OUT"])
         bot, _, rec = await self.run_invite(plugin)
         self.assertEqual(rec["execution_state"], "UNEXPECTED_JOIN_LEFT")
         self.assertTrue(any(name == "set_group_leave" for name, _ in bot.calls))
 
     async def test_in_group_reject_message_then_leave(self):
-        plugin = self.make_plugin("reject", "message_then_leave", ["IN", "IN", "OUT"])
+        plugin = self.make_plugin("reject", "message_then_leave", ["OUT", "IN", "OUT"])
         bot, _, rec = await self.run_invite(plugin)
         names = [name for name, _ in bot.calls]
         self.assertLess(names.index("send_group_msg"), names.index("set_group_leave"))
         self.assertEqual(rec["execution_state"], "UNEXPECTED_JOIN_LEFT")
 
     async def test_group_message_failure_does_not_block_leave(self):
-        plugin = self.make_plugin("reject", "message_then_leave", ["IN", "IN", "OUT"])
+        plugin = self.make_plugin("reject", "message_then_leave", ["OUT", "IN", "OUT"])
         bot = FakeBot()
         bot.fail_group_message = True
         bot, _, rec = await self.run_invite(plugin, bot)
@@ -481,14 +482,14 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(name == "set_group_add_request" for name, _ in bot.calls))
 
     async def test_leave_returning_without_error_but_still_in_is_unconfirmed(self):
-        plugin = self.make_plugin("reject", "leave", ["IN", "IN", "IN"])
+        plugin = self.make_plugin("reject", "leave", ["OUT", "IN", "IN"])
         bot, _, rec = await self.run_invite(plugin)
         self.assertEqual(rec["execution_state"], "LEAVE_UNCONFIRMED")
         self.assertFalse(rec["action_succeeded"])
         self.assertFalse(any(name == "send_private_msg" for name, _ in bot.calls))
 
     async def test_leave_returning_without_error_but_unknown_is_unknown(self):
-        plugin = self.make_plugin("reject", "leave", ["IN", "IN", "UNKNOWN"])
+        plugin = self.make_plugin("reject", "leave", ["OUT", "IN", "UNKNOWN"])
         _, _, rec = await self.run_invite(plugin)
         self.assertEqual(rec["execution_state"], "ACTION_OUTCOME_UNKNOWN")
         self.assertFalse(rec["action_succeeded"])
@@ -601,13 +602,13 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(plugin._kv["invite_records"]["30000"]), 2)
 
     async def test_invalid_unexpected_join_mode_falls_back_to_notify_only(self):
-        plugin = self.make_plugin("reject", "invalid", ["IN", "IN"])
+        plugin = self.make_plugin("reject", "invalid", ["OUT", "IN"])
         bot, _, rec = await self.run_invite(plugin)
         self.assertEqual(rec["execution_state"], "UNEXPECTED_JOIN_NOTIFIED")
         self.assertFalse(any(name == "set_group_leave" for name, _ in bot.calls))
 
     async def test_old_config_defaults_to_notify_only(self):
-        plugin = self.make_plugin("reject", membership=["IN", "IN"])
+        plugin = self.make_plugin("reject", membership=["OUT", "IN"])
         plugin.config.pop("unexpected_join")
         bot, _, rec = await self.run_invite(plugin)
         self.assertEqual(rec["execution_state"], "UNEXPECTED_JOIN_NOTIFIED")
@@ -3116,7 +3117,7 @@ class ProtectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.calls, [])
 
     async def test_unexpected_join_protected_group_is_not_success(self):
-        plugin = self.make_plugin("reject", "leave", ["IN", "IN"])
+        plugin = self.make_plugin("reject", "leave", ["OUT", "IN"])
         plugin.config["protection"] = {"group_whitelist": "30000"}
         bot, _, rec = await InviteFlowTests.run_invite(self, plugin)
         self.assertEqual(rec["execution_state"], "PROTECTED_SKIPPED")
@@ -3411,7 +3412,7 @@ class TrustedInviteTests(unittest.IsolatedAsyncioTestCase):
         plugin._ask_llm.assert_not_awaited()
 
     async def test_external_join_is_rule_approval_without_duplicate_action(self):
-        plugin = self.trusted_plugin(membership=["IN", "IN"])
+        plugin = self.trusted_plugin(membership=["OUT", "IN"])
         bot, _, rec = await self.run_invite(plugin)
         self.assertEqual(rec["execution_state"], "EXTERNAL_JOIN_APPROVED")
         self.assertNotIn("LLM", rec["execution_result"])

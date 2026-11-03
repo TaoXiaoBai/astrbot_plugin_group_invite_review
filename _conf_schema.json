@@ -155,7 +155,7 @@
         "default": "notify_only",
         "options": ["notify_only", "leave", "message_then_leave"],
         "labels": ["仅通知", "直接退群", "发消息后退群"],
-        "hint": "审核前或审核期间已入群且 LLM 拒绝时执行"
+        "hint": "仅在审核开始时不在群、审核期间入群且被拒绝时执行；原本已在群则跳过，开始时状态未知则仅通知"
       },
       "custom_leave_message": {
         "description": "退群前消息",
