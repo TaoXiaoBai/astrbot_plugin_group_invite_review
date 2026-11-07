@@ -41,7 +41,11 @@ print(json.dumps(payload))
             result = subprocess.run([sys.executable, "-c", script], cwd=workdir, env=env,
                                     capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        # 工具注册日志可能异步落在 JSON 之后，不能假定结果永远是最后一行。
+        payload = json.loads(next(
+            line for line in result.stdout.splitlines()
+            if line.startswith('{"group_invite_ban_user"')
+        ))
         for name, parameter in (("group_invite_ban_user", "user_id"),
                                 ("group_invite_unban_user", "user_id"),
                                 ("group_invite_query_profile", "qq")):

@@ -262,7 +262,7 @@ class BlacklistSafetyTests(unittest.IsolatedAsyncioTestCase):
         p = self.make_plugin()
         p.config["decision"]["llm_provider_id"] = "fixture"
         variables = {key: "fixture" for key in ("sender_id", "text", "is_banned", "ban_reason", "ban_time",
-                    "invite_summary", "persona_prompt", "tone", "show_reason", "max_length")}
+                    "invite_summary", "persona_prompt", "tone", "show_reason", "max_length", "source", "group_id")}
         p._build_blacklist_inquiry_variables = AsyncMock(return_value=variables)
         p.context.llm_generate = AsyncMock(return_value=types.SimpleNamespace(completion_text='{"is_inquiry":true,"reply":"ok","reason":"fixture"}'))
         result = await p._ask_blacklist_inquiry("20000", "why")

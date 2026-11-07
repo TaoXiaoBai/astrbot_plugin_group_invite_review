@@ -805,7 +805,7 @@ class InviteFlowTests(unittest.IsolatedAsyncioTestCase):
             },
         })
         self.assertIsNone(snapshot["score"])
-        self.assertEqual(snapshot["risk_status"], "no_evidence")
+        self.assertEqual(snapshot["risk_status"], "unreviewed")
         self.assertEqual(snapshot["risk_scope"], "fused")
         self.assertEqual(snapshot["risk_components"]["verified"], 40)
         self.assertEqual(snapshot["risk_components"]["semantic"], 0)

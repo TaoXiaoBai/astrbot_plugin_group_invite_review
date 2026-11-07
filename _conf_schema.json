@@ -196,7 +196,7 @@
     }
   },
   "private_intent": {
-    "description": "私聊意图",
+    "description": "私聊与申诉",
     "type": "object",
     "items": {
       "enable_private_intent": {
@@ -218,28 +218,28 @@
         "hint": "识别到私聊加群意图时通知管理员"
       },
       "enable_blacklist_inquiry": {
-        "description": "识别私聊询问拉黑原因",
+        "description": "原因询问与自助申诉",
         "type": "bool",
         "default": true,
-        "hint": "被拉黑/拒绝/踢群的人（或其朋友、小号）私聊问原因时自动识别"
+        "hint": "支持私聊、共同群 @bot，以及换号或朋友代申诉；只记录并通知，不自动解封"
       },
       "blacklist_inquiry_reply": {
         "description": "自动回复询问",
         "type": "bool",
         "default": true,
-        "hint": "按人格生成简短解释并回复对方，避免泄露敏感信息"
+        "hint": "按人格回复原因或申诉回执，避免泄露敏感信息"
       },
       "blacklist_inquiry_notify": {
         "description": "通知管理员询问",
         "type": "bool",
         "default": true,
-        "hint": "有人私聊询问拉黑原因时通知你"
+        "hint": "收到原因询问或申诉时通知你；申诉记录可用 /申诉记录 查看"
       },
       "blacklist_inquiry_keywords": {
         "description": "触发关键词",
         "type": "string",
-        "default": "拉黑,为什么拉黑,为啥拉黑,怎么拉黑,踢我,为什么踢,为啥踢,被踢,拒绝,为什么拒绝,为啥拒绝,不同意,进不了群,加不了群,解封,放出来,取消拉黑",
-        "hint": "英文逗号分隔；消息中含任一关键词才会交给 LLM 判断"
+        "default": "拉黑,为什么拉黑,为啥拉黑,怎么拉黑,踢我,为什么踢,为啥踢,被踢,拒绝,为什么拒绝,为啥拒绝,不同意,进不了群,加不了群,解封,放出来,取消拉黑,申诉,误封",
+        "hint": "英文逗号分隔；群内还需 @bot；申诉、误封为内置触发词"
       },
       "blacklist_inquiry_tone": {
         "description": "回复语气",
@@ -271,7 +271,7 @@
         "description": "自定义用户提示词模板（高级）",
         "type": "text",
         "default": "",
-        "hint": "留空用默认。可用变量：{sender_id},{text},{is_banned},{ban_reason},{ban_time},{invite_summary},{tone},{show_reason},{max_length}"
+        "hint": "留空用默认。可用变量：{sender_id},{text},{is_banned},{ban_reason},{ban_time},{invite_summary},{tone},{show_reason},{max_length},{source},{group_id}"
       }
     }
   },
@@ -339,13 +339,13 @@
         "description": "禁言次数阈值",
         "type": "int",
         "default": 3,
-        "hint": "同一个群里被禁言几次后直接退群，不经过 LLM"
+        "hint": "达到次数后退群；不超过 2 小时的事件会先复核是否符合机器人循环聊天例外"
       },
       "long_mute_llm_review": {
-        "description": "长期禁言交给 LLM 复核",
+        "description": "禁言交给 LLM 复核",
         "type": "bool",
         "default": true,
-        "hint": "次数未达阈值但单次禁言很久时，由邀请决策模型判断是否退群；总开关关闭时不生效"
+        "hint": "复核长期禁言及不超过 2 小时的阈值事件；仅明确是与其他 bot 无休止聊天时才应用短禁言例外"
       },
       "long_mute_threshold_hours": {
         "description": "长期禁言时长（小时）",
