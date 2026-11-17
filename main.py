@@ -417,7 +417,7 @@ _INVITE_RECORDS_TEMPLATE = """<!doctype html>
     {% else %}
     <div class="empty">暂无邀请记录</div>
     {% endif %}
-    <div class="hint">操作提示：/手动拉黑 &lt;QQ或群号&gt; ｜ /解封 &lt;QQ&gt; ｜ /拉黑列表 ｜ /守卫画像 &lt;QQ&gt; ｜ /记录邀请 &lt;群号&gt; &lt;邀请人QQ&gt;</div>
+    <div class="hint">操作提示：/手动拉黑 QQ &lt;QQ&gt; [原因] 或 /手动拉黑 群 &lt;群号&gt; [原因] ｜ /解封 &lt;QQ&gt; ｜ /拉黑列表 ｜ /守卫画像 &lt;QQ&gt; ｜ /记录邀请 &lt;群号&gt; &lt;邀请人QQ&gt;</div>
   </div>
 </body>
 </html>"""
@@ -528,7 +528,7 @@ class AdminCommandFilter(filter.CustomFilter):
     "astrbot_plugin_group_invite_guard",
     "Kimi",
     "让 LLM 根据人格设定判断是否通过邀请加群，支持自动同意/拒绝或仅通知管理员；私聊问能否加群/发邀请链接也会被识别",
-    "1.31.0",
+    "1.32.1",
 )
 class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -4014,7 +4014,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         recognized = {
             "provider", "score", "level", "tags", "activity", "social_origin",
             "data_freshness", "llm_status", "partial_errors", "evidence_untrusted",
-            "impression", "traits", "long_term_traits", "management", "risk_status",
+            "impression", "traits", "long_term_traits", "management", "account_links", "risk_status",
             "risk_components", "risk_scope", "review_pending", "semantic_status",
             "semantic_time", "dimension_score", "dimension_status", "risk_dimensions", "sections",
         }
@@ -4205,6 +4205,24 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             long_term_traits.append(cleaned_trait)
             if len(long_term_traits) >= 5:
                 break
+        account_links = []
+        for item in raw.get("account_links") if isinstance(raw.get("account_links"), list) else []:
+            if not isinstance(item, dict) or not re.fullmatch(r"\d{5,12}", str(item.get("target_qq") or "")):
+                continue
+            account_links.append({
+                "target_qq": str(item["target_qq"]),
+                "time": max(0, _safe_int(item.get("time"))),
+                "ban_time": max(0, _safe_int(item.get("ban_time"))),
+                "signals": [value for value in item.get("signals", []) if value in (
+                    "continuation", "history_recall", "account_switch", "ban_reference",
+                )][:4] if isinstance(item.get("signals"), list) else [],
+                "shared_group": bool(item.get("shared_group")),
+                "behavior_similarity": _bounded_number(item.get("behavior_similarity"), 1),
+                "score": _bounded_number(item.get("score"), 1) or 0.0,
+                "strength": item.get("strength") if item.get("strength") in ("弱", "中", "强") else "弱",
+            })
+            if len(account_links) >= 3:
+                break
         schema_version = _safe_int(raw.get("schema_version"), 1)
         if schema_version >= 5:
             risk_status = (
@@ -4244,6 +4262,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 if text
             ][:5],
             "long_term_traits": long_term_traits,
+            "account_links": account_links,
             "score": score,
             "level": str(raw.get("level") or "")[:16],
             "risk_status": risk_status,
@@ -4353,6 +4372,13 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 evidence = _safe_text(item.get("evidence"), 200)
                 rendered.append(label + (f"：{evidence}" if evidence else ""))
             lines.append("画像标签：" + "；".join(rendered))
+
+        account_links = snapshot.get("account_links")
+        if isinstance(account_links, list) and account_links:
+            lines.append("换号续聊线索（仅疑似，非身份定论，不自动处罚）：" + "；".join(
+                f"近期被手动拉黑的 QQ {item['target_qq']}（{item.get('strength', '弱')}线索，规则强度 {float(item.get('score') or 0):.0%}）"
+                for item in account_links[:3] if isinstance(item, dict) and item.get("target_qq")
+            ))
 
         sections = snapshot.get("sections")
         if isinstance(sections, dict):
@@ -6548,7 +6574,7 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
                 parts.append("画像历史：同步失败（黑名单操作结果不受影响）")
         return "；".join(parts) + "；不恢复好友、QQ 协议黑名单或删除历史记录；画像历史按结清类型处理，新事件仍按配置处理"
 
-    async def _manual_blacklist(self, target_qq: str, bot, group_id: str = "") -> str:
+    async def _manual_blacklist(self, target_qq: str, bot, group_id: str = "", *, reason: str = "手动拉黑") -> str:
         protected = self._action_protection(target_qq, group_id)
         if protected:
             return protected
@@ -6557,37 +6583,43 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
         if scope is None or scope[0] is not self:
             token = _PROTECTION_EVENT.set((self, target_qq, group_id))
         try:
-            return await self._manual_blacklist_scoped(target_qq, bot)
+            return await self._manual_blacklist_scoped(target_qq, bot, reason=reason)
         finally:
             if token is not None:
                 _PROTECTION_EVENT.reset(token)
 
-    async def _manual_blacklist_scoped(self, target_qq: str, bot) -> str:
-        """手动拉黑某人：发自定义通知 + 删除并拉黑好友 + 加入 AstrBot 黑名单。"""
-        return await self._punish_user(target_qq, bot, "手动拉黑")
+    async def _manual_blacklist_scoped(self, target_qq: str, bot, *, reason: str = "手动拉黑") -> str:
+        """手动拉黑：按配置通知，删除并拉黑好友，并记录原因到内部黑名单和画像。"""
+        return await self._punish_user(target_qq, bot, str(reason or "").strip() or "手动拉黑")
 
     async def _manual_ban_text(self, event: AstrMessageEvent, args) -> str:
-        usage = "用法：/手动拉黑 QQ <QQ> 或 /手动拉黑 群 <群号>；兼容 /手动拉黑 <QQ> <群号> 和无歧义单数字"
+        usage = "用法：/手动拉黑 QQ <QQ> [原因] 或 /手动拉黑 群 <群号> [原因]；兼容 /手动拉黑 <QQ> <群号> [原因] 和无歧义单数字"
         args = [str(value or "").strip() for value in args]
         kind = args[0].upper() if args else ""
         explicit = kind in ("QQ", "群")
+        legacy_group = not explicit and len(args) >= 2 and args[1].isdigit()
         if explicit:
-            if len(args) != 2:
+            if len(args) < 2:
                 return usage
             target = args[1]
-        elif len(args) in (1, 2):
+            reason_parts = args[2:]
+        elif args:
             target = args[0]
+            reason_parts = args[2:] if legacy_group else args[1:]
         else:
             return usage
-        if not target.isdigit() or (not explicit and len(args) == 2 and not args[1].isdigit()):
+        if not target.isdigit():
             return usage
+        reason = " ".join(reason_parts).strip() or "手动拉黑"
+        if len(reason) > 500:
+            return "拉黑原因过长，请控制在 500 字以内；未执行任何操作。"
         bot = self._find_onebot_client(event)
         if bot is None:
             return "手动拉黑失败：未找到 OneBot 客户端"
         self._remember_relation_bot(event, bot)
         groups, source_group = [], ""
         target_qq = target
-        if not explicit and len(args) == 2:
+        if legacy_group:
             source_group = args[1]
             groups = [source_group]
         else:
@@ -6630,10 +6662,11 @@ class GroupInviteGuardPlugin(GroupRelationGuardMixin, Star):
             except Exception as exc:
                 parts.append(f"退群 {gid} 失败：{exc}")
         try:
-            result = await self._manual_blacklist(target_qq, bot, group_id=source_group)
+            result = await self._manual_blacklist(target_qq, bot, group_id=source_group, reason=reason)
         except Exception as exc:
             result = ActionResult(f"拉黑失败：{exc}", errors=(str(exc),))
         parts.append(f"拉黑 {target_qq}：{result}")
+        parts.append(f"原因：{reason}")
         if self._ban_result_ok(result):
             if not await self._mark_inviter_dealt(target_qq):
                 parts.append("守卫状态落盘失败，请检查存储日志")

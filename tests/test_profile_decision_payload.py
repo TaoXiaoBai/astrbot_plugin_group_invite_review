@@ -320,3 +320,33 @@ class ProfileDecisionPayloadIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("evidence_refs", serialized)
         self.assertNotIn("RAW-SECRET", prompt + serialized)
         self.assertEqual(plugin.put_calls, [])
+
+
+class AccountLinkPayloadTests(unittest.TestCase):
+    def test_account_link_payload_is_bounded_and_rendered_as_uncertain(self):
+        raw = {
+            "schema_version": 5,
+            "account_links": [{
+                "target_qq": "33333", "time": 100, "ban_time": 90,
+                "signals": ["continuation", "account_switch", "unknown"],
+                "shared_group": True, "behavior_similarity": 0.8,
+                "score": 0.85, "strength": "强", "raw_quote": "不得复制",
+            }],
+        }
+        snapshot = GroupInviteGuardPlugin._sanitize_profile_snapshot(raw)
+        link = snapshot["account_links"][0]
+        self.assertEqual(link["target_qq"], "33333")
+        self.assertEqual(link["signals"], ["continuation", "account_switch"])
+        self.assertNotIn("raw_quote", link)
+        text = GroupInviteGuardPlugin._format_external_decision_profile(snapshot)
+        self.assertIn("33333", text)
+        self.assertIn("非身份定论", text)
+        self.assertIn("不自动处罚", text)
+        self.assertNotIn("不得复制", text)
+
+    def test_invalid_account_links_are_dropped(self):
+        snapshot = GroupInviteGuardPlugin._sanitize_profile_snapshot({
+            "account_links": [{"target_qq": "bad"}, {"target_qq": "33333", "score": 99}],
+        })
+        self.assertEqual(len(snapshot["account_links"]), 1)
+        self.assertEqual(snapshot["account_links"][0]["score"], 1.0)

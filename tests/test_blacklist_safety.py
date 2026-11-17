@@ -48,7 +48,7 @@ class BlacklistSafetyTests(unittest.IsolatedAsyncioTestCase):
         p._manual_blacklist = AsyncMock(return_value=ActionResult("done", persisted=True))
         bot = fixtures.ApiOnly()
         result = await p._manual_ban_text(self.event(bot), ["群", "30000"])
-        p._manual_blacklist.assert_awaited_once_with("20000", bot, group_id="30000")
+        p._manual_blacklist.assert_awaited_once_with("20000", bot, group_id="30000", reason="手动拉黑")
         self.assertIn("已退出群 30000", result)
         self.assertNotIn("dealt", p._kv["invite_records"]["30000"][0])
 
